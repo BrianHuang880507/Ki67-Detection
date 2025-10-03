@@ -1,0 +1,22 @@
+# Byte-compiled python files
+__pycache__/
+*.py[cod]
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Project data outputs
+analyze_results/
+data/
+masks/
+model/
+outputs_models/
+predictions.csv
+
+¸ê®Æ¶°/

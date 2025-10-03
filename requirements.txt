@@ -1,0 +1,15 @@
+﻿cellpose
+pandas
+numpy
+scikit-learn
+xgboost
+torch
+torchvision
+matplotlib
+imageio
+scikit-image
+opencv-python-headless
+fastremap
+natsort
+tqdm
+PyYAML
