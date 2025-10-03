@@ -1,28 +1,54 @@
 import argparse
 from pathlib import Path
+
 from ki67dtc.img_prep import segment_all, mask2txt_all, combined
 from ki67dtc.cell_anal import run_all
 
 
 def main():
     parser = argparse.ArgumentParser(description="細胞影像分析 Pipeline")
-    parser.add_argument("--data_folder", type=str, required=True, help="輸入資料夾路徑")
-    parser.add_argument("--fluor_analy", action="store_true", help="是否進行螢光分析")
-    parser.add_argument("--ki67", action="store_true", help="是否進行 Ki67 判斷")
+    parser.add_argument("--data_folder", type=str, required=True, help="輸入資料夾名稱或路徑")
+    parser.add_argument("--fluor_analy", action="store_true", help="是否執行螢光分析")
+    parser.add_argument("--ki67", action="store_true", help="是否執行 Ki67 判斷")
     parser.add_argument("--clean_temp", action="store_true", help="是否清理暫存資料")
 
     args = parser.parse_args()
 
-    data_folder = Path(args.data_folder)
-    if not data_folder.exists() or not data_folder.is_dir():
-        print(f"[ERROR] 找不到資料夾: {data_folder}")
+    raw_data_arg = Path(args.data_folder)
+    candidates = []
+    if raw_data_arg.is_absolute():
+        candidates.append(raw_data_arg)
+    else:
+        base_dir = Path("data/input")
+        candidates.append(base_dir / raw_data_arg)
+        candidates.append(raw_data_arg)
+
+    search_targets = []
+    seen = set()
+    for candidate in candidates:
+        absolute = candidate if candidate.is_absolute() else (Path.cwd() / candidate)
+        key = str(absolute.resolve(strict=False))
+        if key not in seen:
+            seen.add(key)
+            search_targets.append(absolute)
+
+    data_folder = None
+    for candidate in search_targets:
+        if candidate.exists() and candidate.is_dir():
+            data_folder = candidate
+            break
+
+    if data_folder is None:
+        print("[錯誤] 找不到資料夾，請確認以下路徑是否存在：")
+        for candidate in search_targets:
+            print(f" - {candidate}")
         exit(1)
 
     print("=" * 50)
-    print(f"[INFO] 測試資料夾: {data_folder}")
-    print(f"[INFO] 螢光分析: {args.fluor_analy}")
-    print(f"[INFO] Ki67 判斷: {args.ki67}")
-    print(f"[INFO] 清理暫存: {args.clean_temp}")
+    print(f"[資訊] 使用資料夾：{data_folder}")
+    print(f"[資訊] 啟用螢光分析：{args.fluor_analy}")
+    print(f"[資訊] 啟用 Ki67 分析：{args.ki67}")
+    print(f"[資訊] 清理暫存檔：{args.clean_temp}")
     print("=" * 50)
 
     # Step 1: segmentation
@@ -33,12 +59,12 @@ def main():
     print("\n[STEP 2] 將 segmentation npy 轉成 outlines txt")
     mask2txt_all(data_folder)
 
-    # Step 3: 合併 nucleus & cytoplasm outlines
-    print("\n[STEP 3] 合併 nucleus & cytoplasm outlines")
+    # Step 3: combine outlines
+    print("\n[STEP 3] 合併 nucleus 與 cytoplasm outlines")
     combined(data_folder)
 
-    # Step 4: 細胞參數 & 螢光強度分析
-    print("\n[STEP 4] 執行參數分析 + 螢光強度分析")
+    # Step 4: geometry & intensity analysis
+    print("\n[STEP 4] 幾何參數與螢光/陽性分析")
     run_all(
         data_folder,
         fluor_analy=args.fluor_analy,
@@ -46,8 +72,10 @@ def main():
         clean_temp=args.clean_temp,
     )
 
-    print("\n[INFO] Pipeline 執行完成！請檢查輸出結果。")
+    print("\n[資訊] Pipeline 完成！請檢查輸出結果。")
 
 
 if __name__ == "__main__":
     main()
+
+

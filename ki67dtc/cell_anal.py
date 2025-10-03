@@ -303,66 +303,167 @@ def run_all(
 ) -> None:
     data_path = Path(data_name)
     pc_dir = data_path / "PC"
-    df_dir = data_path / "DF"
     ki67_dir = data_path / "KI67"
-    mapping = pd.read_csv(generate_image_mapping(pc_dir, df_dir, ki67_dir))
+
+    fluor_subdirs = ["DF", "LT"]
+    existing_fluor_dirs = [
+        (sub, data_path / sub)
+        for sub in fluor_subdirs
+        if (data_path / sub).exists() and (data_path / sub).is_dir()
+    ]
+
+    if not pc_dir.exists() or not pc_dir.is_dir():
+        print(f"[錯誤] 找不到 PC 資料夾：{pc_dir}")
+        return
+
+    if existing_fluor_dirs:
+        folders = ", ".join(label for label, _ in existing_fluor_dirs)
+        print(f"[資訊] 已偵測到螢光資料夾：{folders}")
+    elif fluor_analy:
+        print(
+            "[警告] 已啟用螢光分析，但未找到 DF 或 LT 資料夾；僅輸出幾何參數。"
+        )
+
+    def get_image_names(folder: Path) -> list[str]:
+        if not folder.exists() or not folder.is_dir():
+            return []
+        return [f.name for f in list_files(folder, [".jpg", ".png", ".tif", ".tiff"])]
+
+    pc_images = get_image_names(pc_dir)
+    if not pc_images:
+        print(f"[錯誤] PC 資料夾中找不到影像：{pc_dir}")
+        return
+
+    ki67_images = get_image_names(ki67_dir)
+    fluor_images = {label: get_image_names(path) for label, path in existing_fluor_dirs}
+
+    counts = [
+        len(pc_images),
+        len(ki67_images),
+        *(len(v) for v in fluor_images.values()),
+    ]
+    max_len = max(counts) if counts else 0
+
+    def safe_get(items: list[str], idx: int) -> str:
+        return items[idx] if idx < len(items) else ""
+
+    rows = []
+    for idx in range(max_len):
+        row = {"PC_Name": safe_get(pc_images, idx)}
+        for label, _ in existing_fluor_dirs:
+            row[f"{label}_Name"] = safe_get(fluor_images.get(label, []), idx)
+        row["KI67_Name"] = safe_get(ki67_images, idx)
+        rows.append(row)
+
+    mapping = pd.DataFrame(rows)
+    mapping_path = data_path / "image_mapping.csv"
+    mapping.to_csv(mapping_path, index=False)
+    print(f"[資訊] 已更新影像對照表：{mapping_path}")
 
     analy_dir = output_dir(data_path, "results")
     outline_dir = output_dir(data_path, "outline")
-    # all_img_files = list_files(pc_dir, [".jpg", ".png", ".tif", ".tiff"])
 
     for i in trange(len(mapping), desc="Processing images(analysis)"):
         row = mapping.iloc[i]
-        pc_name = str(row["PC_Name"]) if pd.notna(row["PC_Name"]) else ""
-        df_name = str(row["DF_Name"]) if pd.notna(row["DF_Name"]) else ""
-        ki67_name = str(row["KI67_Name"]) if pd.notna(row["KI67_Name"]) else ""
+        pc_name = str(row.get("PC_Name", "")).strip()
+        if not pc_name:
+            print(f"[警告] 第 {i + 1} 筆缺少 PC 影像名稱，已略過。")
+            continue
 
         pc_img = pc_dir / pc_name
-        df_img = df_dir / df_name
-        ki67_img = ki67_dir / ki67_name
+        if not pc_img.exists():
+            print(f"[警告] 找不到 PC 影像：{pc_img}")
+            continue
 
         outlines_txt = outline_dir / f"{pc_img.stem}_merged_cp_outlines.txt"
         if not outlines_txt.exists():
-            print(f"[WARN] 缺少 outlines 檔案: {outlines_txt}")
+            print(f"[警告] 缺少輪廓檔案：{outlines_txt}")
             continue
 
         param_csv = analy_dir / f"{pc_img.stem}_params.csv"
-
         merged_param_csv = analy_dir / f"{pc_img.stem}_params_merged.csv"
-        fluor_csv = analy_dir / f"{pc_img.stem}_fluorescence.csv"
-        flat_fluor_csv = analy_dir / f"{pc_img.stem}_fluor_flat.csv"
         final_csv = analy_dir / f"{pc_img.stem}_final.csv"
 
-        # 幾何分析 + 合併
+        fluor_outputs: dict[str, dict[str, Path]] = {}
+        for label, _ in existing_fluor_dirs:
+            suffix = label.lower()
+            fluor_outputs[label] = {
+                "fluor_csv": analy_dir / f"{pc_img.stem}_{suffix}_fluorescence.csv",
+                "flat_csv": analy_dir / f"{pc_img.stem}_{suffix}_fluor_flat.csv",
+                "merged_csv": analy_dir / f"{pc_img.stem}_final_{suffix}.csv",
+            }
+
         param_anal(pc_img, outlines_txt, param_csv)
         merged_excel(param_csv, merged_param_csv)
 
-        if fluor_analy:
-            # 螢光分析 + 攤平 + 合併
-            flour_anal(df_img, outlines_txt, fluor_csv)
-            flatten_fluor_table(fluor_csv, flat_fluor_csv)
-            merge_with_flour(merged_param_csv, flat_fluor_csv, final_csv)
-            print(f"[INFO] 螢光分析完成 → {final_csv}")
+        current_final_path: Path = merged_param_csv
+        processed_fluor = False
+
+        if fluor_analy and existing_fluor_dirs:
+            for label, fluor_dir in existing_fluor_dirs:
+                col_name = f"{label}_Name"
+                df_name = str(row.get(col_name, "")).strip()
+                if not df_name:
+                    print(f"[警告] {pc_img.stem} 缺少 {label} 影像，已略過。")
+                    continue
+
+                df_img = fluor_dir / df_name
+                if not df_img.exists():
+                    print(f"[警告] 找不到 {label} 影像：{df_img}")
+                    continue
+
+                outputs = fluor_outputs[label]
+                flour_anal(df_img, outlines_txt, outputs["fluor_csv"])
+                flatten_fluor_table(outputs["fluor_csv"], outputs["flat_csv"])
+
+                if (
+                    not outputs["flat_csv"].exists()
+                    or outputs["flat_csv"].stat().st_size == 0
+                ):
+                    print(
+                        f"[警告] {label} 螢光分析結果為空，略過合併：{outputs['flat_csv']}"
+                    )
+                    continue
+
+                merge_with_flour(
+                    current_final_path, outputs["flat_csv"], outputs["merged_csv"]
+                )
+                current_final_path = outputs["merged_csv"]
+                processed_fluor = True
+
+        if processed_fluor:
+            if current_final_path != final_csv:
+                copyfile(current_final_path, final_csv)
         else:
-            copyfile(merged_param_csv, final_csv)
+            if merged_param_csv != final_csv:
+                copyfile(merged_param_csv, final_csv)
+        current_final_path = final_csv
+
+        for outputs in fluor_outputs.values():
+            merged_path = outputs["merged_csv"]
+            if merged_path.exists() and merged_path != final_csv:
+                merged_path.unlink()
 
         if ki67:
-            # Ki67 陽性 ROI 判斷與合併
-            ki67_mask = ki67_binarize(ki67_img)
-            binary_dir = output_dir(data_path, "binary")
-            ki67_label = binary_dir / f"{pc_img.stem}_label.txt"
+            ki67_name = str(row.get("KI67_Name", "")).strip()
+            if not ki67_name:
+                print(f"[警告] {pc_img.stem} 缺少 Ki67 影像，已略過。")
+            else:
+                ki67_img = ki67_dir / ki67_name
+                if not ki67_img.exists():
+                    print(f"[警告] 找不到 Ki67 影像：{ki67_img}")
+                else:
+                    ki67_mask = ki67_binarize(ki67_img)
+                    binary_dir = output_dir(data_path, "binary")
+                    ki67_label = binary_dir / f"{pc_img.stem}_label.txt"
 
-            detect_ki67_positive(outlines_txt, ki67_mask, ki67_label)
-            merge_ki67_labels(final_csv, ki67_label, final_csv)
-            print(f"[INFO] Ki67 判斷完成 → {final_csv}")
-
-        if not fluor_analy and not ki67:
-            # 什麼都沒選就直接 copy
-            merged_param_csv.replace(final_csv)
-            print(f"[INFO] Copied merged params to final → {final_csv}")
+                    detect_ki67_positive(outlines_txt, ki67_mask, ki67_label)
+                    merge_ki67_labels(final_csv, ki67_label, final_csv)
+                    print(f"[資訊] Ki67 合併完成：{final_csv}")
 
     merge_all_final_csvs(data_path)
 
     if clean_temp:
         remove_temp_files(analy_dir)
         remove_temp_files(output_dir(data_path, "outline"))
+
