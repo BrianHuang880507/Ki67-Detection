@@ -1,13 +1,15 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
+import argparse
 from pathlib import Path
+
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import trange
 
-IMAGE_DIR = Path(r"data\input\0819\PC")
-MASKS_DIR = Path(r"data\output\segment\0819")
-KI67_DIR = Path(r"data\output\binary\0819")
-OUT_ROOT = Path(r"data\output\cyto_crops\0819")
+DEFAULT_IMAGE_DIR = Path("data/input/0819/PC")
+DEFAULT_MASKS_DIR = Path("data/output/segment/0819")
+DEFAULT_KI67_DIR = Path("data/output/binary/0819")
+DEFAULT_OUT_ROOT = Path("data/output/cyto_crops/0819")
 
 KI67_THRESH = 0.10
 PAD = 6
@@ -16,7 +18,7 @@ PAD = 6
 def load_masks_safely(npy_path: Path):
     arr = np.load(npy_path, allow_pickle=True)
     outlines = None
-    if isinstance(arr, dict) or (arr.dtype == object and arr.shape == ()):
+    if isinstance(arr, dict) or (arr.dtype == object and arr.shape == ()):  # noqa: E721
         arr = arr.item()
         if "masks" in arr:
             outlines = arr.get("outlines", None)
@@ -34,7 +36,7 @@ def to_label_map(masks, hw):
         squeezed = np.squeeze(masks)
         if squeezed.ndim == 2 and squeezed.shape == (H, W):
             return squeezed.astype(np.int32)
-        raise ValueError("2D masks 大小與影像不符。")
+        raise ValueError("2D masks dimensions do not match image size")
     elif masks.ndim == 3:
         if masks.shape[0] == H and masks.shape[1] == W:  # (H,W,N)
             lbl = np.zeros((H, W), dtype=np.int32)
@@ -57,9 +59,9 @@ def to_label_map(masks, hw):
         squeezed = np.squeeze(masks)
         if squeezed.ndim == 2 and squeezed.shape == (H, W):
             return squeezed.astype(np.int32)
-        raise ValueError("3D masks 的形狀無法判讀。")
+        raise ValueError("3D masks dimensions do not match image size")
     else:
-        raise ValueError("masks 維度不支援。")
+        raise ValueError("Unsupported mask dimensions")
 
 
 def farthest_interior_point(bm):
@@ -98,7 +100,7 @@ def compute_outlines_for_label(bm):
 
 def compute_ki67_positive_ids(label_map, ki67_mask_bool, threshold=0.10):
     if ki67_mask_bool.shape != label_map.shape:
-        raise ValueError("Ki-67 mask 與 label_map 大小不一致")
+        raise ValueError("Ki-67 mask dimensions do not match label map")
     labels = np.unique(label_map)
     labels = labels[labels != 0]
     pos = set()
@@ -139,7 +141,10 @@ def draw_overlay_with_outlines(img, label_map, positive_ids, out_path):
         bm = label_map == lb
         if not bm.any():
             continue
-        cy, cx = farthest_interior_point(bm)
+        farthest = farthest_interior_point(bm)
+        if farthest is None:
+            continue
+        cy, cx = farthest
         tcolor = GREEN if lb in positive_ids else YELLOW
         if font is not None and (0 <= cx < W and 0 <= cy < H):
             draw.text((cx + 3, cy + 3), str(int(lb)), fill=tcolor, font=font)
@@ -148,27 +153,35 @@ def draw_overlay_with_outlines(img, label_map, positive_ids, out_path):
     print(f"[INFO] overlay saved to {out_path}")
 
 
-def process_one(image_path: Path):
-    """處理單一影像：畫 overlay + 裁切"""
+def process_one(
+    image_path: Path,
+    masks_dir: Path,
+    ki67_dir: Path,
+    out_root: Path,
+    ki67_thresh: float,
+):
+    """Generate overlay and cytoplasm crops for a single image."""
     img = Image.open(image_path).convert("RGB")
     W, H = img.size
 
-    mask_path = MASKS_DIR / f"{image_path.stem}_cyto_seg.npy"
+    mask_path = masks_dir / f"{image_path.stem}_cyto_seg.npy"
     if not mask_path.exists():
-        print(f"[WARN] 找不到 mask: {mask_path}")
+        print(f"[WARN] Missing mask: {mask_path}")
         return
 
     masks, _ = load_masks_safely(mask_path)
     if masks is None:
         return
     label_map = to_label_map(masks, (H, W))
+    if label_map is None:
+        print(f"[WARN] Unable to build label map for {image_path.name}")
+        return
 
-    out_dir = OUT_ROOT / image_path.stem
+    out_dir = out_root / image_path.stem
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Ki-67
     positive_ids = set()
-    ki67_path = KI67_DIR / f"Ki67-{image_path.stem}_binary.png"
+    ki67_path = ki67_dir / f"Ki67-{image_path.stem}_binary.png"
     if ki67_path.exists():
         from skimage import io as skio
 
@@ -176,14 +189,12 @@ def process_one(image_path: Path):
         if ki67_mask.ndim == 3:
             ki67_mask = ki67_mask[..., 0]
         ki67_bool = ki67_mask > 0
-        positive_ids = compute_ki67_positive_ids(label_map, ki67_bool, KI67_THRESH)
+        positive_ids = compute_ki67_positive_ids(label_map, ki67_bool, ki67_thresh)
 
-    # 疊圖
     draw_overlay_with_outlines(
         img, label_map, positive_ids, out_dir / f"{image_path.stem}_overlay.png"
     )
 
-    # 裁切
     count = 0
     labels = np.unique(label_map)
     labels = labels[labels != 0]
@@ -202,14 +213,65 @@ def process_one(image_path: Path):
         rgba.save(out_dir / f"{image_path.stem}_cyto_{i:03d}.png")
         count += 1
 
-    print(f"[INFO] {image_path.name}: 完成 {count} 顆細胞，overlay 已存檔")
+    print(f"[INFO] {image_path.name}: exported {count} crops")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Crop cytoplasm regions and overlays using segmentation results."
+    )
+    parser.add_argument(
+        "--image-dir",
+        type=Path,
+        default=DEFAULT_IMAGE_DIR,
+        help="Directory containing source images (.jpg).",
+    )
+    parser.add_argument(
+        "--masks-dir",
+        type=Path,
+        default=DEFAULT_MASKS_DIR,
+        help="Directory containing cytoplasm segmentation npy files.",
+    )
+    parser.add_argument(
+        "--ki67-dir",
+        type=Path,
+        default=DEFAULT_KI67_DIR,
+        help="Directory containing Ki-67 binary masks.",
+    )
+    parser.add_argument(
+        "--out-root",
+        type=Path,
+        default=DEFAULT_OUT_ROOT,
+        help="Root directory where overlays and crops will be written.",
+    )
+    return parser.parse_args()
 
 
 def main():
-    images = sorted(IMAGE_DIR.glob("*.jpg"))
-    print(f"找到影像 {len(images)} 張")
-    for i in trange(len(images), desc="Processing"):
-        process_one(images[i])
+    args = parse_args()
+
+    image_dir = args.image_dir.expanduser()
+    masks_dir = args.masks_dir.expanduser()
+    ki67_dir = args.ki67_dir.expanduser()
+    out_root = args.out_root.expanduser()
+
+    for path, label in (
+        (image_dir, "--image-dir"),
+        (masks_dir, "--masks-dir"),
+        (ki67_dir, "--ki67-dir"),
+    ):
+        if not path.is_dir():
+            raise SystemExit(f"[ERROR] {label} not found or not a directory: {path}")
+
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    images = sorted(image_dir.glob("*.jpg"))
+    print(f"[INFO] Found {len(images)} images in {image_dir}")
+    if not images:
+        return
+
+    for idx in trange(len(images), desc="Processing"):
+        process_one(images[idx], masks_dir, ki67_dir, out_root, KI67_THRESH)
 
 
 if __name__ == "__main__":

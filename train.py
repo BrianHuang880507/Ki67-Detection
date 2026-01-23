@@ -20,7 +20,7 @@ from sklearn.exceptions import UndefinedMetricWarning
 from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix
 from sklearn.model_selection import (
     GroupKFold,
     LeaveOneGroupOut,
@@ -35,6 +35,7 @@ import xgboost
 import sklearn
 import warnings
 import re
+import math
 
 
 TARGET_COL = "ki67_positive"
@@ -229,11 +230,12 @@ def normalize_pathlike_to_stem(series: pd.Series) -> pd.Series:
     """
     return (
         series.astype(str)
+        .str.replace("\\\\", "/", regex=False)
         .str.replace("\\", "/", regex=False)
         .str.split("/")
         .str[-1]
         .str.strip()
-        .str.replace(r"\\.(png|jpg|jpeg)$", "", regex=True, case=False)
+        .str.replace(r"\.(png|jpg|jpeg)$", "", regex=True, case=False)
         .str.lower()
     )
 
@@ -252,35 +254,47 @@ def cellid_to_stem(series: pd.Series, channel: str) -> pd.Series:
     channel = channel.lower().strip()
 
     def _convert(value: object) -> str:
-        text = str(value).strip().lower()
+        text = str(value).strip()
         if not text:
             return f"unknown_{channel}_000"
 
-        parts = [p for p in text.split("_") if p != ""]
-        base_parts = []
+        cleaned = text.replace("\\", "/").split("/")[-1].strip().lower()
+        parts = [p for p in cleaned.split("_") if p]
         chan_part = None
-        idx_num = None
-
+        ordered_parts: List[str] = []
         for part in parts:
             if part in {"cyto", "nuc"} and chan_part is None:
                 chan_part = part
-            elif part.isdigit() and idx_num is None:
-                try:
-                    idx_num = int(part)
-                except ValueError:
-                    idx_num = None
             else:
-                base_parts.append(part)
+                ordered_parts.append(part)
 
-        if not base_parts:
-            base = text.replace("_", "-") or "unknown"
-        else:
-            base = "_".join(base_parts)
+        idx_token = None
+        for part in reversed(ordered_parts):
+            if part.isdigit():
+                idx_token = part
+                break
+
+        idx_value = 0
+        base_parts: List[str] = []
+        used_idx = False
+        for part in ordered_parts:
+            if not used_idx and idx_token is not None and part == idx_token:
+                idx_value = int(idx_token)
+                used_idx = True
+                continue
+            base_parts.append(part)
+
+        if idx_token is not None and not used_idx:
+            idx_value = int(idx_token)
+
+        base = "_".join(base_parts).replace(" ", "-").strip("_-")
+        if not base:
+            base = cleaned.replace("_", "-") or "unknown"
 
         chan = chan_part or channel
-        idx_num = 0 if idx_num is None else max(idx_num, 0)
+        idx_value = max(idx_value, 0)
 
-        return f"{base}_{chan}_{idx_num:03d}"
+        return f"{base}_{chan}_{idx_value:03d}"
 
     return series.apply(_convert)
 
@@ -302,7 +316,12 @@ def make_logreg() -> Pipeline:
             (
                 "clf",
                 LogisticRegression(
-                    max_iter=1000, solver="liblinear", class_weight="balanced"
+                    max_iter=2000,
+                    solver="saga",
+                    penalty="l2",
+                    C=1.0,
+                    class_weight="balanced",
+                    random_state=42,
                 ),
             ),
         ]
@@ -320,11 +339,15 @@ def make_xgb(scale_pos_weight: Optional[float] = None) -> XGBClassifier:
     XGBClassifier: 已設定好參數的 XGBoost 模型。
     """
     params = {
-        "n_estimators": 300,
-        "max_depth": 3,
+        "n_estimators": 600,
+        "max_depth": 5,
         "learning_rate": 0.05,
         "subsample": 0.9,
         "colsample_bytree": 0.9,
+        "min_child_weight": 3,
+        "gamma": 1.0,
+        "reg_lambda": 5.0,
+        "reg_alpha": 0.5,
         "random_state": 42,
         "eval_metric": "logloss",
     }
@@ -458,6 +481,160 @@ def average_rank_from_bucket(bucket: Dict[str, List[float]]) -> pd.Series:
         )
         series = series[mask]
     return series
+
+
+def select_top_tabular_features(
+    gain_avg_rank: Optional[pd.Series],
+    perm_avg_rank: Optional[pd.Series],
+    max_features: int,
+) -> Optional[List[str]]:
+    """
+    Select a shortened list of numeric tabular feature names based on ranking data.
+
+    Args:
+        gain_avg_rank: Average rank Series produced from XGBoost gain statistics.
+        perm_avg_rank: Average rank Series produced from permutation importance.
+        max_features: Maximum number of features to keep; ignored if <= 0.
+
+    Returns:
+        A list of feature names to keep, or ``None`` when no reduction is requested.
+    """
+    if max_features <= 0:
+        return None
+
+    combined: Dict[str, List[float]] = {}
+    if gain_avg_rank is not None and not gain_avg_rank.empty:
+        for feat, rank in gain_avg_rank.items():
+            if pd.isna(rank):
+                continue
+            combined.setdefault(str(feat), []).append(float(rank))
+    if perm_avg_rank is not None and not perm_avg_rank.empty:
+        for feat, rank in perm_avg_rank.items():
+            if pd.isna(rank):
+                continue
+            combined.setdefault(str(feat), []).append(float(rank))
+    if not combined:
+        return None
+
+    ranked = sorted(
+        (
+            (feat, float(np.nanmean(ranks)))
+            for feat, ranks in combined.items()
+            if len(ranks) > 0
+        ),
+        key=lambda item: item[1],
+    )
+    top = [feat for feat, _ in ranked[:max_features]]
+    return top if top else None
+
+
+def threshold_search(
+    y_true: np.ndarray, probs: np.ndarray, thresholds: Sequence[float]
+) -> Dict[str, float]:
+    """
+    Scan a list of probability thresholds and pick the best one by Youden's J.
+
+    Args:
+        y_true: Ground-truth binary labels.
+        probs: Positive-class probabilities.
+        thresholds: Candidate thresholds to evaluate.
+
+    Returns:
+        Dictionary containing the best threshold and its supporting metrics.
+    """
+    best_thresh = 0.5
+    best_youden = -np.inf
+    best_acc = 0.0
+    best_sens = 0.0
+    best_spec = 0.0
+    thresholds = list(thresholds)
+    if not thresholds:
+        thresholds = [0.5]
+
+    for thresh in thresholds:
+        preds = (probs >= thresh).astype(int)
+        acc = accuracy_score(y_true, preds)
+        tn, fp, fn, tp = confusion_matrix(
+            y_true, preds, labels=[0, 1]
+        ).ravel()
+        sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        youden = sens + spec - 1.0
+        if youden > best_youden or (np.isclose(youden, best_youden) and acc > best_acc):
+            best_youden = youden
+            best_thresh = float(thresh)
+            best_acc = acc
+            best_sens = sens
+            best_spec = spec
+
+    return {
+        "threshold": best_thresh,
+        "youden": float(best_youden),
+        "accuracy": float(best_acc),
+        "sensitivity": float(best_sens),
+        "specificity": float(best_spec),
+    }
+
+
+def evaluate_model_cv(
+    X: np.ndarray,
+    y: np.ndarray,
+    build_model,
+    cv,
+    cv_kwargs: Dict[str, np.ndarray],
+    thresholds: Sequence[float],
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """
+    Train a model across cross-validation folds and summarise metrics/thresholds.
+
+    Args:
+        X: Feature matrix for the current feature set.
+        y: Target labels.
+        build_model: Callable returning an unfitted estimator.
+        cv: Pre-configured cross-validation splitter.
+        cv_kwargs: Additional keyword arguments for ``cv.split`` (e.g. groups).
+        thresholds: Candidate thresholds to sweep.
+
+    Returns:
+        (metrics_summary, threshold_summary) where both are dictionaries.
+    """
+    fold_acc: List[float] = []
+    fold_auc: List[float] = []
+    all_probs: List[np.ndarray] = []
+    all_true: List[np.ndarray] = []
+
+    for train_idx, test_idx in cv.split(np.zeros(len(y)), y, **cv_kwargs):
+        model = build_model()
+        model.fit(X[train_idx], y[train_idx])
+        prob = model.predict_proba(X[test_idx])[:, 1]
+        y_test = y[test_idx]
+        all_probs.append(prob)
+        all_true.append(y_test)
+        pred_default = (prob >= 0.5).astype(int)
+        fold_acc.append(accuracy_score(y_test, pred_default))
+        if len(np.unique(y_test)) > 1:
+            fold_auc.append(roc_auc_score(y_test, prob))
+
+    metrics = {
+        "acc_mean": float(np.mean(fold_acc)) if fold_acc else float("nan"),
+        "acc_std": float(np.std(fold_acc)) if fold_acc else float("nan"),
+        "auc_mean": float(np.mean(fold_auc)) if fold_auc else float("nan"),
+        "auc_std": float(np.std(fold_auc)) if fold_auc else float("nan"),
+    }
+
+    if not all_probs:
+        return metrics, {
+            "threshold": 0.5,
+            "youden": float("nan"),
+            "accuracy": float("nan"),
+            "sensitivity": float("nan"),
+            "specificity": float("nan"),
+        }
+
+    probs_concat = np.concatenate(all_probs)
+    true_concat = np.concatenate(all_true)
+    threshold_info = threshold_search(true_concat, probs_concat, thresholds)
+    return metrics, threshold_info
 
 
 def analyze_csv_files(
@@ -644,7 +821,11 @@ def analyze_csv_files(
     return csv_big, summary_df, gain_avg_rank, perm_avg_rank
 
 
-def merge_with_embeddings(csv_big: pd.DataFrame, emb_df: pd.DataFrame):
+def merge_with_embeddings(
+    csv_big: pd.DataFrame,
+    emb_df: pd.DataFrame,
+    top_numeric_features: Optional[Sequence[str]] = None,
+):
     """
     這個函式會將表格資料與影像嵌入合併，並回傳不同特徵矩陣。
 
@@ -695,12 +876,71 @@ def merge_with_embeddings(csv_big: pd.DataFrame, emb_df: pd.DataFrame):
     tab_drop_cols.update(emb_cols_sorted)
     tab_df_cols = [col for col in merged.columns if col not in tab_drop_cols]
     tab_df = merged[tab_df_cols].copy()
-    num_cols = tab_df.select_dtypes(include=[np.number]).columns.tolist()
-    X_tab = (
-        tab_df[num_cols].to_numpy(dtype=np.float32)
-        if num_cols
-        else np.empty((len(merged), 0), dtype=np.float32)
-    )
+    original_num_cols = tab_df.select_dtypes(include=[np.number]).columns.tolist()
+    num_cols = original_num_cols.copy()
+    if top_numeric_features:
+        top_set = {str(col) for col in top_numeric_features}
+        selected = [col for col in num_cols if str(col) in top_set]
+        if selected:
+            num_cols = selected
+            log(
+                f"[feature] Using top {len(num_cols)}/{len(original_num_cols)} tabular numeric features after selection"
+            )
+        else:
+            log(
+                "[feature] Requested top tabular features not present in merged data; using all numeric columns"
+            )
+            num_cols = original_num_cols.copy()
+    batch_norm_info: Dict[str, object] = {"tab": None}
+    if num_cols:
+        numeric_df = tab_df[num_cols].apply(pd.to_numeric, errors="coerce")
+        batch_series = merged["_batch"].astype(str).str.lower()
+        eps = 1e-6
+        global_means = numeric_df.mean()
+        global_stds = numeric_df.std()
+        per_batch_means = numeric_df.groupby(batch_series).mean()
+        per_batch_stds = numeric_df.groupby(batch_series).std()
+        transformed_means = numeric_df.groupby(batch_series).transform("mean")
+        transformed_stds = numeric_df.groupby(batch_series).transform("std")
+        safe_global_stds = global_stds.fillna(0.0).abs()
+        safe_global_stds = safe_global_stds.where(safe_global_stds >= eps, eps)
+        adj_stds = transformed_stds.fillna(0.0)
+        mask = adj_stds < eps
+        adj_stds = adj_stds.mask(mask, safe_global_stds, axis=1)
+        adj_means = transformed_means.mask(mask, global_means, axis=1)
+        norm_numeric = (numeric_df - adj_means) / adj_stds
+        tab_df.loc[:, num_cols] = norm_numeric
+        batch_norm_info["tab"] = {
+            "per_batch": {
+                str(batch): {
+                    "mean": {
+                        col: float(per_batch_means.loc[batch, col])
+                        if not pd.isna(per_batch_means.loc[batch, col])
+                        else 0.0
+                        for col in num_cols
+                    },
+                    "std": {
+                        col: float(per_batch_stds.loc[batch, col])
+                        if not pd.isna(per_batch_stds.loc[batch, col])
+                        else 0.0
+                        for col in num_cols
+                    },
+                }
+                for batch in per_batch_means.index
+            },
+            "global_mean": {
+                col: float(global_means[col]) if not pd.isna(global_means[col]) else 0.0
+                for col in num_cols
+            },
+            "global_std": {
+                col: float(global_stds[col]) if not pd.isna(global_stds[col]) else 0.0
+                for col in num_cols
+            },
+            "epsilon": float(eps),
+        }
+        X_tab = tab_df[num_cols].to_numpy(dtype=np.float32)
+    else:
+        X_tab = np.empty((len(merged), 0), dtype=np.float32)
     if X_tab.size and X_emb.size:
         X_concat = np.hstack([X_tab, X_emb])
     elif X_tab.size:
@@ -712,9 +952,20 @@ def merge_with_embeddings(csv_big: pd.DataFrame, emb_df: pd.DataFrame):
     feature_meta = {
         "tab_cols_all": [str(c) for c in tab_df_cols],
         "num_cols": [str(c) for c in num_cols],
+        "num_cols_original": [str(c) for c in original_num_cols],
         "emb_cols": [str(c) for c in emb_cols_sorted],
     }
-    return X_tab, X_emb, X_concat, feature_meta, y, groups_image, groups_batch, merged
+    return (
+        X_tab,
+        X_emb,
+        X_concat,
+        feature_meta,
+        batch_norm_info,
+        y,
+        groups_image,
+        groups_batch,
+        merged,
+    )
 
 
 def compute_class_balance(y: np.ndarray) -> Dict[str, float]:
@@ -755,154 +1006,228 @@ def evaluate_feature_sets(
     skip_cv: bool,
     skip_logo: bool,
     scale_pos_weight: float,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> Tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    Dict[str, Dict[str, float]],
+    Dict[str, Dict[str, float]],
+]:
     """
-    這個函式會針對不同特徵組合進行交叉驗證與 Leave-One-Batch-Out 評估。
-
-    參數:
-    X_tab (np.ndarray): 純表格特徵矩陣。
-    X_emb (np.ndarray): 純影像特徵矩陣。
-    X_concat (np.ndarray): 表格與影像組合特徵矩陣。
-    y (np.ndarray): 標籤資料。
-    groups_image (np.ndarray): 影像分組資訊。
-    groups_batch (np.ndarray): 批次分組資訊。
-    max_splits (int): 最大交叉驗證分割數。
-    skip_cv (bool): 是否略過交叉驗證。
-    skip_logo (bool): 是否略過 Leave-One-Batch-Out。
-    scale_pos_weight (float): XGBoost 的類別權重。
-
-    回傳值:
-    Tuple[pd.DataFrame, pd.DataFrame]: 分別為交叉驗證摘要與 LOBO 結果。
+    Run cross-validation and LOBO evaluations for each feature set, while tuning
+    LogisticRegression ``C`` values and estimating probability thresholds.
     """
-    cv_records: List[Dict[str, float]] = []
+    feature_sets = [
+        ("Embeddings only", "emb", X_emb),
+        ("Tabular only", "tab", X_tab),
+        ("Concat (Tab+Emb)", "concat", X_concat),
+    ]
+    threshold_candidates = np.linspace(0.3, 0.7, 9)
+    cv_records: List[Dict[str, object]] = []
+    logreg_best_params: Dict[str, Dict[str, float]] = {}
+    threshold_map: Dict[str, Dict[str, float]] = {}
+
     if not skip_cv:
-        feature_sets = [
-            ("Embeddings only", X_emb),
-            ("Tabular only", X_tab),
-            ("Concat (Tab+Emb)", X_concat),
-        ]
-        for name, X in feature_sets:
+        for display_name, suffix, X in feature_sets:
             if X.size == 0:
-                log(f"[CV] {name} skipped (no features)")
+                log(f"[CV] {display_name} skipped (no features)")
                 continue
             cv, cv_kwargs, mode = pick_cv(y, groups=groups_image, max_splits=max_splits)
-            logreg = make_logreg()
-            xgb = make_xgb(scale_pos_weight=scale_pos_weight)
-            acc_log = cross_val_score(
-                logreg, X, y, cv=cv, scoring="accuracy", **cv_kwargs
-            )
-            auc_log = cross_val_score(
-                logreg, X, y, cv=cv, scoring="roc_auc", **cv_kwargs
-            )
-            acc_xgb = cross_val_score(xgb, X, y, cv=cv, scoring="accuracy", **cv_kwargs)
-            auc_xgb = cross_val_score(xgb, X, y, cv=cv, scoring="roc_auc", **cv_kwargs)
-            log(
-                f"[CV] {name:16s} ({mode}) LogReg Acc={acc_log.mean():.3f}±{acc_log.std():.3f} AUROC={auc_log.mean():.3f}±{auc_log.std():.3f}"
-            )
-            log(
-                f"[CV] {name:16s} ({mode}) XGB    Acc={acc_xgb.mean():.3f}±{acc_xgb.std():.3f} AUROC={auc_xgb.mean():.3f}±{auc_xgb.std():.3f}"
-            )
-            cv_records.append(
-                {
-                    "feature_set": name,
-                    "model": "logreg",
-                    "metric": "accuracy",
-                    "mean": float(acc_log.mean()),
-                    "std": float(acc_log.std()),
-                    "cv_mode": mode,
+
+            log_candidates = []
+            for C in [0.1, 1.0, 3.0, 10.0]:
+
+                def _build_logreg(c_val: float = C) -> Pipeline:
+                    model = make_logreg()
+                    model.set_params(clf__C=c_val)
+                    return model
+
+                metrics, thresh_info = evaluate_model_cv(
+                    X,
+                    y,
+                    _build_logreg,
+                    cv,
+                    cv_kwargs,
+                    threshold_candidates,
+                )
+                log(
+                    f"[CV] {display_name:16s} ({mode}) LogReg C={C:.2f} "
+                    f"Acc={metrics['acc_mean']:.3f}+/-{metrics['acc_std']:.3f} "
+                    f"AUROC={metrics['auc_mean']:.3f}+/-{metrics['auc_std']:.3f}"
+                )
+                log_candidates.append(
+                    {
+                        "C": C,
+                        "metrics": metrics,
+                        "threshold": thresh_info,
+                    }
+                )
+
+            if log_candidates:
+                best_candidate = max(
+                    log_candidates,
+                    key=lambda item: (
+                        not np.isnan(item["metrics"]["auc_mean"]),
+                        item["metrics"]["auc_mean"],
+                        item["metrics"]["acc_mean"],
+                    ),
+                )
+                best_C = best_candidate["C"]
+                logreg_best_params[suffix] = {"C": best_C}
+                threshold_map[f"logreg_{suffix}"] = best_candidate["threshold"]
+                best_metrics = best_candidate["metrics"]
+                cv_records.append(
+                    {
+                        "feature_set": display_name,
+                        "model": "logreg",
+                        "metric": "accuracy",
+                        "mean": best_metrics["acc_mean"],
+                        "std": best_metrics["acc_std"],
+                        "cv_mode": mode,
+                        "param": f"C={best_C}",
+                    }
+                )
+                cv_records.append(
+                    {
+                        "feature_set": display_name,
+                        "model": "logreg",
+                        "metric": "roc_auc",
+                        "mean": best_metrics["auc_mean"],
+                        "std": best_metrics["auc_std"],
+                        "cv_mode": mode,
+                        "param": f"C={best_C}",
+                    }
+                )
+                log(
+                    f"[CV] {display_name:16s} LogReg best C={best_C:.2f} "
+                    f"threshold={best_candidate['threshold']['threshold']:.3f}"
+                )
+            else:
+                logreg_best_params[suffix] = {"C": 1.0}
+                threshold_map[f"logreg_{suffix}"] = {
+                    "threshold": 0.5,
+                    "youden": float("nan"),
+                    "accuracy": float("nan"),
+                    "sensitivity": float("nan"),
+                    "specificity": float("nan"),
                 }
+
+            metrics_xgb, thresh_xgb = evaluate_model_cv(
+                X,
+                y,
+                lambda: make_xgb(scale_pos_weight=scale_pos_weight),
+                cv,
+                cv_kwargs,
+                threshold_candidates,
+            )
+            threshold_map[f"xgb_{suffix}"] = thresh_xgb
+            log(
+                f"[CV] {display_name:16s} ({mode}) XGB    "
+                f"Acc={metrics_xgb['acc_mean']:.3f}+/-{metrics_xgb['acc_std']:.3f} "
+                f"AUROC={metrics_xgb['auc_mean']:.3f}+/-{metrics_xgb['auc_std']:.3f}"
             )
             cv_records.append(
                 {
-                    "feature_set": name,
-                    "model": "logreg",
-                    "metric": "roc_auc",
-                    "mean": float(auc_log.mean()),
-                    "std": float(auc_log.std()),
-                    "cv_mode": mode,
-                }
-            )
-            cv_records.append(
-                {
-                    "feature_set": name,
+                    "feature_set": display_name,
                     "model": "xgb",
                     "metric": "accuracy",
-                    "mean": float(acc_xgb.mean()),
-                    "std": float(acc_xgb.std()),
+                    "mean": metrics_xgb["acc_mean"],
+                    "std": metrics_xgb["acc_std"],
                     "cv_mode": mode,
+                    "param": "default",
                 }
             )
             cv_records.append(
                 {
-                    "feature_set": name,
+                    "feature_set": display_name,
                     "model": "xgb",
                     "metric": "roc_auc",
-                    "mean": float(auc_xgb.mean()),
-                    "std": float(auc_xgb.std()),
+                    "mean": metrics_xgb["auc_mean"],
+                    "std": metrics_xgb["auc_std"],
                     "cv_mode": mode,
+                    "param": "default",
                 }
             )
+            log(
+                f"[CV] {display_name:16s} XGB threshold={thresh_xgb['threshold']:.3f}"
+            )
+    else:
+        for _, suffix, X in feature_sets:
+            if X.size == 0:
+                continue
+            logreg_best_params[suffix] = {"C": 1.0}
+            threshold_map[f"logreg_{suffix}"] = {
+                "threshold": 0.5,
+                "youden": float("nan"),
+                "accuracy": float("nan"),
+                "sensitivity": float("nan"),
+                "specificity": float("nan"),
+            }
+            threshold_map[f"xgb_{suffix}"] = {
+                "threshold": 0.5,
+                "youden": float("nan"),
+                "accuracy": float("nan"),
+                "sensitivity": float("nan"),
+                "specificity": float("nan"),
+            }
+
     cv_df = pd.DataFrame(cv_records)
-    lobo_records: List[Dict[str, float]] = []
-    if not skip_logo and groups_batch.size >= 1:
-        unique_batches = pd.Series(groups_batch).nunique()
-        if unique_batches >= 2:
-            feature_sets = [
-                ("Embeddings only", X_emb),
-                ("Tabular only", X_tab),
-                ("Concat (Tab+Emb)", X_concat),
-            ]
-            for name, X in feature_sets:
-                if X.size == 0:
-                    log(f"[LOBO] {name} skipped (no features)")
-                    continue
-                logreg = make_logreg()
-                xgb = make_xgb(scale_pos_weight=scale_pos_weight)
-                logo = LeaveOneGroupOut()
-                for train_idx, test_idx in logo.split(X, y, groups=groups_batch):
-                    batch_name = pd.Series(groups_batch[test_idx]).iloc[0]
-                    logreg.fit(X[train_idx], y[train_idx])
-                    xgb.fit(X[train_idx], y[train_idx])
-                    prob_log = logreg.predict_proba(X[test_idx])[:, 1]
-                    prob_xgb = xgb.predict_proba(X[test_idx])[:, 1]
-                    pred_log = (prob_log >= 0.5).astype(int)
-                    pred_xgb = (prob_xgb >= 0.5).astype(int)
-                    auc_log = (
-                        roc_auc_score(y[test_idx], prob_log)
-                        if len(np.unique(y[test_idx])) > 1
-                        else np.nan
-                    )
-                    auc_xgb = (
-                        roc_auc_score(y[test_idx], prob_xgb)
-                        if len(np.unique(y[test_idx])) > 1
-                        else np.nan
-                    )
-                    acc_log = accuracy_score(y[test_idx], pred_log)
-                    acc_xgb = accuracy_score(y[test_idx], pred_xgb)
-                    lobo_records.append(
-                        {
-                            "feature_set": name,
-                            "model": "logreg",
-                            "test_batch": str(batch_name),
-                            "acc": float(acc_log),
-                            "roc_auc": (
-                                float(auc_log) if not np.isnan(auc_log) else np.nan
-                            ),
-                        }
-                    )
-                    lobo_records.append(
-                        {
-                            "feature_set": name,
-                            "model": "xgb",
-                            "test_batch": str(batch_name),
-                            "acc": float(acc_xgb),
-                            "roc_auc": (
-                                float(auc_xgb) if not np.isnan(auc_xgb) else np.nan
-                            ),
-                        }
-                    )
+
+    lobo_records: List[Dict[str, object]] = []
+    if not skip_logo:
+        logo = LeaveOneGroupOut()
+        for display_name, suffix, X in feature_sets:
+            if X.size == 0:
+                continue
+            best_C = logreg_best_params.get(suffix, {}).get("C", 1.0)
+            for train_idx, test_idx in logo.split(X, y, groups=groups_batch):
+                batch_name = pd.Series(groups_batch[test_idx]).iloc[0]
+                log_model = make_logreg()
+                log_model.set_params(clf__C=best_C)
+                xgb_model = make_xgb(scale_pos_weight=scale_pos_weight)
+
+                log_model.fit(X[train_idx], y[train_idx])
+                xgb_model.fit(X[train_idx], y[train_idx])
+
+                prob_log = log_model.predict_proba(X[test_idx])[:, 1]
+                prob_xgb = xgb_model.predict_proba(X[test_idx])[:, 1]
+
+                pred_log = (prob_log >= 0.5).astype(int)
+                pred_xgb = (prob_xgb >= 0.5).astype(int)
+
+                auc_log = (
+                    roc_auc_score(y[test_idx], prob_log)
+                    if len(np.unique(y[test_idx])) > 1
+                    else np.nan
+                )
+                auc_xgb = (
+                    roc_auc_score(y[test_idx], prob_xgb)
+                    if len(np.unique(y[test_idx])) > 1
+                    else np.nan
+                )
+                acc_log = accuracy_score(y[test_idx], pred_log)
+                acc_xgb = accuracy_score(y[test_idx], pred_xgb)
+
+                lobo_records.append(
+                    {
+                        "feature_set": display_name,
+                        "model": "logreg",
+                        "test_batch": str(batch_name),
+                        "acc": float(acc_log),
+                        "roc_auc": float(auc_log) if not np.isnan(auc_log) else np.nan,
+                    }
+                )
+                lobo_records.append(
+                    {
+                        "feature_set": display_name,
+                        "model": "xgb",
+                        "test_batch": str(batch_name),
+                        "acc": float(acc_xgb),
+                        "roc_auc": float(auc_xgb) if not np.isnan(auc_xgb) else np.nan,
+                    }
+                )
+
     lobo_df = pd.DataFrame(lobo_records)
-    return cv_df, lobo_df
+    return cv_df, lobo_df, logreg_best_params, threshold_map
 
 
 def train_final_models(
@@ -911,6 +1236,7 @@ def train_final_models(
     X_concat: np.ndarray,
     y: np.ndarray,
     scale_pos_weight: float,
+    logreg_params: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> Dict[str, object]:
     """
     這個函式會以全量資料訓練最終的各式模型。
@@ -926,14 +1252,26 @@ def train_final_models(
     Dict[str, object]: 模型名稱對應訓練完成的模型物件。
     """
     models: Dict[str, object] = {}
+    logreg_params = logreg_params or {}
+
+    def _configure_logreg(suffix: str) -> Pipeline:
+        model = make_logreg()
+        params = logreg_params.get(suffix, {})
+        if "C" in params:
+            model.set_params(clf__C=float(params["C"]))
+        return model
+
     if X_emb.size:
-        models["logreg_emb"] = make_logreg().fit(X_emb, y)
+        logreg_model = _configure_logreg("emb")
+        models["logreg_emb"] = logreg_model.fit(X_emb, y)
         models["xgb_emb"] = make_xgb(scale_pos_weight=scale_pos_weight).fit(X_emb, y)
     if X_tab.size:
-        models["logreg_tab"] = make_logreg().fit(X_tab, y)
+        logreg_model = _configure_logreg("tab")
+        models["logreg_tab"] = logreg_model.fit(X_tab, y)
         models["xgb_tab"] = make_xgb(scale_pos_weight=scale_pos_weight).fit(X_tab, y)
     if X_concat.size:
-        models["logreg_concat"] = make_logreg().fit(X_concat, y)
+        logreg_model = _configure_logreg("concat")
+        models["logreg_concat"] = logreg_model.fit(X_concat, y)
         models["xgb_concat"] = make_xgb(scale_pos_weight=scale_pos_weight).fit(
             X_concat, y
         )
@@ -966,6 +1304,7 @@ def compute_train_scores(
     X_emb: np.ndarray,
     X_concat: np.ndarray,
     y: np.ndarray,
+    thresholds: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> pd.DataFrame:
     """
     這個函式會計算訓練資料上的準確率與 AUROC。
@@ -986,6 +1325,7 @@ def compute_train_scores(
         "emb": X_emb,
         "concat": X_concat,
     }
+    thresholds = thresholds or {}
     for name, model in models.items():
         key = None
         if name.endswith("_tab"):
@@ -1000,11 +1340,21 @@ def compute_train_scores(
         if X.size == 0:
             continue
         prob = model.predict_proba(X)[:, 1]
-        pred = (prob >= 0.5).astype(int)
+        threshold = float(thresholds.get(name, {}).get("threshold", 0.5))
+        pred = (prob >= threshold).astype(int)
         acc = accuracy_score(y, pred)
         auc = roc_auc_score(y, prob)
-        log(f"[TRAIN] {name:16s} Acc={acc:.3f} AUROC={auc:.3f}")
-        records.append({"model": name, "accuracy": float(acc), "roc_auc": float(auc)})
+        log(
+            f"[TRAIN] {name:16s} Acc={acc:.3f} AUROC={auc:.3f} thr={threshold:.3f}"
+        )
+        records.append(
+            {
+                "model": name,
+                "accuracy": float(acc),
+                "roc_auc": float(auc),
+                "threshold": threshold,
+            }
+        )
     return pd.DataFrame(records)
 
 
@@ -1026,73 +1376,92 @@ def save_manifest(model_dir: Path, manifest: Dict[str, object]) -> Path:
 
 
 def parse_args() -> argparse.Namespace:
-    """
-    這個函式會定義並解析訓練腳本所需的命令列參數。
-
-    參數:
-    無。
-
-    回傳值:
-    argparse.Namespace: 解析後的參數集合。
-    """
-    parser = argparse.ArgumentParser(description="訓練 Ki67 分類流程。")
+    """Parse command-line options for the Ki67 training pipeline."""
+    parser = argparse.ArgumentParser(description="Train the Ki67 classifier pipeline.")
     parser.add_argument(
         "--csv-root",
         type=Path,
         default=Path("data/output/results"),
-        help="包含 *_cleaned.csv 檔案的根目錄。",
+        help="Root directory containing batch subfolders with *_cleaned.csv files.",
     )
     parser.add_argument(
         "--image-root",
         type=Path,
         default=Path("data/output/cyto_crops"),
-        help="依批次存放影像切塊的根目錄。",
+        help="Root directory for cropped images organised by batch.",
     )
     parser.add_argument(
-        "--channel", default="cyto", help="轉換 Cell_ID 為檔名時使用的通道字尾。"
+        "--channel",
+        default="cyto",
+        help="Channel suffix used when converting Cell_ID values to image stems.",
     )
     parser.add_argument(
         "--output-root",
         type=Path,
         default=Path("outputs_models"),
-        help="儲存訓練後模型的輸出目錄。",
+        help="Destination directory for trained model artifacts.",
     )
     parser.add_argument(
         "--tabular-output-root",
         type=Path,
         default=Path("analyze_results"),
-        help="輸出表格分析結果的目錄。",
+        help="Directory where per-CSV analysis reports will be written.",
     )
     parser.add_argument(
         "--backbone",
         choices=sorted(SUPPORTED_BACKBONES),
         default="resnet18",
-        help="用來抽取影像特徵的 CNN 架構。",
+        help="CNN backbone used to extract image embeddings.",
     )
     parser.add_argument(
-        "--image-size", type=int, default=224, help="影像縮放後的邊長像素。"
+        "--image-size",
+        type=int,
+        default=224,
+        help="Image size (pixels) used when resizing before embedding extraction.",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=64, help="抽取特徵時的批次大小。"
+        "--batch-size",
+        type=int,
+        default=64,
+        help="Batch size when extracting embeddings with the backbone CNN.",
     )
     parser.add_argument(
-        "--device", default=None, help="PyTorch 使用的裝置，例如 'cuda:0'。"
+        "--device",
+        default=None,
+        help="Torch device string, e.g. 'cuda:0' or 'cpu'. Defaults to auto-detect.",
     )
     parser.add_argument(
-        "--max-splits", type=int, default=5, help="交叉驗證允許的最大分割數。"
+        "--max-splits",
+        type=int,
+        default=5,
+        help="Maximum number of folds considered when constructing cross-validation.",
+    )
+    parser.add_argument(
+        "--top-tabular-features",
+        type=int,
+        default=0,
+        help="Keep only the top-K numeric tabular features (0 disables feature selection).",
     )
     parser.add_argument(
         "--skip-permutation",
         action="store_true",
-        help="略過計算 permutation importance。",
+        help="Skip permutation-importance calculation for tabular features.",
     )
     parser.add_argument(
-        "--skip-cv", action="store_true", help="略過合併資料的交叉驗證。"
+        "--skip-cv",
+        action="store_true",
+        help="Skip generating the overall cross-validation summary.",
     )
     parser.add_argument(
-        "--skip-logo", action="store_true", help="略過分批 Leave-One-Batch-Out 評估。"
+        "--skip-logo",
+        action="store_true",
+        help="Skip Leave-One-Batch-Out evaluation.",
     )
-    parser.add_argument("--timestamp", default=None, help="自訂輸出資料夾的時間戳記。")
+    parser.add_argument(
+        "--timestamp",
+        default=None,
+        help="Optional output folder name; defaults to the current timestamp.",
+    )
     return parser.parse_args()
 
 
@@ -1123,6 +1492,13 @@ def main() -> None:
         skip_permutation=args.skip_permutation,
         max_splits=args.max_splits,
     )
+    top_tabular_features = select_top_tabular_features(
+        gain_avg_rank, perm_avg_rank, args.top_tabular_features
+    )
+    if top_tabular_features:
+        log(
+            f"[feature] Selected {len(top_tabular_features)} tabular features based on importance ranking"
+        )
     dataset = MultiBatchImageDataset(args.image_root, size=args.image_size)
     if len(dataset) == 0:
         log(f"No images found under {args.image_root}")
@@ -1135,8 +1511,20 @@ def main() -> None:
         device=args.device,
     )
     log(f"Embeddings dataframe shape: {emb_df.shape}")
-    X_tab, X_emb, X_concat, feature_meta, y, groups_image, groups_batch, merged = (
-        merge_with_embeddings(csv_big, emb_df)
+    (
+        X_tab,
+        X_emb,
+        X_concat,
+        feature_meta,
+        batch_norm_info,
+        y,
+        groups_image,
+        groups_batch,
+        merged,
+    ) = merge_with_embeddings(
+        csv_big,
+        emb_df,
+        top_numeric_features=top_tabular_features,
     )
     class_balance = compute_class_balance(y)
     log(
@@ -1147,7 +1535,12 @@ def main() -> None:
             spw=class_balance["scale_pos_weight"],
         )
     )
-    cv_df, lobo_df = evaluate_feature_sets(
+    (
+        cv_df,
+        lobo_df,
+        logreg_params,
+        threshold_map,
+    ) = evaluate_feature_sets(
         X_tab=X_tab,
         X_emb=X_emb,
         X_concat=X_concat,
@@ -1162,16 +1555,52 @@ def main() -> None:
     ts = args.timestamp or time.strftime("%Y%m%d-%H%M%S")
     model_dir = args.output_root / ts
     models = train_final_models(
-        X_tab, X_emb, X_concat, y, scale_pos_weight=class_balance["scale_pos_weight"]
+        X_tab,
+        X_emb,
+        X_concat,
+        y,
+        scale_pos_weight=class_balance["scale_pos_weight"],
+        logreg_params=logreg_params,
     )
     artifact_paths = save_models(models, model_dir)
-    train_scores_df = compute_train_scores(models, X_tab, X_emb, X_concat, y)
+    train_scores_df = compute_train_scores(
+        models, X_tab, X_emb, X_concat, y, thresholds=threshold_map
+    )
     if not train_scores_df.empty:
         train_scores_df.to_csv(model_dir / "train_scores.csv", index=False)
     if not cv_df.empty:
         cv_df.to_csv(model_dir / "cv_summary.csv", index=False)
     if not lobo_df.empty:
         lobo_df.to_csv(model_dir / "lobo_summary.csv", index=False)
+    logreg_param_export = {
+        key: {param: float(val) for param, val in params.items()}
+        for key, params in logreg_params.items()
+    }
+    xgb_param_export = make_xgb(
+        scale_pos_weight=class_balance["scale_pos_weight"]
+    ).get_params()
+
+    def _clean_threshold_dict(
+        th_map: Dict[str, Dict[str, float]]
+    ) -> Dict[str, Dict[str, Optional[float]]]:
+        cleaned: Dict[str, Dict[str, Optional[float]]] = {}
+        for model_key, info in th_map.items():
+            clean_info: Dict[str, Optional[float]] = {}
+            for metric, value in info.items():
+                if isinstance(value, float) and math.isnan(value):
+                    clean_info[metric] = None
+                elif isinstance(value, (np.floating, float, int)):
+                    clean_info[metric] = float(value)
+                else:
+                    clean_info[metric] = value
+            cleaned[model_key] = clean_info
+        return cleaned
+
+    threshold_export = _clean_threshold_dict(threshold_map)
+    for model_key, info in threshold_export.items():
+        threshold_value = info.get("threshold")
+        if threshold_value is not None:
+            log(f"[threshold] {model_key}: {threshold_value:.3f}")
     manifest = {
         "pipeline": "resnet_embedding_extractor + classical_classifier",
         "resnet": {
@@ -1190,10 +1619,18 @@ def main() -> None:
         "features": {
             "tab_cols_all": feature_meta["tab_cols_all"],
             "num_cols": feature_meta["num_cols"],
+            "num_cols_original": feature_meta["num_cols_original"],
             "emb_cols": feature_meta["emb_cols"],
             "emb_dim": int(X_emb.shape[1]),
             "concat_dim": int(X_concat.shape[1]),
+            "top_tabular_limit": int(args.top_tabular_features),
         },
+        "batch_normalization": batch_norm_info,
+        "model_params": {
+            "logreg": logreg_param_export,
+            "xgb": xgb_param_export,
+        },
+        "decision_thresholds": threshold_export,
         "class_balance": class_balance,
         "artifacts": {name: str(path) for name, path in artifact_paths.items()},
         "versions": {

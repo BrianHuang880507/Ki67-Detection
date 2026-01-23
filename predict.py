@@ -4,7 +4,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union, Set
 
 import joblib
 import numpy as np
@@ -263,7 +263,9 @@ def find_image_column(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
-def load_csv_inputs(csv_paths: Sequence[Path], channel: str) -> pd.DataFrame:
+def load_csv_inputs(
+    csv_paths: Sequence[Path], channel: str
+) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
     """
     這個函式會讀取多個 CSV 並附加 join key、批次與索引資訊。
 
@@ -275,10 +277,12 @@ def load_csv_inputs(csv_paths: Sequence[Path], channel: str) -> pd.DataFrame:
     pd.DataFrame: 合併後的整體資料表。
     """
     frames: List[pd.DataFrame] = []
+    original_columns: Dict[str, List[str]] = {}
     for path in csv_paths:
         if not path.exists():
             raise FileNotFoundError(f"CSV file not found: {path}")
         df = pd.read_csv(path)
+        original_columns[path.as_posix()] = df.columns.tolist()
         df["_batch"] = path.parent.name
         df["_source_csv"] = path.as_posix()
         if ID_COL in df.columns:
@@ -296,7 +300,7 @@ def load_csv_inputs(csv_paths: Sequence[Path], channel: str) -> pd.DataFrame:
         raise RuntimeError("No CSV data loaded.")
     data_df = pd.concat(frames, ignore_index=True)
     data_df["_orig_index"] = np.arange(len(data_df))
-    return data_df
+    return data_df, original_columns
 
 
 def build_image_index(
@@ -429,6 +433,97 @@ def prepare_feature_matrices(
     return X_tab, X_emb, X_concat
 
 
+def apply_batch_normalization(
+    df: pd.DataFrame,
+    num_cols: Sequence[str],
+    batch_norm_info: Optional[Dict[str, object]],
+) -> pd.DataFrame:
+    """
+    Apply batch-wise normalization using statistics recorded in the manifest.
+    """
+    if not num_cols or not batch_norm_info:
+        return df
+    tab_info = batch_norm_info.get("tab") if isinstance(batch_norm_info, dict) else None
+    if not tab_info:
+        return df
+    per_batch = tab_info.get("per_batch", {}) or {}
+    global_means = pd.Series(tab_info.get("global_mean", {}), dtype="float64")
+    global_stds = pd.Series(tab_info.get("global_std", {}), dtype="float64")
+    epsilon = float(tab_info.get("epsilon", 1e-6))
+    num_cols = list(num_cols)
+    present_cols = [col for col in num_cols if col in df.columns]
+    if not present_cols:
+        return df
+    numeric_df = df.loc[:, present_cols].apply(pd.to_numeric, errors="coerce")
+    batch_series = df["_batch"].astype(str).str.lower()
+
+    global_means = global_means.reindex(present_cols).astype(float, copy=False)
+    global_stds = global_stds.reindex(present_cols).astype(float, copy=False)
+    adj_means = pd.DataFrame(
+        np.nan, index=df.index, columns=present_cols, dtype=np.float64
+    )
+    adj_stds = pd.DataFrame(
+        np.nan, index=df.index, columns=present_cols, dtype=np.float64
+    )
+
+    for batch_name, stats in per_batch.items():
+        mask = batch_series == str(batch_name).lower()
+        if not mask.any():
+            continue
+        mean_series = (
+            pd.Series(stats.get("mean", {}), dtype="float64")
+            .reindex(present_cols)
+            .astype(float, copy=False)
+        )
+        std_series = (
+            pd.Series(stats.get("std", {}), dtype="float64")
+            .reindex(present_cols)
+            .astype(float, copy=False)
+        )
+        adj_means.loc[mask, :] = mean_series.values
+        adj_stds.loc[mask, :] = std_series.values
+
+    for col in present_cols:
+        mean_val = float(global_means.get(col, 0.0))
+        std_val = float(global_stds.get(col, epsilon))
+        if abs(std_val) < epsilon:
+            std_val = epsilon
+        col_means = adj_means[col].where(adj_means[col].notna(), mean_val)
+        col_stds = adj_stds[col].where(adj_stds[col].notna(), std_val)
+        col_stds = col_stds.abs()
+        col_stds = col_stds.where(col_stds >= epsilon, std_val)
+        col_stds = col_stds.fillna(std_val)
+        adj_means[col] = col_means
+        adj_stds[col] = col_stds
+    norm_numeric = (numeric_df - adj_means) / adj_stds
+    df.loc[:, present_cols] = norm_numeric
+    return df
+
+
+def attach_accuracy_summary(df: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[float]]:
+    """
+    Append an accuracy summary row and ensure the accuracy column is last.
+    """
+    df_out = df.copy()
+    accuracy_value: Optional[float] = None
+    if TARGET_COL in df_out.columns and "prediction" in df_out.columns:
+        y_true = pd.to_numeric(df_out[TARGET_COL], errors="coerce")
+        y_pred = pd.to_numeric(df_out["prediction"], errors="coerce")
+        mask = y_true.isin([0, 1]) & y_pred.isin([0, 1])
+        total = int(mask.sum())
+        if total > 0:
+            correct = int((y_true[mask] == y_pred[mask]).sum())
+            accuracy_value = correct / total
+    df_out["accuracy"] = ""
+    cols = [c for c in df_out.columns if c != "accuracy"] + ["accuracy"]
+    df_out = df_out.loc[:, cols]
+    if accuracy_value is not None:
+        summary_row = {col: "" for col in df_out.columns}
+        summary_row["accuracy"] = f"{accuracy_value:.6f}"
+        df_out = pd.concat([df_out, pd.DataFrame([summary_row])], ignore_index=True)
+    return df_out, accuracy_value
+
+
 def select_feature_matrix(
     model_key: str, matrices: Dict[str, np.ndarray]
 ) -> Tuple[str, np.ndarray]:
@@ -451,7 +546,7 @@ def select_feature_matrix(
     raise ValueError(f"Unrecognized model key: {model_key}")
 
 
-def run_inference(args: argparse.Namespace) -> Path:
+def run_inference(args: argparse.Namespace) -> Union[Path, List[Path]]:
     """
     這個函式會依命令列參數載入模型、整理資料並輸出預測結果。
 
@@ -459,7 +554,7 @@ def run_inference(args: argparse.Namespace) -> Path:
     args (argparse.Namespace): 使用者輸入的參數集合。
 
     回傳值:
-    Path: 預測結果 CSV 的輸出路徑。
+    Path 或 List[Path]: 預測結果 CSV 的輸出路徑或路徑列表。
     """
     model_dir = args.model_dir.resolve()
     manifest = load_manifest(model_dir)
@@ -481,6 +576,7 @@ def run_inference(args: argparse.Namespace) -> Path:
     pretrained = bool(manifest.get("resnet", {}).get("pretrained", True))
     num_cols = manifest.get("features", {}).get("num_cols", [])
     emb_cols = manifest.get("features", {}).get("emb_cols", [])
+    batch_norm_info = manifest.get("batch_normalization")
     emb_dim = (
         int(manifest.get("features", {}).get("emb_dim", len(emb_cols)))
         if emb_cols
@@ -491,7 +587,8 @@ def run_inference(args: argparse.Namespace) -> Path:
     log(f"Loading CSV files ({len(csv_paths)}):")
     for p in csv_paths:
         log(f"  {p}")
-    data_df = load_csv_inputs(csv_paths, channel=channel)
+    should_split = len(csv_paths) > 1 and getattr(args, "split_output", False)
+    data_df, source_columns = load_csv_inputs(csv_paths, channel=channel)
 
     for col in num_cols:
         if col not in data_df.columns:
@@ -560,6 +657,7 @@ def run_inference(args: argparse.Namespace) -> Path:
         feat_dim = 0
 
     merged = merged.sort_values("_orig_index").reset_index(drop=True)
+    merged = apply_batch_normalization(merged, num_cols, batch_norm_info)
 
     X_tab, X_emb, X_concat = prepare_feature_matrices(merged, num_cols, emb_cols)
     matrices = {"tab": X_tab, "emb": X_emb, "concat": X_concat}
@@ -583,17 +681,94 @@ def run_inference(args: argparse.Namespace) -> Path:
     result_df["model_key"] = args.model_key
     result_df = result_df.drop(columns=["_orig_index"], errors="ignore")
 
+    internal_drop_cols = ["_batch", "_source_csv", "_join_key", "model_key"]
+    intensity_union: Set[str] = set()
+    for cols in source_columns.values():
+        for col in cols:
+            if col.startswith("IntDen-") or col.startswith("RawIntDen-"):
+                intensity_union.add(col)
+
+    if should_split:
+        if args.output is not None:
+            output_dir = Path(args.output)
+            if output_dir.suffix:
+                raise ValueError("使用 --split-output 時，--output 必須指定為資料夾路徑。")
+        else:
+            output_dir = model_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        output_paths: List[Path] = []
+        for source_csv, group_df in result_df.groupby("_source_csv", sort=False):
+            if pd.isna(source_csv):
+                continue
+            source_name = str(source_csv).strip()
+            if not source_name:
+                continue
+            src_path = Path(source_name)
+            safe_tag = "".join(
+                c if c.isalnum() or c in ("-", "_") else "-" for c in src_path.stem
+            )
+            filename = f"predictions_{args.model_key}_{safe_tag}_{ts}.csv"
+            out_path = output_dir / filename
+            allowed_intensity = {
+                col
+                for col in source_columns.get(source_name, [])
+                if col.startswith("IntDen-") or col.startswith("RawIntDen-")
+            }
+            group_out = group_df.drop(columns=internal_drop_cols, errors="ignore").copy()
+            drop_intensity = [
+                col
+                for col in group_out.columns
+                if (col.startswith("IntDen-") or col.startswith("RawIntDen-"))
+                and col not in allowed_intensity
+            ]
+            if drop_intensity:
+                group_out = group_out.drop(columns=drop_intensity, errors="ignore")
+            group_out, group_accuracy = attach_accuracy_summary(group_out)
+            group_out.to_csv(out_path, index=False)
+            log(f"Wrote predictions to {out_path}")
+            log(f"Rows scored ({src_path.name}): {len(group_df)}")
+            log(f"Positive predictions ({src_path.name}): {int(group_df['prediction'].sum())}")
+            if group_accuracy is not None:
+                log(
+                    f"Accuracy ({src_path.name}): {group_accuracy:.4f}"
+                )
+            else:
+                log(f"Accuracy ({src_path.name}): N/A")
+            output_paths.append(out_path)
+        log(f"Total rows scored: {len(result_df)}")
+        log(f"Positive predictions (all files): {int(result_df['prediction'].sum())}")
+        if dropped_pairs:
+            log(f"Rows skipped due to missing images: {len(dropped_pairs)}")
+        return output_paths
+
     output_path = args.output
     if output_path is None:
         ts = time.strftime("%Y%m%d-%H%M%S")
         output_path = model_dir / f"predictions_{args.model_key}_{ts}.csv"
     else:
         output_path = Path(output_path)
+    result_df = result_df.drop(columns=internal_drop_cols, errors="ignore")
+    row_count = len(result_df)
+    positive_count = int(preds.sum())
+    drop_intensity = [
+        col
+        for col in result_df.columns
+        if (col.startswith("IntDen-") or col.startswith("RawIntDen-"))
+        and col not in intensity_union
+    ]
+    if drop_intensity:
+        result_df = result_df.drop(columns=drop_intensity, errors="ignore")
+    result_df, overall_accuracy = attach_accuracy_summary(result_df)
     result_df.to_csv(output_path, index=False)
 
     log(f"Wrote predictions to {output_path}")
-    log(f"Rows scored: {len(result_df)}")
-    log(f"Positive predictions: {int(preds.sum())}")
+    log(f"Rows scored: {row_count}")
+    log(f"Positive predictions: {positive_count}")
+    if overall_accuracy is not None:
+        log(f"Accuracy: {overall_accuracy:.4f}")
+    else:
+        log("Accuracy: N/A")
     if dropped_pairs:
         log(f"Rows skipped due to missing images: {len(dropped_pairs)}")
     return output_path
@@ -651,6 +826,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output", type=Path, default=None, help="指定預測結果輸出的 CSV 路徑。"
     )
+    parser.add_argument(
+        "--split-output",
+        action="store_true",
+        help="若同時提供多個 CSV，啟用後會為每個輸入各自輸出結果檔。",
+    )
     return parser.parse_args()
 
 
@@ -666,8 +846,13 @@ def main() -> None:
     """
     args = parse_args()
     warnings.filterwarnings("ignore", message="Palette images with transparency")
-    output_path = run_inference(args)
-    log(f"Done. Predictions stored at {output_path}")
+    output_paths = run_inference(args)
+    if isinstance(output_paths, list):
+        log("Done. Predictions stored at:")
+        for path in output_paths:
+            log(f"  {path}")
+    else:
+        log(f"Done. Predictions stored at {output_paths}")
 
 
 if __name__ == "__main__":

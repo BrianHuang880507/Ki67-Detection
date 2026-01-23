@@ -12,13 +12,23 @@ from ki67dtc.utils.io import list_files, output_dir, load_outlines, remove_temp_
 
 # 模型路徑固定
 CYTO_MODEL_PATH = "model/model_BDL6_label_new"
-NUC_MODEL_PATH = "model/model_BDL3_label_dapi"
+NUC_MODEL_PATH = "cyto3"
 
 
 # ===============================
 # 分割流程
 # ===============================
-def segment(model_path: str, img_files: list[Path], output_dir: Path, suffix: str):
+def segment(
+    model_path: str,
+    img_files: list[Path],
+    output_dir: Path,
+    suffix: str,
+    channels: list[int] | tuple[int, int] = (0, 0),
+    diameter: float | None = None,
+    cellprob_threshold: float = 0.0,
+    flow_threshold: float = 0.4,
+    invert: bool = False,
+):
     """
     使用指定模型進行細胞質 (cyto) 或細胞核 (nuc) 分割
     輸出 segmentation 結果到指定資料夾
@@ -27,8 +37,17 @@ def segment(model_path: str, img_files: list[Path], output_dir: Path, suffix: st
     for i in trange(len(img_files), desc=f"Segmenting ({suffix})"):
         f = img_files[i]
         img = io.imread(f)
-        masks, flows, styles = model.eval(img, diameter=None, channels=[0, 0])
-        io.masks_flows_to_seg(img, masks, flows, f, channels=[0, 0], diams=None)
+        masks, flows, styles = model.eval(
+            img,
+            diameter=diameter,
+            channels=list(channels),
+            cellprob_threshold=cellprob_threshold,
+            flow_threshold=flow_threshold,
+            invert=invert,
+        )
+        io.masks_flows_to_seg(
+            img, masks, flows, f, channels=list(channels), diams=diameter
+        )
         seg_file = f.with_name(f"{f.stem}_seg.npy")
         target_file = output_dir / f"{f.stem}_{suffix}_seg.npy"
         shutil.move(seg_file, target_file)
@@ -48,8 +67,8 @@ def segment_all(input_dir: str):
     if not img_files:
         print(f"[WARN] 找不到相位差圖片於 {input_dir}")
         return
-    segment(CYTO_MODEL_PATH, img_files, seg_dir, "cyto")
-    segment(NUC_MODEL_PATH, img_files, seg_dir, "nuc")
+    segment(CYTO_MODEL_PATH, img_files, seg_dir, "cyto", channels=(0, 0))
+    segment(NUC_MODEL_PATH, img_files, seg_dir, "nuc", channels=(0, 0))
 
 
 # ===============================
@@ -103,6 +122,7 @@ def create_mask(outlines, shape):
 
 from pathlib import Path
 from typing import Optional, Tuple
+
 
 def find_image_and_nuc_file(cyto_file: Path) -> Tuple[Optional[Path], Optional[Path]]:
     """根據 cytoplasm outlines 找對應的 nucleus outlines 與原圖"""

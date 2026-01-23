@@ -219,23 +219,72 @@ def flour_anal(
 # ===============================
 # Ki67 陽性判斷與合併
 # ===============================
-def ki67_binarize(img_path: Union[str, Path]) -> Path:
+def _remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
+    """移除小於 min_area 的連通元件。"""
+    if min_area <= 0:
+        return mask
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8), connectivity=8
+    )
+    cleaned = np.zeros_like(mask, dtype=np.uint8)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            cleaned[labels == i] = 255
+    return cleaned
+
+
+def ki67_binarize(
+    img_path: Union[str, Path],
+    channel: str = "auto",  # "auto"|"r"|"g"|"b"
+    gauss_sigma: float = 1.5,
+    clahe_clip: float = 2.0,
+    otsu_scale: float = 0.85,
+    min_obj_area: int = 20,
+    open_kernel: int = 3,
+) -> Path:
     """
-    對單張 Ki67 影像進行 Otsu 二值化，輸出為 PNG 格式，回傳輸出路徑。
+    對單張 Ki67 影像進行較保守的二值化：選擇較亮的通道增強 + Otsu（可調降）+ 形態學去噪。
     """
     img_path = Path(img_path)
-    img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
-    if img is None:
+    img_color = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+    if img_color is None:
         raise FileNotFoundError(f"[ERROR] 找不到圖片: {img_path}")
 
-    # Otsu 二值化
-    _, binary_otsu = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if img_color.ndim == 3:
+        chans = {
+            "b": img_color[:, :, 0],
+            "g": img_color[:, :, 1],
+            "r": img_color[:, :, 2],
+        }
+        if channel == "auto":
+            # 選取平均亮度較高的通道
+            channel = max(chans, key=lambda k: np.mean(chans[k]))
+        chan_img = chans.get(channel.lower(), chans["g"])
+    else:
+        chan_img = img_color
+
+    gray = chan_img.astype(np.float32)
+    gray = cv2.GaussianBlur(gray, (0, 0), sigmaX=gauss_sigma)
+    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    if clahe_clip and clahe_clip > 0:
+        gray = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8)).apply(gray)
+
+    ret, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    low_thresh = max(1, int(ret * otsu_scale))
+    _, binary = cv2.threshold(gray, low_thresh, 255, cv2.THRESH_BINARY)
+
+    # 形態學開運算，去除噪點並平滑邊界
+    if open_kernel and open_kernel > 1:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_kernel, open_kernel))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, k)
+
+    binary = _remove_small_components(binary, min_obj_area)
 
     # 輸出路徑
     binary_dir = output_dir(img_path.parent.parent, "binary")  # 從 PC 資料夾回到 root
     out_path = binary_dir / f"{img_path.stem}_binary.png"
 
-    cv2.imwrite(str(out_path), binary_otsu)
+    cv2.imwrite(str(out_path), binary)
     print(f"[INFO] 已輸出 Ki67 二值圖: {out_path}")
 
     return out_path
@@ -244,8 +293,9 @@ def ki67_binarize(img_path: Union[str, Path]) -> Path:
 def detect_ki67_positive(
     roi_dir: Path, ki67_dir: Path, output_dir: Path, threshold: float = 0.10
 ):
-    """Ki67 陽性 ROI 判斷"""
-    """判斷單一 ROI txt 是否為 Ki67 陽性，並輸出 label.txt"""
+    """
+    Ki67 陽性 ROI 判斷：使用二值化後的 Ki67 mask，計算 ROI 重疊比例判定陽性。
+    """
     if not ki67_dir.exists():
         print(f"[WARN] 找不到 Ki67 mask: {ki67_dir}")
         return

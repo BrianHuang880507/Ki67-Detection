@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 from pathlib import Path
 
 from ki67dtc.img_prep import segment_all, mask2txt_all, combined
@@ -7,7 +7,9 @@ from ki67dtc.cell_anal import run_all
 
 def main():
     parser = argparse.ArgumentParser(description="細胞影像分析 Pipeline")
-    parser.add_argument("--data_folder", type=str, required=True, help="輸入資料夾名稱或路徑")
+    parser.add_argument(
+        "--data_folder", type=str, required=True, help="輸入資料夾名稱或路徑"
+    )
     parser.add_argument("--fluor_analy", action="store_true", help="是否執行螢光分析")
     parser.add_argument("--ki67", action="store_true", help="是否執行 Ki67 判斷")
     parser.add_argument("--clean_temp", action="store_true", help="是否清理暫存資料")
@@ -54,7 +56,7 @@ def main():
     # Step 1: segmentation
     print("\n[STEP 1] 執行 segmentation (cyto & nuc)")
     segment_all(data_folder)
-
+    
     # Step 2: mask -> outlines
     print("\n[STEP 2] 將 segmentation npy 轉成 outlines txt")
     mask2txt_all(data_folder)
@@ -77,5 +79,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

@@ -19,4 +19,13 @@ model/
 outputs_models/
 predictions.csv
 
+# Jupyter notebooks
+*.ipynb
+
+# Visual Studio / VS Code local settings
+.vs/
+
+# Predictions outputs
+predictions/
+
 資料集/
