@@ -52,8 +52,10 @@ def _resolve_data_folder(raw_data_folder: Path) -> Path:
 
 def run_pipeline(
     data_folder: Path,
+    nuc_source: str = "pc",
     fluor_analy: bool = True,
     ki67: bool = True,
+    ki67_backend: str = "pyimagej",
     clean_temp: bool = True,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> PipelineResult:
@@ -74,7 +76,7 @@ def run_pipeline(
     # Step 1: segmentation
     if progress_callback:
         progress_callback(current_step, total_steps, "執行 segmentation (cyto & nuc)")
-    segment_all(data_folder)
+    segment_all(data_folder, nuc_source=nuc_source)
     current_step += 1
 
     # Step 2: mask -> outlines
@@ -96,7 +98,13 @@ def run_pipeline(
     # Step 4: geometry & intensity analysis
     if progress_callback:
         progress_callback(current_step, total_steps, "幾何參數與螢光/陽性分析")
-    run_all(data_folder, fluor_analy=fluor_analy, ki67=ki67, clean_temp=clean_temp)
+    run_all(
+        data_folder,
+        fluor_analy=fluor_analy,
+        ki67=ki67,
+        ki67_backend=ki67_backend,
+        clean_temp=clean_temp,
+    )
     current_step += 1
 
     if progress_callback:

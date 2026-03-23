@@ -29,14 +29,6 @@ FOLDER_NAMES = [
     "2025-07-10-B8-P6-P10-P14-Ki67-lot-2-P6",
     "2025-07-10-B8-P6-P10-P14-Ki67-lot-2-P10",
     "2025-07-10-B8-P6-P10-P14-Ki67-lot-2-P14",
-    "P7-P10-P7",
-    "P7-P10-P8",
-    "P7-P10-P9",
-    "P7-P10-P10",
-    "P11-P13-P11",
-    "P11-P13-P12",
-    "P11-P13-P13",
-    "0819",
 ]
 
 # Base Python executable and script to call
@@ -44,7 +36,7 @@ PY_EXE = sys.executable  # current python; change to r"C:\path\to\python.exe" if
 MAIN_SCRIPT = Path("main.py")
 
 # Extra args that stay the same every run
-EXTRA_ARGS = ["--ki67", "--clean_temp"]
+EXTRA_ARGS = ["--nuc_source", "dapi", "--ki67", "--ki67_backend", "pyimagej", "--clean_temp"]
 
 # Stop the whole batch when one fails?
 STOP_ON_FAILURE = True

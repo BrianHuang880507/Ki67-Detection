@@ -9,6 +9,9 @@ matplotlib
 imageio
 scikit-image
 opencv-python-headless
+pyimagej
+scyjava
+jpype1
 fastremap
 natsort
 tqdm

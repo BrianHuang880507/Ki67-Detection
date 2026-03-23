@@ -1,4 +1,5 @@
 import shutil
+import re
 from pathlib import Path
 import numpy as np
 from tqdm import trange
@@ -23,6 +24,7 @@ def segment(
     img_files: list[Path],
     output_dir: Path,
     suffix: str,
+    output_stems: list[str] | None = None,
     channels: list[int] | tuple[int, int] = (0, 0),
     diameter: float | None = None,
     cellprob_threshold: float = 0.0,
@@ -33,6 +35,9 @@ def segment(
     使用指定模型進行細胞質 (cyto) 或細胞核 (nuc) 分割
     輸出 segmentation 結果到指定資料夾
     """
+    if output_stems is not None and len(output_stems) != len(img_files):
+        raise ValueError("output_stems length must match img_files length.")
+
     model = models.CellposeModel(gpu=True, pretrained_model=model_path)
     for i in trange(len(img_files), desc=f"Segmenting ({suffix})"):
         f = img_files[i]
@@ -49,26 +54,104 @@ def segment(
             img, masks, flows, f, channels=list(channels), diams=diameter
         )
         seg_file = f.with_name(f"{f.stem}_seg.npy")
-        target_file = output_dir / f"{f.stem}_{suffix}_seg.npy"
+        target_stem = output_stems[i] if output_stems is not None else f.stem
+        target_file = output_dir / f"{target_stem}_{suffix}_seg.npy"
         shutil.move(seg_file, target_file)
 
 
-def segment_all(input_dir: str):
+def _last_numeric_token(stem: str) -> int | None:
+    match = re.search(r"(\d+)(?!.*\d)", stem)
+    return int(match.group(1)) if match else None
+
+
+def segment_all(input_dir: str, nuc_source: str = "pc", dapi_dir_name: str = "DAPI"):
     """
-    遍歷資料夾，僅處理相位差圖片 (檔名不包含 Ki67 或 DF)
+    遍歷資料夾，處理相位差圖片做 cytoplasm 分割；
+    nucleus 分割來源可用 PC (預設) 或 DAPI。
     """
-    input_dir = Path(input_dir) / "PC"
-    seg_dir = output_dir(input_dir.parent, "segment")
+    root_dir = Path(input_dir)
+    pc_dir = root_dir / "PC"
+    seg_dir = output_dir(root_dir, "segment")
+
     img_files = [
         f
-        for f in list_files(input_dir, [".png", ".jpg", ".jpeg", ".tif", ".tiff"])
+        for f in list_files(pc_dir, [".png", ".jpg", ".jpeg", ".tif", ".tiff"])
         if "ki67" not in f.stem.lower() and "df" not in f.stem.lower()
     ]
     if not img_files:
-        print(f"[WARN] 找不到相位差圖片於 {input_dir}")
+        print(f"[WARN] 找不到相位差圖片於 {pc_dir}")
         return
+
+    nuc_source = nuc_source.strip().lower()
+    if nuc_source not in {"pc", "dapi"}:
+        raise ValueError(f"Unsupported nuc_source: {nuc_source}")
+
     segment(CYTO_MODEL_PATH, img_files, seg_dir, "cyto", channels=(0, 0))
-    segment(NUC_MODEL_PATH, img_files, seg_dir, "nuc", channels=(0, 0))
+
+    if nuc_source == "pc":
+        segment(NUC_MODEL_PATH, img_files, seg_dir, "nuc", channels=(0, 0))
+        return
+
+    dapi_dir = root_dir / dapi_dir_name
+    if not dapi_dir.exists() or not dapi_dir.is_dir():
+        print(f"[WARN] 找不到 DAPI 資料夾 {dapi_dir}，nucleus 改回使用 PC。")
+        segment(NUC_MODEL_PATH, img_files, seg_dir, "nuc", channels=(0, 0))
+        return
+
+    dapi_files = list_files(dapi_dir, [".png", ".jpg", ".jpeg", ".tif", ".tiff"])
+    if not dapi_files:
+        print(f"[WARN] DAPI 資料夾沒有可用影像 {dapi_dir}，nucleus 改回使用 PC。")
+        segment(NUC_MODEL_PATH, img_files, seg_dir, "nuc", channels=(0, 0))
+        return
+
+    dapi_by_stem: dict[str, list[Path]] = {}
+    dapi_by_idx: dict[int, list[Path]] = {}
+    for dapi in dapi_files:
+        dapi_by_stem.setdefault(dapi.stem.lower(), []).append(dapi)
+        idx = _last_numeric_token(dapi.stem)
+        if idx is not None:
+            dapi_by_idx.setdefault(idx, []).append(dapi)
+
+    used_dapi: set[Path] = set()
+    nuc_img_files: list[Path] = []
+    nuc_output_stems: list[str] = []
+    fallback_pc_count = 0
+
+    for pc in img_files:
+        candidates: list[Path] = []
+        candidates.extend(dapi_by_stem.get(pc.stem.lower(), []))
+        idx = _last_numeric_token(pc.stem)
+        if idx is not None:
+            candidates.extend(dapi_by_idx.get(idx, []))
+
+        matched: Path | None = None
+        for c in candidates:
+            if c not in used_dapi:
+                matched = c
+                used_dapi.add(c)
+                break
+
+        if matched is None:
+            matched = pc
+            fallback_pc_count += 1
+
+        nuc_img_files.append(matched)
+        nuc_output_stems.append(pc.stem)
+
+    if fallback_pc_count > 0:
+        print(
+            f"[WARN] 有 {fallback_pc_count} 張 PC 找不到對應 DAPI，"
+            "該些影像的 nucleus 仍使用 PC。"
+        )
+
+    segment(
+        NUC_MODEL_PATH,
+        nuc_img_files,
+        seg_dir,
+        "nuc",
+        output_stems=nuc_output_stems,
+        channels=(0, 0),
+    )
 
 
 # ===============================

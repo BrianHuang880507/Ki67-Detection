@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -25,6 +26,77 @@ from ki67dtc.utils.io import (
     merge_all_final_csvs,
     generate_image_mapping,
 )
+
+_PYIMAGEJ = None
+
+_KI67_IMAGEJ_MACRO = r"""
+#@ String input_path
+#@ String binary_path
+#@ String particle_options
+
+open(input_path);
+orig_title = getTitle();
+
+run("8-bit");
+setAutoThreshold("Default dark no-reset");
+setAutoThreshold("Otsu dark no-reset");
+setThreshold(13, 255);
+setOption("BlackBackground", true);
+run("Convert to Mask");
+run("Watershed");
+run("Duplicate...", "title=Ki67BinaryFallback");
+run("Analyze Particles...", particle_options);
+
+mask_title = "Mask of " + orig_title;
+if (isOpen(mask_title)) {
+    selectWindow(mask_title);
+    saveAs("PNG", binary_path);
+    close();
+} else if (isOpen("Mask")) {
+    selectWindow("Mask");
+    saveAs("PNG", binary_path);
+    close();
+} else if (isOpen("Ki67BinaryFallback")) {
+    selectWindow("Ki67BinaryFallback");
+    saveAs("PNG", binary_path);
+}
+
+if (isOpen("Ki67BinaryFallback")) {
+    selectWindow("Ki67BinaryFallback");
+    close();
+}
+if (isOpen(orig_title)) {
+    selectWindow(orig_title);
+    close();
+}
+"""
+
+
+def _get_pyimagej():
+    global _PYIMAGEJ
+    if _PYIMAGEJ is not None:
+        return _PYIMAGEJ
+
+    try:
+        import imagej
+        import scyjava
+    except ImportError as exc:
+        raise RuntimeError(
+            "PyImageJ is unavailable. Install pyimagej/scyjava/jpype1 first."
+        ) from exc
+
+    scyjava.config.add_option("-Dscijava.log.level=info")
+    fiji_app_path = os.environ.get("FIJI_APP_PATH", "").strip()
+    if fiji_app_path:
+        ij = imagej.init(fiji_app_path, mode="headless", add_legacy=True)
+    else:
+        ij = imagej.init("sc.fiji:fiji", mode="headless", add_legacy=True)
+
+    if not (ij.legacy and ij.legacy.isActive()):
+        raise RuntimeError("ImageJ legacy mode is inactive, cannot run IJ1 macro.")
+
+    _PYIMAGEJ = ij
+    return _PYIMAGEJ
 
 
 # ===============================
@@ -239,13 +311,86 @@ def ki67_binarize(
     gauss_sigma: float = 1.5,
     clahe_clip: float = 2.0,
     otsu_scale: float = 0.85,
-    min_obj_area: int = 20,
+    min_obj_area: int = 50,
     open_kernel: int = 3,
+    backend: str = "pyimagej",  # "pyimagej"|"opencv"
 ) -> Path:
     """
-    對單張 Ki67 影像進行較保守的二值化：選擇較亮的通道增強 + Otsu（可調降）+ 形態學去噪。
+    Ki67 binarization.
+    Default backend is PyImageJ macro flow (from notebook), with OpenCV fallback.
     """
     img_path = Path(img_path)
+    if not img_path.exists():
+        raise FileNotFoundError(f"[ERROR] 找不到圖片: {img_path}")
+
+    binary_dir = output_dir(img_path.parent.parent, "binary")
+    out_path = binary_dir / f"{img_path.stem}_binary.png"
+
+    backend = backend.lower().strip()
+    if backend not in {"pyimagej", "opencv"}:
+        raise ValueError(f"Unsupported ki67 backend: {backend}")
+
+    if backend == "pyimagej":
+        try:
+            _ki67_binarize_pyimagej(
+                img_path=img_path,
+                out_path=out_path,
+                min_obj_area=min_obj_area,
+            )
+            print(f"[INFO] 已輸出 PyImageJ Ki67 二值圖: {out_path}")
+            return out_path
+        except Exception as exc:
+            print(f"[WARN] PyImageJ Ki67 二值化失敗，改用 OpenCV。原因: {exc}")
+
+    _ki67_binarize_opencv(
+        img_path=img_path,
+        out_path=out_path,
+        channel=channel,
+        gauss_sigma=gauss_sigma,
+        clahe_clip=clahe_clip,
+        otsu_scale=otsu_scale,
+        min_obj_area=min_obj_area,
+        open_kernel=open_kernel,
+    )
+    print(f"[INFO] 已輸出 OpenCV Ki67 二值圖: {out_path}")
+    return out_path
+
+
+def _ki67_binarize_pyimagej(
+    img_path: Path,
+    out_path: Path,
+    min_obj_area: int = 50,
+) -> None:
+    ij = _get_pyimagej()
+    if out_path.exists():
+        out_path.unlink()
+
+    particle_options = f"size={int(max(0, min_obj_area))}-Infinity show=Masks clear"
+    args = {
+        "input_path": str(img_path),
+        "binary_path": str(out_path),
+        "particle_options": particle_options,
+    }
+    ij.py.run_macro(_KI67_IMAGEJ_MACRO, args=args)
+
+    binary = cv2.imread(str(out_path), cv2.IMREAD_GRAYSCALE)
+    if binary is None:
+        raise RuntimeError(f"ImageJ macro did not produce a readable file: {out_path}")
+
+    _, binary = cv2.threshold(binary, 0, 255, cv2.THRESH_BINARY)
+    cv2.imwrite(str(out_path), binary)
+
+
+def _ki67_binarize_opencv(
+    img_path: Path,
+    out_path: Path,
+    channel: str = "auto",
+    gauss_sigma: float = 1.5,
+    clahe_clip: float = 2.0,
+    otsu_scale: float = 0.85,
+    min_obj_area: int = 50,
+    open_kernel: int = 3,
+) -> None:
     img_color = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
     if img_color is None:
         raise FileNotFoundError(f"[ERROR] 找不到圖片: {img_path}")
@@ -257,7 +402,6 @@ def ki67_binarize(
             "r": img_color[:, :, 2],
         }
         if channel == "auto":
-            # 選取平均亮度較高的通道
             channel = max(chans, key=lambda k: np.mean(chans[k]))
         chan_img = chans.get(channel.lower(), chans["g"])
     else:
@@ -273,21 +417,12 @@ def ki67_binarize(
     low_thresh = max(1, int(ret * otsu_scale))
     _, binary = cv2.threshold(gray, low_thresh, 255, cv2.THRESH_BINARY)
 
-    # 形態學開運算，去除噪點並平滑邊界
     if open_kernel and open_kernel > 1:
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_kernel, open_kernel))
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, k)
 
     binary = _remove_small_components(binary, min_obj_area)
-
-    # 輸出路徑
-    binary_dir = output_dir(img_path.parent.parent, "binary")  # 從 PC 資料夾回到 root
-    out_path = binary_dir / f"{img_path.stem}_binary.png"
-
     cv2.imwrite(str(out_path), binary)
-    print(f"[INFO] 已輸出 Ki67 二值圖: {out_path}")
-
-    return out_path
 
 
 def detect_ki67_positive(
@@ -349,6 +484,7 @@ def run_all(
     data_name: str,
     fluor_analy: bool = False,
     ki67: bool = False,
+    ki67_backend: str = "pyimagej",
     clean_temp: bool = True,
 ) -> None:
     data_path = Path(data_name)
@@ -503,7 +639,7 @@ def run_all(
                 if not ki67_img.exists():
                     print(f"[警告] 找不到 Ki67 影像：{ki67_img}")
                 else:
-                    ki67_mask = ki67_binarize(ki67_img)
+                    ki67_mask = ki67_binarize(ki67_img, backend=ki67_backend)
                     binary_dir = output_dir(data_path, "binary")
                     ki67_label = binary_dir / f"{pc_img.stem}_label.txt"
 

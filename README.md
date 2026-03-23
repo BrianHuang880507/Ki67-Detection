@@ -6,6 +6,11 @@
 pip install -r requirements.txt
 ```
 
+若要使用 `pyimagej` 的 Ki67 二值化流程，需有 Java 執行環境。可選擇：
+
+- 直接讓 `pyimagej` 自動下載 Fiji（首次執行較久）
+- 或先安裝 Fiji，並設定環境變數 `FIJI_APP_PATH`
+
 ## GUI（PyQt6）
 
 本專案包含一個用於操作 Ki67 pipeline 的圖形介面（可瀏覽影像、顯示 outlines overlay、檢視 `<dataset>_cleaned.csv` 並點選 Cell_ID 高亮對應 cell）。
@@ -75,6 +80,8 @@ pip install -r requirements.txt
 | 參數            | 類別 | 預設值 | 說明               |
 | --------------- | ---- | ------ | ------------------ |
 | `--data_folder` | str  | 必填   | 輸入資料夾路徑     |
+| `--nuc_source`  | str  | pc     | nucleus 分割來源（`pc` 或 `dapi`） |
 | `--fluor_analy` | bool | True   | 是否執行螢光分析   |
 | `--ki67`        | bool | True   | 是否進行 Ki67 判斷 |
+| `--ki67_backend`| str  | pyimagej | Ki67 二值化方法（`pyimagej` 或 `opencv`） |
 | `--clean_temp`  | bool | True   | 是否清除暫存資料   |
