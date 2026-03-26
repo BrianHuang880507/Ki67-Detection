@@ -70,9 +70,11 @@ def main():
     print("=" * 50)
 
     # Step 1: segmentation
+    """
     print("\n[STEP 1] 執行 segmentation (cyto & nuc)")
     segment_all(data_folder, nuc_source=args.nuc_source)
-    
+    """
+
     # Step 2: mask -> outlines
     print("\n[STEP 2] 將 segmentation npy 轉成 outlines txt")
     mask2txt_all(data_folder)
@@ -82,6 +84,7 @@ def main():
     combined(data_folder)
 
     # Step 4: geometry & intensity analysis
+    """
     print("\n[STEP 4] 幾何參數與螢光/陽性分析")
     run_all(
         data_folder,
@@ -90,6 +93,7 @@ def main():
         ki67_backend=args.ki67_backend,
         clean_temp=args.clean_temp,
     )
+    """
 
     print("\n[資訊] Pipeline 完成！請檢查輸出結果。")
 

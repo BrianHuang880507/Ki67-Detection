@@ -10,9 +10,16 @@ Example:
     python script/run_segment_subset_dapi.py data/input/0819 data/input/P7-P10-P7
 """
 import argparse
+import os
 import sys
 from pathlib import Path
 import numpy as np
+
+if os.name == "nt":
+    # Windows 上常見 cellpose/torch 與 MKL OpenMP runtime 衝突。
+    # 先在 import cellpose 前設定 workaround，避免 OMP Error #15 直接中止。
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 from cellpose import io, models
 
 # 保證可以匯入本專案模組
@@ -25,15 +32,7 @@ from ki67dtc.utils.io import list_files  # noqa: E402
 
 DEFAULT_DATASETS = [
     # 依你的資料夾列表編輯
-    "data/input/2025-06-19-B4-P6-P10-P14-Ki67-P6-1",
-    "data/input/2025-06-19-B4-P6-P10-P14-Ki67-P6-2",
-    "data/input/2025-06-19-B4-P6-P10-P14-Ki67-P10-1",
-    "data/input/2025-06-19-B4-P6-P10-P14-Ki67-P10-2",
-    "data/input/2025-06-19-B4-P6-P10-P14-Ki67-P14-1",
-    "data/input/2025-06-19-B4-P6-P10-P14-Ki67-P14-2",
-    "data/input/2025-07-10-B8-P6-P10-P14-Ki67-lot-2-P6",
-    "data/input/2025-07-10-B8-P6-P10-P14-Ki67-lot-2-P10",
-    "data/input/2025-07-10-B8-P6-P10-P14-Ki67-lot-2-P14",
+    "data/input/20260320_IFN-r_TEST_B4_p6",
 ]
 
 MODEL_TYPE = "cyto3"

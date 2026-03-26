@@ -1,4 +1,12 @@
-﻿cellpose
+# Install pyimagej + Java with mamba first (see README.md):
+#   mamba create -n ki67 python=3.10 pyimagej openjdk=11 pip -c conda-forge -y
+# Then install the remaining pip dependencies:
+#   pip install -r requirements.txt
+
+pyimagej
+scyjava
+jpype1
+cellpose==3.1.1.1
 pandas
 numpy
 scikit-learn
@@ -8,10 +16,9 @@ torchvision
 matplotlib
 imageio
 scikit-image
+tifffile
 opencv-python-headless
-pyimagej
-scyjava
-jpype1
+shapely
 fastremap
 natsort
 tqdm

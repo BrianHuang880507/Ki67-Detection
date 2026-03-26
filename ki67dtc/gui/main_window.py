@@ -83,9 +83,9 @@ class ZoomableGraphicsView(QGraphicsView):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._zoom_factor = 1.15
-        self.setDragMode(QGraphicsView.ScrollHandDrag)
-        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
-        self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
 
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
         angle = event.angleDelta().y()
