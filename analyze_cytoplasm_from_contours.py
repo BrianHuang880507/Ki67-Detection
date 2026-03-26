@@ -1,10 +1,6 @@
-#!/usr/bin/env python3
-"""Quantify nucleus/cytoplasm fluorescence from pre-existing contour coordinates.
-
-This script does NOT perform segmentation. It builds ROI masks from input contours,
-preprocesses the selected signal channel with ImageJ-style background subtraction,
-and measures whole-cell / nucleus / whole-cytoplasm intensity metrics.
-"""
+﻿#!/usr/bin/env python3
+"""雿輻?Ｘ?頛芸?摨扳??葫?湧?蝝啗??Ｗ?撘瑕漲??
+甇方?砌??瑁??芸??嚗?湔?寞?頛詨頛芸?撱箇? ROI??瘚?????ImageJ 憸冽???嚗?頛詨瘥?蝝啗??撥摨西?撟曆??孵噩??"""
 
 from __future__ import annotations
 
@@ -40,6 +36,7 @@ except ImportError:  # pragma: no cover
 
 LOGGER = logging.getLogger("cytoplasm_from_contours")
 
+# ImageJ 前處理巨集：轉為 16-bit 後套用 rolling-ball 背景扣除。
 _PREPROCESS_MACRO = r"""
 #@ String input_path
 #@ String output_path
@@ -52,6 +49,7 @@ saveAs("Tiff", output_path);
 close();
 """
 
+# ImageJ 量測巨集：用二值 ROI mask 輸出強度與形狀參數。
 _MEASURE_ROI_MACRO = r"""
 #@ String signal_path
 #@ String mask_path
@@ -161,246 +159,79 @@ class CellRoiResult:
 
 
 # ------------------------------
-# Argument parsing
+# ?閫??
 # ------------------------------
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Quantify fluorescence in whole cytoplasm from contour coordinates"
-    )
+    """解析命令列參數
 
-    parser.add_argument(
-        "data_folder",
-        nargs="?",
-        type=Path,
-        help=(
-            "Main-pipeline style dataset root (or dataset name under data/input). "
-            "When provided, script can auto-infer other paths."
-        ),
-    )
-    parser.add_argument(
-        "--input-dir",
-        default=None,
-        type=Path,
-        help="Image folder (required only when positional data_folder is not provided).",
-    )
-    parser.add_argument(
-        "--contours-file",
-        default=None,
-        type=Path,
-        help=(
-            "Contour source path. For CSV/JSON: file path. "
-            "For TXT: either one merged outlines txt or a folder. "
-            "Required only when positional data_folder is not provided."
-        ),
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=None,
-        type=Path,
-        help="Output folder for CSV and QC (optional with --use-main-output-layout)",
-    )
-    parser.add_argument(
-        "--use-main-output-layout",
-        action="store_true",
-        help=(
-            "Use main pipeline style output path: "
-            "data/output/<subfolder>/<dataset_name>"
-        ),
-    )
+    Args:
+        無
 
-    parser.add_argument(
-        "--contour-format",
-        default="auto",
-        choices=["auto", "csv", "json", "txt"],
-        help="Contour file format",
-    )
-    parser.add_argument(
-        "--txt-glob",
-        default="*_merged_cp_outlines.txt",
-        help="Glob pattern when --contours-file is a folder in txt mode",
-    )
-    parser.add_argument(
-        "--txt-second-contour-type",
-        default=None,
-        choices=["cytoplasm", "cell"],
-        help=(
-            "For merged txt pair format, first line is nucleus and second line type "
-            "is set by this option."
-        ),
-    )
-    parser.add_argument(
-        "--contour-mode",
-        default=None,
-        choices=["nucleus_cell", "nucleus_cytoplasm"],
-        help="nucleus+whole-cell or nucleus+cytoplasm contour mode",
-    )
-    parser.add_argument(
-        "--cytoplasm-contour-interpretation",
-        default=None,
-        choices=["direct", "outer_cell"],
-        help=(
-            "Only used with contour-mode=nucleus_cytoplasm. "
-            "direct: contour is cytoplasm ROI; outer_cell: contour is outer cell boundary"
-        ),
-    )
-    parser.add_argument(
-        "--signal-dir-name",
-        default="auto",
-        help=(
-            "Quick mode only (when using positional data_folder). "
-            "Set signal subfolder name (e.g. DF/KI67/IDO/DAPI/PC), or 'auto'."
-        ),
-    )
-    parser.add_argument(
-        "--image-name-replace",
-        action="append",
-        default=[],
-        metavar="SRC:DST",
-        help=(
-            "Optional contour name matching rewrite rule. "
-            "Applied to input image filename before contour lookup. "
-            "Example: --image-name-replace IDO:PHASE (can be repeated)."
-        ),
-    )
-
-    parser.add_argument(
-        "--signal-channel",
-        type=int,
-        default=0,
-        help="0-based channel index for multi-channel image",
-    )
-    parser.add_argument(
-        "--channel-axis",
-        default="auto",
-        choices=["auto", "first", "last"],
-        help="Channel axis handling for multi-channel images",
-    )
-    parser.add_argument(
-        "--rolling-ball-radius",
-        type=float,
-        default=50.0,
-        help="ImageJ Subtract Background rolling radius",
-    )
-    parser.add_argument(
-        "--fiji-app-path",
-        default="",
-        help="Optional local Fiji.app path for pyimagej init",
-    )
-    parser.add_argument(
-        "--intden-mode",
-        default="integrated_bgsub",
-        choices=["integrated_bgsub", "mean_bgsub"],
-        help=(
-            "How to populate IntDen output column. "
-            "integrated_bgsub: ID - (Area * mean_background); "
-            "mean_bgsub: (ID - Area * mean_background) / Area."
-        ),
-    )
-    parser.add_argument(
-        "--intensity-scale",
-        default="raw",
-        choices=[
-            "raw",
-            "zero_to_one_auto",
-            "zero_to_one_255",
-            "zero_to_one_65535",
-        ],
-        help=(
-            "Optional scaling for IntDen output values. "
-            "raw: no scaling. "
-            "zero_to_one_auto: divide by inferred denominator (1/255/65535) from image range. "
-            "zero_to_one_255: divide by 255. "
-            "zero_to_one_65535: divide by 65535."
-        ),
-    )
-
-    parser.add_argument(
-        "--nucleus-labels",
-        default="nucleus,nuc",
-        help="Comma-separated contour_type aliases for nucleus",
-    )
-    parser.add_argument(
-        "--cell-labels",
-        default="cell,whole_cell,wholecell,cell_boundary,cytoplasm_boundary",
-        help="Comma-separated contour_type aliases for whole-cell",
-    )
-    parser.add_argument(
-        "--cytoplasm-labels",
-        default="cytoplasm,cyto",
-        help="Comma-separated contour_type aliases for cytoplasm",
-    )
-
-    # Schema mapping
-    parser.add_argument("--image-name-column", default="image_name")
-    parser.add_argument("--cell-id-column", default="cell_id")
-    parser.add_argument("--contour-type-column", default="contour_type")
-    parser.add_argument(
-        "--coords-column",
-        default="polygon",
-        help="CSV/JSON field for one-row-per-contour coordinates",
-    )
-    parser.add_argument(
-        "--x-column",
-        default="",
-        help="CSV long-format x column (one row per point)",
-    )
-    parser.add_argument(
-        "--y-column",
-        default="",
-        help="CSV long-format y column (one row per point)",
-    )
-    parser.add_argument(
-        "--point-order-column",
-        default="",
-        help="Optional ordering column for long-format CSV points",
-    )
-    parser.add_argument(
-        "--json-records-key",
-        default="",
-        help="JSON key containing contour records list (if top-level is dict)",
-    )
-
-    # Optional behavior
-    parser.add_argument(
-        "--recursive",
-        action="store_true",
-        help="Recursively scan images in input-dir",
-    )
-    parser.add_argument(
-        "--exclude-flagged",
-        action="store_true",
-        help="Exclude rows with QC flags from output CSV",
-    )
-    parser.add_argument(
-        "--flag-border-touching",
-        action="store_true",
-        help="Add QC flags for border-touching ROIs",
-    )
-    parser.add_argument(
-        "--exclude-border-touching",
-        action="store_true",
-        help="Flag border-touching ROIs and exclude them from output",
-    )
-    parser.add_argument(
-        "--save-qc-overlays",
-        action="store_true",
-        help="Save QC overlay images with contours and IDs",
-    )
-    parser.add_argument(
-        "--save-summary-per-image",
-        action="store_true",
-        help="Write per-image summary CSV",
-    )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-    )
-
-    return parser.parse_args()
+    Returns:
+        argparse.Namespace: 已補齊主流程預設值的執行參數
+    """
+    parser = argparse.ArgumentParser(description="整顆細胞量測（主流程輸出格式）")
+    parser.add_argument("data_folder", type=Path, help="資料夾名稱或完整路徑")
+    cli_args = parser.parse_args()
+    return _build_runtime_args(cli_args.data_folder)
 
 
+def _build_runtime_args(data_folder: Path) -> argparse.Namespace:
+    """建立主流程固定參數
+
+    Args:
+        data_folder (Path): 資料夾名稱或路徑
+
+    Returns:
+        argparse.Namespace: 內部執行所需完整參數（固定主流程輸出）
+    """
+    return argparse.Namespace(
+        data_folder=data_folder,
+        input_dir=None,
+        contours_file=None,
+        output_dir=None,
+        use_main_output_layout=True,
+        contour_format="auto",
+        txt_glob="*_merged_cp_outlines.txt",
+        txt_second_contour_type=None,
+        contour_mode=None,
+        cytoplasm_contour_interpretation=None,
+        signal_dir_name="auto",
+        image_name_replace=[],
+        signal_channel=0,
+        channel_axis="auto",
+        rolling_ball_radius=50.0,
+        fiji_app_path="",
+        # IntDen 固定使用平均背景校正，並正規化到 0~1。
+        intden_mode="mean_bgsub",
+        intensity_scale="zero_to_one_65535",
+        nucleus_labels="nucleus,nuc",
+        cell_labels="cell,whole_cell,wholecell,cell_boundary,cytoplasm_boundary",
+        cytoplasm_labels="cytoplasm,cyto",
+        image_name_column="image_name",
+        cell_id_column="cell_id",
+        contour_type_column="contour_type",
+        coords_column="polygon",
+        x_column="",
+        y_column="",
+        point_order_column="",
+        json_records_key="",
+        recursive=False,
+        exclude_flagged=False,
+        flag_border_touching=False,
+        exclude_border_touching=False,
+        save_qc_overlays=False,
+        save_summary_per_image=False,
+        log_level="INFO",
+    )
 def _resolve_data_folder(raw_data_folder: Path) -> Path:
+    """閫??鞈?憭曉祕?楝敺?
+    Args:
+        raw_data_folder (Path): 雿輻?撓?亦?鞈?憭曉?蝔望?頝臬?
+
+    Returns:
+        Path: ?舐???冗蝯?頝臬?
+    """
     candidates: list[Path] = []
     if raw_data_folder.is_absolute():
         candidates.append(raw_data_folder)
@@ -429,6 +260,11 @@ def _resolve_data_folder(raw_data_folder: Path) -> Path:
 
 
 def _has_supported_images(folder: Path) -> bool:
+    """瑼Ｘ鞈?憭曉?臬??游蔣??
+    Args:
+        folder (Path): ?格?鞈?憭?
+    Returns:
+        bool: ?臬?喳??銝撘菜?湔撘蔣??    """
     if not folder.exists() or not folder.is_dir():
         return False
     return any(
@@ -437,6 +273,15 @@ def _has_supported_images(folder: Path) -> bool:
 
 
 def _infer_quick_input_dir(dataset_root: Path, signal_dir_name: str) -> Path:
+    """?刻?銝餅?蝔撓?亙蔣???冗
+
+    Args:
+        dataset_root (Path): 鞈???桅?
+        signal_dir_name (str): ??閮?摮??冗?迂
+
+    Returns:
+        Path: 撖阡?雿輻?蔣???冗
+    """
     if signal_dir_name.lower() != "auto":
         preferred = dataset_root / signal_dir_name
         if not _has_supported_images(preferred):
@@ -460,6 +305,14 @@ def _infer_quick_input_dir(dataset_root: Path, signal_dir_name: str) -> Path:
 
 
 def _finalize_runtime_args(args: argparse.Namespace) -> argparse.Namespace:
+    """鋆?銝行迤閬??瑁??
+
+    Args:
+        args (argparse.Namespace): ????拐辣
+
+    Returns:
+        argparse.Namespace: 鋆?敺???拐辣
+    """
     quick_mode = args.data_folder is not None
 
     if quick_mode:
@@ -1190,6 +1043,12 @@ def build_cell_roi(
                 cytoplasm_mask = np.logical_and(
                     cytoplasm_mask, np.logical_not(nucleus_mask)
                 )
+            # direct 模式下，整顆細胞視為 cytoplasm 與 nucleus 的聯集。
+            whole_cell_points = cytoplasm_poly
+            if nucleus_mask is not None:
+                whole_cell_mask = np.logical_or(cytoplasm_mask, nucleus_mask)
+            else:
+                whole_cell_mask = cytoplasm_mask.copy()
         else:
             whole_cell_points = cytoplasm_poly
             whole_cell_mask = polygon_to_bool_mask(cytoplasm_poly, image_shape)
@@ -1313,7 +1172,7 @@ def measure_roi_with_imagej(
 
 
 def corrected_intden(intden: float, area: float, mean_background: float) -> float:
-    """Background-corrected integrated density: IDcor = ID - (Area * mean background)."""
+    # 背景校正後整合強度：IDcor = ID - (Area * mean background)
     if any(np.isnan([intden, area, mean_background])):
         return np.nan
     return float(intden - (area * mean_background))
@@ -1322,7 +1181,7 @@ def corrected_intden(intden: float, area: float, mean_background: float) -> floa
 def corrected_mean_intensity(
     intden: float, area: float, mean_background: float
 ) -> float:
-    """Background-corrected mean intensity: (ID - Area*BG) / Area."""
+    # 背景校正後平均強度：(ID - Area*BG) / Area
     if any(np.isnan([intden, area, mean_background])) or area <= 0:
         return np.nan
     return float((intden - (area * mean_background)) / area)
@@ -1626,9 +1485,13 @@ def process_image(
         )
         cell_rois.append(result)
 
-        for m in (result.nucleus_mask, result.cytoplasm_mask, result.whole_cell_mask):
-            if m is not None:
-                all_cell_masks |= m
+        # 背景估計優先使用整顆細胞遮罩，避免細胞像素混入背景。
+        if result.whole_cell_mask is not None:
+            all_cell_masks |= result.whole_cell_mask
+        else:
+            for m in (result.cytoplasm_mask, result.nucleus_mask):
+                if m is not None:
+                    all_cell_masks |= m
 
     bg_mask = np.logical_not(all_cell_masks)
     mean_background = (
@@ -1651,6 +1514,15 @@ def process_image(
                 continue
             exported_cells += 1
 
+            # IntDen / RawIntDen：整顆細胞量測。
+            whole_m = measure_roi_with_imagej(
+                ij,
+                signal_measure_path,
+                result.whole_cell_mask,
+                mtmp_dir,
+                f"roi_{idx}_cell",
+            )
+            # 其餘幾何參數：核與質分開量測。
             nuc_m = measure_roi_with_imagej(
                 ij,
                 signal_measure_path,
@@ -1668,18 +1540,16 @@ def process_image(
 
             nuc_g = geometry_from_imagej_measurements(nuc_m)
             cyto_g = geometry_from_imagej_measurements(cyto_m)
-            cyto_id_cor = corrected_intden(
-                cyto_m["intden"], cyto_m["area"], mean_background
-            )
-            cyto_mean_bgsub = corrected_mean_intensity(
-                cyto_m["intden"], cyto_m["area"], mean_background
-            )
-            intden_value = (
-                cyto_mean_bgsub if args.intden_mode == "mean_bgsub" else cyto_id_cor
+
+            # IntDen 固定使用平均背景校正，再正規化到 0~1。
+            whole_mean_bgsub = corrected_mean_intensity(
+                whole_m["intden"], whole_m["area"], mean_background
             )
             intden_value = apply_intensity_scale(
-                intden_value, args.intensity_scale, preprocessed
+                whole_mean_bgsub, args.intensity_scale, preprocessed
             )
+            if not np.isnan(intden_value):
+                intden_value = float(np.clip(intden_value, 0.0, 1.0))
 
             karyoplasmic_ratio = np.nan
             if (
@@ -1716,7 +1586,7 @@ def process_image(
                     "Roughness_cyto": cyto_g["roughness"],
                     "Karyoplasmic Ratio_cyto": karyoplasmic_ratio,
                     "IntDen": intden_value,
-                    "RawIntDen": cyto_m["raw_intden"],
+                    "RawIntDen": whole_m["raw_intden"],
                 }
             )
 
@@ -1735,8 +1605,15 @@ def process_image(
 
     return rows, summary
 
-
 def run_pipeline(args: argparse.Namespace) -> None:
+    """執行整顆細胞量測流程
+
+    Args:
+        args (argparse.Namespace): 執行參數
+
+    Returns:
+        None: 此函式僅負責輸出檔案
+    """
     args = _finalize_runtime_args(args)
     results_dir, qc_overlay_dir = resolve_output_paths(args)
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -1849,8 +1726,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
         summary_csv = results_dir / "image_summary.csv"
         pd.DataFrame(all_summaries).to_csv(summary_csv, index=False)
         LOGGER.info("Saved image-level summary: %s", summary_csv)
-
-
 def configure_logging(level: str) -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper()),
