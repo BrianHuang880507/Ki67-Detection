@@ -13,9 +13,9 @@ def main():
     parser.add_argument(
         "--nuc_source",
         type=str,
-        default="pc",
+        default="dapi",
         choices=["pc", "dapi"],
-        help="nucleus segmentation 來源（pc 或 dapi）",
+        help="nucleus segmentation 來源（pc 或 dapi，預設 dapi）",
     )
     parser.add_argument("--fluor_analy", action="store_true", help="是否執行螢光分析")
     parser.add_argument("--ki67", action="store_true", help="是否執行 Ki67 判斷")
@@ -70,10 +70,8 @@ def main():
     print("=" * 50)
 
     # Step 1: segmentation
-    """
     print("\n[STEP 1] 執行 segmentation (cyto & nuc)")
     segment_all(data_folder, nuc_source=args.nuc_source)
-    """
 
     # Step 2: mask -> outlines
     print("\n[STEP 2] 將 segmentation npy 轉成 outlines txt")
@@ -84,7 +82,6 @@ def main():
     combined(data_folder)
 
     # Step 4: geometry & intensity analysis
-    """
     print("\n[STEP 4] 幾何參數與螢光/陽性分析")
     run_all(
         data_folder,
@@ -93,7 +90,6 @@ def main():
         ki67_backend=args.ki67_backend,
         clean_temp=args.clean_temp,
     )
-    """
 
     print("\n[資訊] Pipeline 完成！請檢查輸出結果。")
 

@@ -1,4 +1,4 @@
-import shutil
+﻿import shutil
 import re
 from pathlib import Path
 import numpy as np
@@ -11,13 +11,13 @@ from PIL import Image
 
 from ki67dtc.utils.io import list_files, output_dir, load_outlines, remove_temp_files
 
-# 模型路徑固定
+# 璅∪?頝臬??箏?
 CYTO_MODEL_PATH = "model/model_BDL6_label_new"
 NUC_MODEL_PATH = "cyto3"
 
 
 # ===============================
-# 分割流程
+# ?瘚?
 # ===============================
 def segment(
     model_path: str,
@@ -32,8 +32,8 @@ def segment(
     invert: bool = False,
 ):
     """
-    使用指定模型進行細胞質 (cyto) 或細胞核 (nuc) 分割
-    輸出 segmentation 結果到指定資料夾
+    雿輻??璅∪??脰?蝝啗?鞈?(cyto) ?敦? (nuc) ?
+    頛詨 segmentation 蝯??唳?摰??冗
     """
     if output_stems is not None and len(output_stems) != len(img_files):
         raise ValueError("output_stems length must match img_files length.")
@@ -64,10 +64,11 @@ def _last_numeric_token(stem: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def segment_all(input_dir: str, nuc_source: str = "pc", dapi_dir_name: str = "DAPI"):
+def segment_all(input_dir: str, nuc_source: str = "dapi", dapi_dir_name: str = "DAPI"):
     """
-    遍歷資料夾，處理相位差圖片做 cytoplasm 分割；
-    nucleus 分割來源可用 PC (預設) 或 DAPI。
+    執行細胞質與細胞核分割。
+    - cytoplasm 一律使用 PC 影像
+    - nucleus 可選擇 PC 或 DAPI；若選 DAPI，channel 使用 [3, 3]
     """
     root_dir = Path(input_dir)
     pc_dir = root_dir / "PC"
@@ -86,6 +87,7 @@ def segment_all(input_dir: str, nuc_source: str = "pc", dapi_dir_name: str = "DA
     if nuc_source not in {"pc", "dapi"}:
         raise ValueError(f"Unsupported nuc_source: {nuc_source}")
 
+    # Cytoplasm segmentation always uses PC channel [0, 0].
     segment(CYTO_MODEL_PATH, img_files, seg_dir, "cyto", channels=(0, 0))
 
     if nuc_source == "pc":
@@ -113,8 +115,10 @@ def segment_all(input_dir: str, nuc_source: str = "pc", dapi_dir_name: str = "DA
             dapi_by_idx.setdefault(idx, []).append(dapi)
 
     used_dapi: set[Path] = set()
-    nuc_img_files: list[Path] = []
-    nuc_output_stems: list[str] = []
+    dapi_nuc_img_files: list[Path] = []
+    dapi_output_stems: list[str] = []
+    fallback_pc_nuc_img_files: list[Path] = []
+    fallback_pc_output_stems: list[str] = []
     fallback_pc_count = 0
 
     for pc in img_files:
@@ -132,33 +136,40 @@ def segment_all(input_dir: str, nuc_source: str = "pc", dapi_dir_name: str = "DA
                 break
 
         if matched is None:
-            matched = pc
             fallback_pc_count += 1
-
-        nuc_img_files.append(matched)
-        nuc_output_stems.append(pc.stem)
+            fallback_pc_nuc_img_files.append(pc)
+            fallback_pc_output_stems.append(pc.stem)
+        else:
+            dapi_nuc_img_files.append(matched)
+            dapi_output_stems.append(pc.stem)
 
     if fallback_pc_count > 0:
-        print(
-            f"[WARN] 有 {fallback_pc_count} 張 PC 找不到對應 DAPI，"
-            "該些影像的 nucleus 仍使用 PC。"
+        print(f"[WARN] 有 {fallback_pc_count} 張 PC 找不到對應 DAPI，該些影像的 nucleus 仍使用 PC。")
+
+    if dapi_nuc_img_files:
+        segment(
+            NUC_MODEL_PATH,
+            dapi_nuc_img_files,
+            seg_dir,
+            "nuc",
+            output_stems=dapi_output_stems,
+            channels=(3, 3),
         )
 
-    segment(
-        NUC_MODEL_PATH,
-        nuc_img_files,
-        seg_dir,
-        "nuc",
-        output_stems=nuc_output_stems,
-        channels=(0, 0),
-    )
-
-
+    if fallback_pc_nuc_img_files:
+        segment(
+            NUC_MODEL_PATH,
+            fallback_pc_nuc_img_files,
+            seg_dir,
+            "nuc",
+            output_stems=fallback_pc_output_stems,
+            channels=(0, 0),
+        )
 # ===============================
-# Mask 輸出與 outlines 轉換
+# Mask 頛詨??outlines 頧?
 # ===============================
 def mask2txt(npy_files: list[Path], output_dir: Path):
-    """將所有 segmentation npy 檔轉換為 outlines (txt)"""
+    """撠???segmentation npy 瑼?? outlines (txt)"""
     for i in trange(len(npy_files), desc=f"Saving {len(npy_files)} masks"):
         f = npy_files[i]
         data = np.load(f, allow_pickle=True).item()
@@ -177,8 +188,8 @@ def mask2txt(npy_files: list[Path], output_dir: Path):
 
 def mask2txt_all(input_dir: str):
     """
-    將 cytoplasm 和 nucleus segmentation 的 npy 結果
-    輸出為 mask/txt 格式
+    撠?cytoplasm ??nucleus segmentation ??npy 蝯?
+    頛詨??mask/txt ?澆?
     """
     input_dir = Path(input_dir)
     seg_dir = output_dir(input_dir, "segment")
@@ -190,10 +201,10 @@ def mask2txt_all(input_dir: str):
 
 
 # ===============================
-# Outlines 合併
+# Outlines ?蔥
 # ===============================
 def create_mask(outlines, shape):
-    """將 outlines 轉換為 mask 陣列"""
+    """撠?outlines 頧???mask ???"""
     mask = np.zeros(shape, dtype=np.int32)
     for i, line in enumerate(outlines, start=1):
         coords = list(map(int, line.split(",")))
@@ -208,19 +219,19 @@ from typing import Optional, Tuple
 
 
 def find_image_and_nuc_file(cyto_file: Path) -> Tuple[Optional[Path], Optional[Path]]:
-    """根據 cytoplasm outlines 找對應的 nucleus outlines 與原圖"""
-    # 建立 nucleus 檔案路徑
+    """Match cytoplasm outlines to nucleus outlines and locate the source image."""
+    # 撱箇? nucleus 瑼?頝臬?
     nuc_file = cyto_file.with_name(
         cyto_file.name.replace("_cyto_seg_cp_outlines.txt", "_nuc_seg_cp_outlines.txt")
     )
     if not nuc_file.exists():
         return None, None
 
-    # 從 cyto_file 取得 dataset_name
+    # 敺?cyto_file ?? dataset_name
     dataset_name = cyto_file.parent.name  # e.g., 2025-07-10-B8-P6...
     index_key = cyto_file.stem.replace("_cyto_seg_cp_outlines", "")
 
-    # 拼接圖片路徑
+    # ?潭??頝臬?
     for ext in [".jpg", ".png", ".tif", ".tiff"]:
         img_candidate = Path("data/input") / dataset_name / "PC" / f"{index_key}{ext}"
         if img_candidate.exists():
@@ -230,7 +241,7 @@ def find_image_and_nuc_file(cyto_file: Path) -> Tuple[Optional[Path], Optional[P
 
 
 def match_and_write(cyto_lines, nuc_lines, cyto_mask, nuc_mask, out_path: Path):
-    """配對 nucleus 與 cytoplasm 並輸出合併的 outlines"""
+    """?? nucleus ??cytoplasm 銝西撓?箏?雿萇? outlines"""
     cyto_ids = np.unique(cyto_mask)[1:]
     nuc_ids = np.unique(nuc_mask)[1:]
     cyto_polygons = {}
@@ -274,19 +285,21 @@ def match_and_write(cyto_lines, nuc_lines, cyto_mask, nuc_mask, out_path: Path):
 
 
 def combined(input_dir: str):
-    """合併 cytoplasm 與 nucleus outlines"""
+    """Merge cytoplasm and nucleus outlines into paired merged outline files."""
     input_dir = Path(input_dir)
     outline_dir = output_dir(input_dir, "outline")
     txt_files = [f for f in list_files(outline_dir, ".txt") if "_cyto_seg" in f.stem]
     if not txt_files:
-        print(f"[WARN] 找不到 cytoplasm outlines 檔案於 {outline_dir}")
+        print(f"[WARN] 找不到 cytoplasm outlines 於 {outline_dir}")
         return
+
     for cyto_file in trange(len(txt_files), desc="Merging outlines"):
         cyto_path = txt_files[cyto_file]
         nuc_path, img_path = find_image_and_nuc_file(cyto_path)
         if not nuc_path or not img_path:
-            print(f"[WARN] 缺少 nucleus 或原圖: {cyto_path.name}")
+            print(f"[WARN] 缺少 nucleus 或對應影像: {cyto_path.name}")
             continue
+
         img = Image.open(img_path)
         shape = img.size[::-1]
         cyto_lines = load_outlines(cyto_path)
@@ -297,4 +310,6 @@ def combined(input_dir: str):
             cyto_path.stem.replace("_cyto_seg_cp_outlines", "_merged_cp_outlines.txt")
         )
         match_and_write(cyto_lines, nuc_lines, cyto_mask, nuc_mask, out_path)
+
     remove_temp_files(outline_dir)
+

@@ -1,19 +1,20 @@
 import os
+import sys
+import tempfile
+from contextlib import contextmanager
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from tqdm import trange
-from natsort import natsorted
-from typing import Union
+from typing import Any, Union
 from skimage.draw import polygon, polygon2mask
 from skimage.io import imread
-from skimage.measure import regionprops
 from shapely.affinity import scale
 from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
-from shapely.ops import unary_union
 from skimage import io as skio
 from shutil import copyfile
 import cv2
+import tifffile
 
 
 from ki67dtc.utils.io import (
@@ -29,10 +30,53 @@ from ki67dtc.utils.io import (
 
 _PYIMAGEJ = None
 
+
+@contextmanager
+def _suppress_console_output():
+    """Temporarily silence Python/native stdout and stderr."""
+    with open(os.devnull, "w") as devnull:
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        stdout_fd_backup = None
+        stderr_fd_backup = None
+        try:
+            sys.stdout = devnull
+            sys.stderr = devnull
+            try:
+                stdout_fd_backup = os.dup(1)
+                os.dup2(devnull.fileno(), 1)
+            except OSError:
+                stdout_fd_backup = None
+            try:
+                stderr_fd_backup = os.dup(2)
+                os.dup2(devnull.fileno(), 2)
+            except OSError:
+                stderr_fd_backup = None
+            yield
+        finally:
+            if stdout_fd_backup is not None:
+                os.dup2(stdout_fd_backup, 1)
+                os.close(stdout_fd_backup)
+            if stderr_fd_backup is not None:
+                os.dup2(stderr_fd_backup, 2)
+                os.close(stderr_fd_backup)
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+
+
+def _run_macro_quiet(ij: Any, macro: str, args: dict[str, Any]) -> Any:
+    """Run an IJ1 macro while suppressing noisy terminal output."""
+    with _suppress_console_output():
+        return ij.py.run_macro(macro, args=args)
+
 _KI67_IMAGEJ_MACRO = r"""
 #@ String input_path
 #@ String binary_path
 #@ String particle_options
+
+run("Close All");
+run("Clear Results");
+setBatchMode(true);
 
 open(input_path);
 orig_title = getTitle();
@@ -69,10 +113,119 @@ if (isOpen(orig_title)) {
     selectWindow(orig_title);
     close();
 }
+run("Clear Results");
+setBatchMode(false);
+close("*");
+"""
+
+_PREPROCESS_MACRO = r"""
+#@ String input_path
+#@ String output_path
+#@ double rolling_ball_radius
+
+open(input_path);
+run("16-bit");
+run("Subtract Background...", "rolling=" + rolling_ball_radius);
+saveAs("Tiff", output_path);
+close();
+"""
+
+_MEASURE_ROI_MACRO = r"""
+#@ String signal_path
+#@ String mask_path
+#@ String output_path
+
+run("Close All");
+run("Clear Results");
+setBatchMode(true);
+
+open(signal_path);
+rename("signal");
+open(mask_path);
+rename("mask");
+
+selectWindow("mask");
+run("8-bit");
+setThreshold(1, 255);
+run("Convert to Mask");
+run("Create Selection");
+
+stype = selectionType();
+if (stype < 0) {
+    File.saveString("valid=0\n", output_path);
+    setBatchMode(false);
+    close("*");
+    exit();
+}
+getSelectionCoordinates(xpoints, ypoints);
+
+selectWindow("signal");
+makeSelection("polygon", xpoints, ypoints);
+run("Set Measurements...", "area mean standard min integrated perimeter shape feret's fit decimal=6");
+run("Measure");
+
+area = getResult("Area", 0);
+mean = getResult("Mean", 0);
+std = getResult("StdDev", 0);
+minv = getResult("Min", 0);
+maxv = getResult("Max", 0);
+intden = getResult("IntDen", 0);
+rawintden = getResult("RawIntDen", 0);
+perim = getResult("Perim.", 0);
+feret = getResult("Feret", 0);
+minferet = getResult("MinFeret", 0);
+major = getResult("Major", 0);
+minor = getResult("Minor", 0);
+ar = getResult("AR", 0);
+roundv = getResult("Round", 0);
+circ = getResult("Circ.", 0);
+
+selectWindow("signal");
+makeSelection("polygon", xpoints, ypoints);
+run("Convex Hull");
+run("Clear Results");
+run("Set Measurements...", "perimeter decimal=6");
+run("Measure");
+conv_perim = getResult("Perim.", 0);
+
+result_txt = "";
+result_txt = result_txt + "valid=1\n";
+result_txt = result_txt + "area=" + area + "\n";
+result_txt = result_txt + "mean=" + mean + "\n";
+result_txt = result_txt + "std=" + std + "\n";
+result_txt = result_txt + "min=" + minv + "\n";
+result_txt = result_txt + "max=" + maxv + "\n";
+result_txt = result_txt + "intden=" + intden + "\n";
+result_txt = result_txt + "raw_intden=" + rawintden + "\n";
+result_txt = result_txt + "perimeter=" + perim + "\n";
+result_txt = result_txt + "feret=" + feret + "\n";
+result_txt = result_txt + "minferet=" + minferet + "\n";
+result_txt = result_txt + "major=" + major + "\n";
+result_txt = result_txt + "minor=" + minor + "\n";
+result_txt = result_txt + "ar=" + ar + "\n";
+result_txt = result_txt + "round=" + roundv + "\n";
+result_txt = result_txt + "circ=" + circ + "\n";
+result_txt = result_txt + "convex_perimeter=" + conv_perim + "\n";
+File.saveString(result_txt, output_path);
+
+run("Clear Results");
+setBatchMode(false);
+close("*");
 """
 
 
 def _get_pyimagej():
+    """初始化並回傳 PyImageJ 物件（含快取）。
+
+    Args:
+        無。
+
+    Returns:
+        Any: 可執行 IJ1 macro 的 PyImageJ 物件。
+
+    Raises:
+        RuntimeError: 未安裝 PyImageJ 相關套件，或 legacy 模式未啟用時拋出。
+    """
     global _PYIMAGEJ
     if _PYIMAGEJ is not None:
         return _PYIMAGEJ
@@ -85,7 +238,7 @@ def _get_pyimagej():
             "PyImageJ is unavailable. Install pyimagej/scyjava/jpype1 first."
         ) from exc
 
-    scyjava.config.add_option("-Dscijava.log.level=info")
+    scyjava.config.add_option("-Dscijava.log.level=error")
     fiji_app_path = os.environ.get("FIJI_APP_PATH", "").strip()
     if fiji_app_path:
         ij = imagej.init(fiji_app_path, mode="headless", add_legacy=True)
@@ -99,11 +252,285 @@ def _get_pyimagej():
     return _PYIMAGEJ
 
 
+def _preprocess_signal_with_imagej(
+    ij: Any, signal_2d: np.ndarray, rolling_ball_radius: float = 50.0
+) -> np.ndarray:
+    """使用 PyImageJ 對單通道影像做背景扣除前處理。
+
+    Args:
+        ij (Any): PyImageJ 物件。
+        signal_2d (np.ndarray): 單通道 2D 影像。
+        rolling_ball_radius (float, optional): Rolling-ball 半徑。預設為 `50.0`。
+
+    Returns:
+        np.ndarray: 背景扣除後的 `float32` 2D 影像。
+
+    Raises:
+        ValueError: 輸入影像不是 2D 時拋出。
+        RuntimeError: ImageJ 前處理失敗時拋出。
+    """
+    if signal_2d.ndim != 2:
+        raise ValueError(f"signal_2d 必須為 2D，實際為 {signal_2d.shape}")
+
+    with tempfile.TemporaryDirectory(prefix="pyimagej_bgsub_") as tmp:
+        tmp_dir = Path(tmp)
+        in_path = tmp_dir / "signal_input.tif"
+        out_path = tmp_dir / "signal_bgsub.tif"
+        tifffile.imwrite(in_path, signal_2d.astype(np.float32))
+        _run_macro_quiet(
+            ij,
+            _PREPROCESS_MACRO,
+            args={
+                "input_path": str(in_path),
+                "output_path": str(out_path),
+                "rolling_ball_radius": float(rolling_ball_radius),
+            },
+        )
+        if not out_path.exists():
+            raise RuntimeError(f"ImageJ 前處理失敗，找不到輸出檔：{out_path}")
+        out = tifffile.imread(out_path).astype(np.float32)
+        out = np.squeeze(out)
+        if out.ndim != 2:
+            raise ValueError(f"前處理結果維度錯誤：{out.shape}")
+        return out
+
+
+def _empty_imagej_measurements() -> dict[str, float]:
+    """建立 ImageJ 量測結果的預設字典。
+
+    Args:
+        無。
+
+    Returns:
+        dict[str, float]: 各欄位以 `np.nan` 初始化的量測字典。
+    """
+    return {
+        "area": np.nan,
+        "mean": np.nan,
+        "std": np.nan,
+        "min": np.nan,
+        "max": np.nan,
+        "intden": np.nan,
+        "raw_intden": np.nan,
+        "perimeter": np.nan,
+        "feret": np.nan,
+        "minferet": np.nan,
+        "major": np.nan,
+        "minor": np.nan,
+        "ar": np.nan,
+        "round": np.nan,
+        "circ": np.nan,
+        "convex_perimeter": np.nan,
+    }
+
+
+def _read_kv_measurements(path: Path) -> dict[str, float]:
+    """讀取 ImageJ macro 輸出的 key-value 量測檔。
+
+    Args:
+        path (Path): 量測輸出文字檔路徑。
+
+    Returns:
+        dict[str, float]: 量測結果字典。
+    """
+    out = _empty_imagej_measurements()
+    if not path.exists():
+        return out
+
+    parsed: dict[str, str] = {}
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            parsed[key.strip()] = value.strip()
+
+    if parsed.get("valid") != "1":
+        return out
+
+    for key in out:
+        if key not in parsed:
+            continue
+        try:
+            out[key] = float(parsed[key])
+        except Exception:
+            out[key] = np.nan
+
+    if (
+        np.isnan(out["raw_intden"])
+        and not np.isnan(out["area"])
+        and not np.isnan(out["mean"])
+    ):
+        out["raw_intden"] = float(out["area"] * out["mean"])
+    return out
+
+
+def _measure_roi_with_imagej(
+    ij: Any,
+    signal_path: Path,
+    roi_mask: np.ndarray | None,
+    temp_dir: Path,
+    slot: str,
+) -> dict[str, float]:
+    """使用 PyImageJ 量測單一 ROI 遮罩。
+
+    Args:
+        ij (Any): PyImageJ 物件。
+        signal_path (Path): 被量測影像路徑。
+        roi_mask (np.ndarray | None): ROI 二值遮罩。
+        temp_dir (Path): 暫存目錄。
+        slot (str): 暫存檔命名識別字。
+
+    Returns:
+        dict[str, float]: ROI 量測結果字典。
+    """
+    if roi_mask is None or not np.any(roi_mask):
+        return _empty_imagej_measurements()
+
+    mask_path = temp_dir / f"{slot}_mask.tif"
+    out_path = temp_dir / f"{slot}_measure.txt"
+    tifffile.imwrite(mask_path, (roi_mask.astype(np.uint8) * 255))
+    _run_macro_quiet(
+        ij,
+        _MEASURE_ROI_MACRO,
+        args={
+            "signal_path": str(signal_path),
+            "mask_path": str(mask_path),
+            "output_path": str(out_path),
+        },
+    )
+    return _read_kv_measurements(out_path)
+
+
+def _geometry_from_imagej_measurements(m: dict[str, float]) -> dict[str, float]:
+    """將 ImageJ 量測結果轉為主流程幾何欄位。
+
+    Args:
+        m (dict[str, float]): ImageJ 量測結果字典。
+
+    Returns:
+        dict[str, float]: 主流程幾何欄位對應值。
+    """
+    area = m["area"]
+    perimeter = m["perimeter"]
+    convex_perimeter = m["convex_perimeter"]
+    major = m["major"]
+    minor = m["minor"]
+
+    circular_diameter = (
+        2 * np.sqrt(area / np.pi) if not np.isnan(area) and area > 0 else np.nan
+    )
+    sphericity = m["circ"]
+    if np.isnan(sphericity):
+        sphericity = (
+            (4 * np.pi * area) / (perimeter**2)
+            if not np.isnan(area) and not np.isnan(perimeter) and perimeter > 0
+            else np.nan
+        )
+
+    roughness = (
+        (convex_perimeter / perimeter)
+        if not np.isnan(convex_perimeter) and not np.isnan(perimeter) and perimeter > 0
+        else np.nan
+    )
+
+    aspect_ratio = m["ar"]
+    roundness = m["round"]
+    circularity = np.nan
+
+    if (
+        np.isnan(aspect_ratio)
+        and not np.isnan(major)
+        and not np.isnan(minor)
+        and minor > 0
+    ):
+        aspect_ratio = major / minor
+
+    if np.isnan(roundness) and not np.isnan(area) and not np.isnan(major) and major > 0:
+        roundness = (4 * area) / (np.pi * major**2)
+
+    if not np.isnan(area) and not np.isnan(perimeter) and perimeter > 0:
+        circularity = (2 * np.sqrt(np.pi * area)) / (perimeter**2)
+
+    return {
+        "area": area,
+        "perimeter": perimeter,
+        "convex_perimeter": convex_perimeter,
+        "circular_diameter": circular_diameter,
+        "feret_length": m["feret"],
+        "feret_width": m["minferet"],
+        "aspect_ratio": aspect_ratio,
+        "roundness": roundness,
+        "circularity": circularity,
+        "sphericity": sphericity,
+        "roughness": roughness,
+    }
+
+
+def _parse_outline_pairs(
+    outlines_txt: Union[str, Path],
+) -> list[tuple[int, np.ndarray, np.ndarray]]:
+    """解析 merged outline 檔為成對的核/質座標。
+
+    Args:
+        outlines_txt (Union[str, Path]): merged outline 文字檔路徑。
+
+    Returns:
+        list[tuple[int, np.ndarray, np.ndarray]]:
+        每個元素為 `(roi_id, nucleus_xy, cytoplasm_xy)`。
+    """
+    with open(outlines_txt, "r", encoding="utf-8", errors="ignore") as f:
+        lines = [line.strip() for line in f if line.strip()]
+
+    pairs: list[tuple[int, np.ndarray, np.ndarray]] = []
+    num_pairs = len(lines) // 2
+    for i in range(num_pairs):
+        try:
+            nuc = np.array(
+                list(map(int, lines[2 * i].split(","))), dtype=np.int32
+            ).reshape(-1, 2)
+            cyto = np.array(
+                list(map(int, lines[2 * i + 1].split(","))), dtype=np.int32
+            ).reshape(-1, 2)
+        except Exception:
+            continue
+        if nuc.shape[0] < 3 or cyto.shape[0] < 3:
+            continue
+        pairs.append((i + 1, nuc, cyto))
+    return pairs
+
+
+def _polygon_to_mask(points_xy: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """將 polygon 座標轉為二值遮罩。
+
+    Args:
+        points_xy (np.ndarray): `(N, 2)` 座標，欄位順序為 `(x, y)`。
+        shape (tuple[int, int]): 遮罩尺寸 `(height, width)`。
+
+    Returns:
+        np.ndarray: `bool` 型態遮罩。
+    """
+    rr, cc = polygon(points_xy[:, 1], points_xy[:, 0], shape)
+    mask = np.zeros(shape, dtype=bool)
+    mask[rr, cc] = True
+    return mask
+
+
 # ===============================
 # Geometry Utilities
 # ===============================
+
+
 def extract_polygons(geom):
-    """將輸入幾何物件統一轉成 Polygon list"""
+    """將 Shapely 幾何物件展平成 Polygon 清單。
+
+    Args:
+        geom: `Polygon`、`MultiPolygon` 或 `GeometryCollection`。
+
+    Returns:
+        list[Polygon]: 可直接迭代處理的 Polygon 清單。
+    """
     if isinstance(geom, Polygon):
         return [geom]
     elif isinstance(geom, MultiPolygon):
@@ -114,81 +541,90 @@ def extract_polygons(geom):
         return []
 
 
-# ===============================
-# 幾何參數分析
-# ===============================
 def param_anal(img_path, outlines_txt, output_csv):
-    """計算 outlines 的各項幾何參數並輸出 CSV"""
-    img = imread(img_path, as_gray=True)
-    h, w = img.shape
-    rows = []
-    nucleus_areas = {}
+    """以 PyImageJ 量測核與細胞質幾何參數，並輸出主流程相容 CSV。
 
-    with open(outlines_txt, "r") as f:
-        lines = [line.strip() for line in f if line.strip()]
+    Args:
+        img_path (Union[str, Path]): PC 影像路徑。
+        outlines_txt (Union[str, Path]): `_merged_cp_outlines.txt` 路徑。
+        output_csv (Union[str, Path]): 參數輸出 CSV 路徑。
 
-    for idx, line in enumerate(lines):
-        coords = list(map(int, line.split(",")))
-        X, Y = coords[::2], coords[1::2]
-        if len(X) < 3:
-            continue
+    Returns:
+        None: 此函式僅負責輸出檔案。
+    """
+    img_path = Path(img_path)
+    output_csv = Path(output_csv)
+    if not img_path.exists():
+        raise FileNotFoundError(f"找不到影像：{img_path}")
 
-        rr, cc = polygon(Y, X, (h, w))
-        mask = np.zeros((h, w), dtype=np.uint8)
-        mask[rr, cc] = 1
-        props = regionprops(mask.astype(int), intensity_image=img)[0]
+    signal = imread(img_path, as_gray=True).astype(np.float32)
+    shape = signal.shape
+    ij = _get_pyimagej()
+    pairs = _parse_outline_pairs(outlines_txt)
+    rows: list[list[float | str]] = []
 
-        roi_type = "nuc" if idx % 2 == 0 else "cyto"
-        roi_id = idx // 2 + 1
-        roi_name = f"{img_path.stem}_{roi_id}_{roi_type}"
+    with tempfile.TemporaryDirectory(prefix="pyimagej_param_") as tmp:
+        tmp_dir = Path(tmp)
+        signal_path = tmp_dir / f"{img_path.stem}_pc_signal.tif"
+        tifffile.imwrite(signal_path, signal)
 
-        area = props.area
-        perimeter = props.perimeter
-        major_axis = props.major_axis_length
-        minor_axis = props.minor_axis_length
-        feret_max = props.feret_diameter_max
-        feret_min = minor_axis
+        for roi_id, nuc_xy, cyto_xy in pairs:
+            nuc_mask = _polygon_to_mask(nuc_xy, shape)
+            cyto_raw_mask = _polygon_to_mask(cyto_xy, shape)
+            cyto_mask = np.logical_and(cyto_raw_mask, np.logical_not(nuc_mask))
 
-        poly = Polygon(zip(X, Y))
-        convex_perimeter = poly.convex_hull.length if poly.is_valid else np.nan
+            nuc_m = _measure_roi_with_imagej(
+                ij, signal_path, nuc_mask, tmp_dir, f"roi_{roi_id}_nuc"
+            )
+            cyto_m = _measure_roi_with_imagej(
+                ij, signal_path, cyto_mask, tmp_dir, f"roi_{roi_id}_cyto"
+            )
 
-        circular_diameter = 2 * np.sqrt(area / np.pi)
-        aspect_ratio = major_axis / minor_axis if minor_axis > 0 else np.nan
-        roundness = (4 * area) / (np.pi * major_axis**2) if major_axis > 0 else np.nan
-        circularity = (
-            (2 * np.sqrt(np.pi * area)) / perimeter if perimeter > 0 else np.nan
-        )
-        sphericity = (4 * np.pi * area) / (perimeter**2) if perimeter > 0 else np.nan
-        roughness = (
-            1 - (convex_perimeter / perimeter)
-            if perimeter > 0 and convex_perimeter > 0
-            else np.nan
-        )
+            nuc_g = _geometry_from_imagej_measurements(nuc_m)
+            cyto_g = _geometry_from_imagej_measurements(cyto_m)
 
-        if roi_type == "nuc":
-            nucleus_areas[roi_id] = area
             karyoplasmic_ratio = np.nan
-        else:
-            nuc_area = nucleus_areas.get(roi_id, np.nan)
-            karyoplasmic_ratio = area / nuc_area if nuc_area > 0 else np.nan
+            if (
+                not np.isnan(cyto_g["area"])
+                and not np.isnan(nuc_g["area"])
+                and nuc_g["area"] > 0
+            ):
+                karyoplasmic_ratio = float(cyto_g["area"] / nuc_g["area"])
 
-        rows.append(
-            [
-                roi_name,
-                area,
-                perimeter,
-                convex_perimeter,
-                circular_diameter,
-                feret_max,
-                feret_min,
-                aspect_ratio,
-                roundness,
-                circularity,
-                sphericity,
-                roughness,
-                karyoplasmic_ratio,
-            ]
-        )
+            rows.append(
+                [
+                    f"{img_path.stem}_{roi_id}_nuc",
+                    nuc_g["area"],
+                    nuc_g["perimeter"],
+                    nuc_g["convex_perimeter"],
+                    nuc_g["circular_diameter"],
+                    nuc_g["feret_length"],
+                    nuc_g["feret_width"],
+                    nuc_g["aspect_ratio"],
+                    nuc_g["roundness"],
+                    nuc_g["circularity"],
+                    nuc_g["sphericity"],
+                    nuc_g["roughness"],
+                    np.nan,
+                ]
+            )
+            rows.append(
+                [
+                    f"{img_path.stem}_{roi_id}_cyto",
+                    cyto_g["area"],
+                    cyto_g["perimeter"],
+                    cyto_g["convex_perimeter"],
+                    cyto_g["circular_diameter"],
+                    cyto_g["feret_length"],
+                    cyto_g["feret_width"],
+                    cyto_g["aspect_ratio"],
+                    cyto_g["roundness"],
+                    cyto_g["circularity"],
+                    cyto_g["sphericity"],
+                    cyto_g["roughness"],
+                    karyoplasmic_ratio,
+                ]
+            )
 
     df = pd.DataFrame(
         rows,
@@ -209,90 +645,104 @@ def param_anal(img_path, outlines_txt, output_csv):
         ],
     )
     df.to_csv(output_csv, index=False)
-    print(f"[INFO] Saved full measurement table → {output_csv}")
+    print(f"[INFO] 已輸出參數分析結果：{output_csv}")
 
 
-# ===============================
-# 螢光分析
-# ===============================
 def flour_anal(
     img_path, outlines_txt, output_csv, max_expand_steps=20, expand_factor=0.5
 ):
+    """以 PyImageJ 量測環狀 ROI 的螢光強度。
+
+    Args:
+        img_path (Union[str, Path]): 螢光影像路徑（如 DF/LT）。
+        outlines_txt (Union[str, Path]): `_merged_cp_outlines.txt` 路徑。
+        output_csv (Union[str, Path]): 螢光輸出 CSV 路徑。
+        max_expand_steps (int, optional): 向外擴張圈層數。預設為 `20`。
+        expand_factor (float, optional): 每一步核輪廓擴張比例。預設為 `0.5`。
+
+    Returns:
+        None: 此函式僅負責輸出檔案。
     """
-    螢光分析流程：
-    - 逐步擴張 nucleus
-    - 每次與前一次做 XOR
-    - XOR 結果再與 cytoplasm 做 AND
-    - 計算 IntDen 與 RawIntDen
-    """
-    img = imread(img_path, as_gray=True)
-    h, w = img.shape
+    img_path = Path(img_path)
+    output_csv = Path(output_csv)
+    if not img_path.exists():
+        raise FileNotFoundError(f"找不到影像：{img_path}")
 
-    with open(outlines_txt, "r") as f:
-        lines = [line.strip() for line in f if line.strip()]
-    num_pairs = len(lines) // 2
-    rows = []
+    signal = imread(img_path, as_gray=True).astype(np.float32)
+    h, w = signal.shape
+    ij = _get_pyimagej()
+    signal_bgsub = _preprocess_signal_with_imagej(ij, signal, rolling_ball_radius=50.0)
+    pairs = _parse_outline_pairs(outlines_txt)
+    rows: list[list[float | str]] = []
 
-    for i in range(num_pairs):
-        nuc_coords = list(map(int, lines[2 * i].split(",")))
-        cyto_coords = list(map(int, lines[2 * i + 1].split(",")))
+    with tempfile.TemporaryDirectory(prefix="pyimagej_fluor_") as tmp:
+        tmp_dir = Path(tmp)
+        signal_path = tmp_dir / f"{img_path.stem}_fluor_signal.tif"
+        tifffile.imwrite(signal_path, signal_bgsub.astype(np.float32))
 
-        if len(nuc_coords) < 6 or len(cyto_coords) < 6:
-            continue
-
-        nuc_poly = Polygon(np.array(nuc_coords).reshape(-1, 2))
-        cyto_poly = Polygon(np.array(cyto_coords).reshape(-1, 2))
-
-        nuc_poly = nuc_poly.buffer(0)
-        cyto_poly = cyto_poly.buffer(0)
-
-        if not nuc_poly.is_valid or not cyto_poly.is_valid:
-            continue
-
-        prev_poly = nuc_poly
-
-        for j in range(max_expand_steps):
-            factor = 1 + expand_factor * (j + 1)
-            scaled_nuc = scale(nuc_poly, xfact=factor, yfact=factor, origin="center")
-
-            xor_poly = scaled_nuc.symmetric_difference(prev_poly)
-            if xor_poly.is_empty:
-                prev_poly = scaled_nuc
+        for roi_id, nuc_xy, cyto_xy in pairs:
+            nuc_poly = Polygon(nuc_xy).buffer(0)
+            cyto_poly = Polygon(cyto_xy).buffer(0)
+            if nuc_poly.is_empty or cyto_poly.is_empty:
+                continue
+            if not nuc_poly.is_valid or not cyto_poly.is_valid:
                 continue
 
-            and_poly = xor_poly.intersection(cyto_poly)
-            if and_poly.is_empty:
+            prev_poly = nuc_poly
+            for ring_id in range(max_expand_steps):
+                factor = 1 + expand_factor * (ring_id + 1)
+                scaled_nuc = scale(
+                    nuc_poly, xfact=factor, yfact=factor, origin="center"
+                )
+                ring_poly = scaled_nuc.symmetric_difference(prev_poly)
                 prev_poly = scaled_nuc
-                continue
+                if ring_poly.is_empty:
+                    continue
 
-            polys = extract_polygons(and_poly)
-            mask = np.zeros((h, w), dtype=bool)
-            for poly in polys:
-                coords = np.array(poly.exterior.coords).round().astype(int)
-                rr, cc = polygon(coords[:, 1], coords[:, 0], (h, w))
-                mask[rr, cc] = True
+                target = ring_poly.intersection(cyto_poly)
+                if target.is_empty:
+                    continue
 
-            if np.any(mask):
-                props = regionprops(mask.astype(int), intensity_image=img)[0]
-                area = props.area
-                mean_gray_value = props.mean_intensity
-                int_den = area * mean_gray_value
-                raw_int_den = img[mask].sum()
-                label = f"{Path(img_path).name}:NewCell-{i+1}-and{j}"
-                rows.append([label, int_den, raw_int_den])
+                ring_mask = np.zeros((h, w), dtype=bool)
+                for poly in extract_polygons(target):
+                    coords = np.array(poly.exterior.coords, dtype=np.float32)[:, :2]
+                    if coords.shape[0] < 3:
+                        continue
+                    ring_mask |= _polygon_to_mask(coords.astype(np.int32), (h, w))
 
-            prev_poly = scaled_nuc
+                if not np.any(ring_mask):
+                    continue
+
+                measured = _measure_roi_with_imagej(
+                    ij,
+                    signal_path,
+                    ring_mask,
+                    tmp_dir,
+                    f"roi_{roi_id}_ring_{ring_id}",
+                )
+                rows.append(
+                    [
+                        f"{img_path.name}:NewCell-{roi_id}-and{ring_id}",
+                        measured["intden"],
+                        measured["raw_intden"],
+                    ]
+                )
 
     df = pd.DataFrame(rows, columns=["Label", "IntDen", "RawIntDen"])
     df.to_csv(output_csv, index=False)
-    print(f"[INFO] Saved fluorescence analysis → {output_csv}")
+    print(f"[INFO] 已輸出螢光分析結果：{output_csv}")
 
 
-# ===============================
-# Ki67 陽性判斷與合併
-# ===============================
 def _remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
-    """移除小於 min_area 的連通元件。"""
+    """移除小於門檻面積的連通元件。
+
+    Args:
+        mask (np.ndarray): 二值影像。
+        min_area (int): 保留元件的最小像素面積。
+
+    Returns:
+        np.ndarray: 僅保留面積大於等於 `min_area` 的二值影像。
+    """
     if min_area <= 0:
         return mask
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
@@ -315,9 +765,24 @@ def ki67_binarize(
     open_kernel: int = 3,
     backend: str = "pyimagej",  # "pyimagej"|"opencv"
 ) -> Path:
-    """
-    Ki67 binarization.
-    Default backend is PyImageJ macro flow (from notebook), with OpenCV fallback.
+    """執行 Ki67 二值化。
+
+    Args:
+        img_path (Union[str, Path]): Ki67 影像路徑。
+        channel (str, optional): OpenCV 模式下使用的色彩通道。
+        gauss_sigma (float, optional): 高斯平滑 sigma。
+        clahe_clip (float, optional): CLAHE clip limit?
+        otsu_scale (float, optional): Otsu 門檻縮放比例。
+        min_obj_area (int, optional): 最小物件面積。
+        open_kernel (int, optional): 開運算 kernel 尺寸。
+        backend (str, optional): `pyimagej` 或 `opencv`。
+
+    Returns:
+        Path: 二值化輸出影像路徑。
+
+    Raises:
+        FileNotFoundError: 找不到輸入影像時拋出。
+        ValueError: backend 參數不支援時拋出。
     """
     img_path = Path(img_path)
     if not img_path.exists():
@@ -361,6 +826,17 @@ def _ki67_binarize_pyimagej(
     out_path: Path,
     min_obj_area: int = 50,
 ) -> None:
+    """使用 PyImageJ macro 執行 Ki67 二值化。
+
+    Args:
+        img_path (Path): Ki67 影像路徑。
+        out_path (Path): 二值化輸出路徑。
+        min_obj_area (int, optional): Analyze Particles 最小面積門檻。
+
+    Returns:
+        None: 此函式僅負責輸出檔案。
+    """
+
     ij = _get_pyimagej()
     if out_path.exists():
         out_path.unlink()
@@ -371,7 +847,7 @@ def _ki67_binarize_pyimagej(
         "binary_path": str(out_path),
         "particle_options": particle_options,
     }
-    ij.py.run_macro(_KI67_IMAGEJ_MACRO, args=args)
+    _run_macro_quiet(ij, _KI67_IMAGEJ_MACRO, args=args)
 
     binary = cv2.imread(str(out_path), cv2.IMREAD_GRAYSCALE)
     if binary is None:
@@ -391,6 +867,22 @@ def _ki67_binarize_opencv(
     min_obj_area: int = 50,
     open_kernel: int = 3,
 ) -> None:
+    """使用 OpenCV 執行 Ki67 二值化。
+
+    Args:
+        img_path (Path): Ki67 影像路徑。
+        out_path (Path): 二值化輸出路徑。
+        channel (str, optional): 使用的色彩通道。
+        gauss_sigma (float, optional): 高斯平滑 sigma。
+        clahe_clip (float, optional): CLAHE clip limit?
+        otsu_scale (float, optional): Otsu 門檻縮放比例。
+        min_obj_area (int, optional): 最小物件面積。
+        open_kernel (int, optional): 開運算 kernel 尺寸。
+
+    Returns:
+        None: 此函式僅負責輸出檔案。
+    """
+
     img_color = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
     if img_color is None:
         raise FileNotFoundError(f"[ERROR] 找不到圖片: {img_path}")
@@ -428,8 +920,16 @@ def _ki67_binarize_opencv(
 def detect_ki67_positive(
     roi_dir: Path, ki67_dir: Path, output_dir: Path, threshold: float = 0.10
 ):
-    """
-    Ki67 陽性 ROI 判斷：使用二值化後的 Ki67 mask，計算 ROI 重疊比例判定陽性。
+    """依 ROI 與 Ki67 mask 重疊比例判定陽性。
+
+    Args:
+        roi_dir (Path): outlines 文字檔路徑。
+        ki67_dir (Path): Ki67 二值化影像路徑。
+        output_dir (Path): 陽性標記輸出路徑。
+        threshold (float, optional): 陽性判定的重疊比例門檻。
+
+    Returns:
+        None: 此函式僅負責輸出檔案。
     """
     if not ki67_dir.exists():
         print(f"[WARN] 找不到 Ki67 mask: {ki67_dir}")
@@ -460,7 +960,16 @@ def detect_ki67_positive(
 
 
 def merge_ki67_labels(param_csv: Path, label_file: Path, output_csv: Path):
-    """將單一檔案合併 Ki67 陽性標記"""
+    """將 Ki67 陽性標記合併回參數表。
+
+    Args:
+        param_csv (Path): 參數表路徑。
+        label_file (Path): 陽性標記文字檔路徑。
+        output_csv (Path): 合併後輸出路徑。
+
+    Returns:
+        None: 此函式僅負責輸出檔案。
+    """
     if not label_file.exists():
         print(f"[WARN] 缺少陽性 label: {label_file.name}")
         return
@@ -487,6 +996,19 @@ def run_all(
     ki67_backend: str = "pyimagej",
     clean_temp: bool = True,
 ) -> None:
+    """執行主流程的幾何、螢光與 Ki67 分析。
+
+    Args:
+        data_name (str): 資料集路徑或名稱。
+        fluor_analy (bool, optional): 是否啟用螢光分析。
+        ki67 (bool, optional): 是否啟用 Ki67 判定。
+        ki67_backend (str, optional): Ki67 二值化後端。
+        clean_temp (bool, optional): 是否清理暫存檔。
+
+    Returns:
+        None: 此函式僅負責輸出檔案。
+    """
+
     data_path = Path(data_name)
     pc_dir = data_path / "PC"
     ki67_dir = data_path / "KI67"
@@ -506,9 +1028,7 @@ def run_all(
         folders = ", ".join(label for label, _ in existing_fluor_dirs)
         print(f"[資訊] 已偵測到螢光資料夾：{folders}")
     elif fluor_analy:
-        print(
-            "[警告] 已啟用螢光分析，但未找到 DF 或 LT 資料夾；僅輸出幾何參數。"
-        )
+        print("[警告] 已啟用螢光分析，但未找到 DF 或 LT 資料夾；僅輸出幾何參數。")
 
     def get_image_names(folder: Path) -> list[str]:
         if not folder.exists() or not folder.is_dir():
@@ -652,4 +1172,3 @@ def run_all(
     if clean_temp:
         remove_temp_files(analy_dir)
         remove_temp_files(output_dir(data_path, "outline"))
-
