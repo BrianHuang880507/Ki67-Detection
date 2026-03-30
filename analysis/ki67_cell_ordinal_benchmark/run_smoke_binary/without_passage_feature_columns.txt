@@ -1,0 +1,23 @@
+Area_nuc
+Perimeter_nuc
+Convex Perimeter_nuc
+Circular Diameter_nuc
+Feret Length_nuc
+Feret Width_nuc
+Aspect Ratio_nuc
+Roundness_nuc
+Circularity_nuc
+Sphericity_nuc
+Roughness_nuc
+Area_cyto
+Perimeter_cyto
+Convex Perimeter_cyto
+Circular Diameter_cyto
+Feret Length_cyto
+Feret Width_cyto
+Aspect Ratio_cyto
+Roundness_cyto
+Circularity_cyto
+Sphericity_cyto
+Roughness_cyto
+Karyoplasmic Ratio_cyto

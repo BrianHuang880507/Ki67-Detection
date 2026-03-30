@@ -1,0 +1,37 @@
+{
+  "results_root": "data\\output\\results",
+  "output_dir": "analysis\\ki67_cell_ordinal_benchmark\\run_smoke_binary",
+  "random_state": 42,
+  "train_ratio": 0.8,
+  "val_ratio": 0.1,
+  "test_ratio": 0.1,
+  "dataset_include": null,
+  "dataset_exclude": null,
+  "label_info": {
+    "label_source": "column:ki67_positive",
+    "dropped_missing_label": 0,
+    "rows_after_label_drop": 14617,
+    "unique_labels": [
+      0,
+      1
+    ]
+  },
+  "models_requested": [
+    "logistic_regression",
+    "random_forest",
+    "extra_trees",
+    "hist_gradient_boosting",
+    "xgboost",
+    "catboost"
+  ],
+  "models_run": [
+    "extra_trees",
+    "hist_gradient_boosting",
+    "logistic_regression",
+    "random_forest"
+  ],
+  "models_skipped_optional": {
+    "xgboost": "No module named 'xgboost'",
+    "catboost": "No module named 'catboost'"
+  }
+}
