@@ -52,7 +52,7 @@ def _resolve_data_folder(raw_data_folder: Path) -> Path:
 
 def run_pipeline(
     data_folder: Path,
-    nuc_source: str = "pc",
+    nuc_source: str = "dapi",
     fluor_analy: bool = True,
     ki67: bool = True,
     ki67_backend: str = "pyimagej",

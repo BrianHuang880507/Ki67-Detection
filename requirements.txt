@@ -11,9 +11,11 @@ pandas
 numpy
 scikit-learn
 xgboost
+lightgbm
 torch
 torchvision
 matplotlib
+openpyxl
 imageio
 scikit-image
 tifffile

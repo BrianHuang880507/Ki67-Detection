@@ -17,7 +17,10 @@ class RunResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run main.py for every first-level folder under data/input."
+        description=(
+            "Run the full main.py pipeline, including segmentation, for every "
+            "first-level folder under data/input."
+        )
     )
     parser.add_argument(
         "--input-root",
@@ -27,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--main-script",
         default="main.py",
-        help="Main pipeline script path (default: main.py).",
+        help="Full pipeline script path, including segmentation (default: main.py).",
     )
     parser.add_argument(
         "--python-exec",

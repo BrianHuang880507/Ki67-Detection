@@ -1,7 +1,0 @@
-split,label,n_cells
-test,0,216
-test,1,821
-train,0,2510
-train,1,9389
-val,0,326
-val,1,1355

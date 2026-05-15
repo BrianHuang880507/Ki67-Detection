@@ -59,6 +59,7 @@ def remove_temp_files(folder: Path, keywords: list[str] = None, exts: list[str] 
             "params_merged",
             "fluorescence",
             "fluor_flat",
+            "ido_measurements",
             "_cyto_seg_cp_outlines",
             "_nuc_seg_cp_outlines",
         ]

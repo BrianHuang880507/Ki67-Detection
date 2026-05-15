@@ -587,9 +587,11 @@ def param_anal(img_path, outlines_txt, output_csv):
             if (
                 not np.isnan(cyto_g["area"])
                 and not np.isnan(nuc_g["area"])
-                and nuc_g["area"] > 0
+                and cyto_g["area"] > 0
             ):
-                karyoplasmic_ratio = float(cyto_g["area"] / nuc_g["area"])
+                # Use nucleus area / cytoplasm area so the value matches the intended
+                # biological interpretation of a nucleocytoplasmic ratio.
+                karyoplasmic_ratio = float(nuc_g["area"] / cyto_g["area"])
 
             rows.append(
                 [
@@ -731,6 +733,78 @@ def flour_anal(
     df = pd.DataFrame(rows, columns=["Label", "IntDen", "RawIntDen"])
     df.to_csv(output_csv, index=False)
     print(f"[INFO] 已輸出螢光分析結果：{output_csv}")
+
+
+def ido_anal(img_path, outlines_txt, output_csv):
+    """依使用者定義輸出 IDO 細胞層級量測欄位。"""
+    img_path = Path(img_path)
+    output_csv = Path(output_csv)
+    if not img_path.exists():
+        raise FileNotFoundError(f"?曆??啣蔣??{img_path}")
+
+    signal = imread(img_path, as_gray=True).astype(np.float32)
+    shape = signal.shape
+    pairs = _parse_outline_pairs(outlines_txt)
+
+    cell_mask_union = np.zeros(shape, dtype=bool)
+    roi_masks: list[tuple[int, np.ndarray]] = []
+    for roi_id, nuc_xy, cyto_xy in pairs:
+        nuc_mask = _polygon_to_mask(nuc_xy, shape)
+        cyto_raw_mask = _polygon_to_mask(cyto_xy, shape)
+        cyto_mask = np.logical_and(cyto_raw_mask, np.logical_not(nuc_mask))
+
+        cell_mask_union |= cyto_raw_mask
+        roi_masks.append((roi_id, cyto_mask))
+
+    background_pixels = signal[np.logical_not(cell_mask_union)]
+    # The requested field name keeps "Mean", but the value is the
+    # non-cell pixel median defined by the user.
+    ido_background_mean = (
+        float(np.median(background_pixels)) if background_pixels.size > 0 else np.nan
+    )
+
+    rows: list[list[float | str]] = []
+    for roi_id, cyto_mask in roi_masks:
+        area_cyto = float(np.count_nonzero(cyto_mask))
+        ido_mean_intensity = (
+            float(np.mean(signal[cyto_mask])) if area_cyto > 0 else np.nan
+        )
+
+        if np.isnan(ido_mean_intensity) or np.isnan(ido_background_mean):
+            ido_mean_intensity_bgsub = np.nan
+            ido_intden = np.nan
+            ido_intden_bgsub = np.nan
+        else:
+            ido_mean_intensity_bgsub = float(
+                ido_mean_intensity - ido_background_mean
+            )
+            ido_intden = ido_mean_intensity_bgsub
+            ido_intden_bgsub = float(area_cyto * ido_mean_intensity_bgsub)
+
+        rows.append(
+            [
+                f"{img_path.stem}_{roi_id}",
+                ido_background_mean,
+                ido_mean_intensity,
+                ido_mean_intensity_bgsub,
+                ido_intden,
+                ido_intden_bgsub,
+            ]
+        )
+
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "Cell_ID",
+            "IDO_BackgroundMean",
+            "IDO_MeanIntensity",
+            "IDO_MeanIntensity_BgSub",
+            "IDO_IntDen",
+            "IDO_IntDen_BgSub",
+        ],
+    )
+    df.to_csv(output_csv, index=False)
+    print(f"[INFO] IDO 量測完成：{output_csv}")
 
 
 def _remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
@@ -936,16 +1010,26 @@ def detect_ki67_positive(
         return
 
     ki67_mask = skio.imread(str(ki67_dir)) > 0
-    shape = ki67_mask.shape
+    positive_labels = _ki67_positive_labels_from_mask(roi_dir, ki67_mask, threshold)
+    np.savetxt(output_dir, positive_labels, fmt="%d")
+    print(f"[INFO] 已輸出 Ki67 陽性 label: {output_dir}")
 
+
+def _ki67_positive_labels_from_mask(
+    roi_dir: Path, ki67_mask: np.ndarray, threshold: float = 0.10
+) -> list[int]:
+    """Return merged-outline nucleus line labels that overlap a Ki67 mask."""
+    shape = ki67_mask.shape
     with open(roi_dir) as f:
-        lines = f.readlines()
+        lines = [line.strip() for line in f if line.strip()]
 
     positive_labels = []
     for idx, line in enumerate(lines):
-        if idx % 2:
+        if idx % 2 or line == "-1,-1":
             continue
-        coords = list(map(int, line.strip().split(",")))
+        coords = list(map(int, line.split(",")))
+        if len(coords) < 6:
+            continue
         xy = np.array(coords).reshape(-1, 2)
         mask = polygon2mask(shape, xy[:, [1, 0]])
         roi_area = mask.sum()
@@ -954,9 +1038,142 @@ def detect_ki67_positive(
         overlap_area = np.logical_and(mask, ki67_mask).sum()
         if overlap_area / roi_area >= threshold:
             positive_labels.append(idx + 1)
+    return positive_labels
 
-    np.savetxt(output_dir, positive_labels, fmt="%d")
-    print(f"[INFO] 已輸出 Ki67 陽性 label: {output_dir}")
+
+def _score_ki67_mask_for_outline(
+    roi_dir: Path, ki67_mask_path: Path, threshold: float = 0.10
+) -> tuple[int, int, float]:
+    """Score a Ki67 mask against one PC merged-outline file."""
+    if not roi_dir.exists() or not ki67_mask_path.exists():
+        return 0, 0, 0.0
+
+    ki67_mask = skio.imread(str(ki67_mask_path)) > 0
+    shape = ki67_mask.shape
+    with open(roi_dir) as f:
+        lines = [line.strip() for line in f if line.strip()]
+
+    positive = 0
+    total = 0
+    fractions: list[float] = []
+    for idx, line in enumerate(lines):
+        if idx % 2 or line == "-1,-1":
+            continue
+        coords = list(map(int, line.split(",")))
+        if len(coords) < 6:
+            continue
+        xy = np.array(coords).reshape(-1, 2)
+        mask = polygon2mask(shape, xy[:, [1, 0]])
+        roi_area = mask.sum()
+        if roi_area == 0:
+            continue
+        total += 1
+        overlap_fraction = float(np.logical_and(mask, ki67_mask).sum() / roi_area)
+        fractions.append(overlap_fraction)
+        if overlap_fraction >= threshold:
+            positive += 1
+
+    return positive, total, float(np.mean(fractions)) if fractions else 0.0
+
+
+def _linear_assignment(score_matrix: np.ndarray) -> list[tuple[int, int]]:
+    """Maximize row/column assignment scores with scipy when available."""
+    try:
+        from scipy.optimize import linear_sum_assignment
+
+        rows, cols = linear_sum_assignment(-score_matrix)
+        return list(zip(rows.tolist(), cols.tolist()))
+    except Exception:
+        pairs: list[tuple[int, int]] = []
+        used_rows: set[int] = set()
+        used_cols: set[int] = set()
+        for row, col in sorted(
+            np.ndindex(score_matrix.shape),
+            key=lambda rc: float(score_matrix[rc[0], rc[1]]),
+            reverse=True,
+        ):
+            if row in used_rows or col in used_cols:
+                continue
+            pairs.append((int(row), int(col)))
+            used_rows.add(int(row))
+            used_cols.add(int(col))
+            if len(used_rows) == score_matrix.shape[0] or len(used_cols) == score_matrix.shape[1]:
+                break
+        return pairs
+
+
+def _remap_ki67_masks_to_outlines(
+    outline_paths_by_pc_stem: dict[str, Path],
+    mask_paths_by_pc_stem: dict[str, Path],
+    threshold: float = 0.10,
+) -> dict[str, Path]:
+    """Detect and fix whole-batch Ki67/PC filename shifts."""
+    pc_stems = [
+        stem
+        for stem, path in outline_paths_by_pc_stem.items()
+        if path.exists() and stem in mask_paths_by_pc_stem
+    ]
+    source_stems = [
+        stem for stem in mask_paths_by_pc_stem if mask_paths_by_pc_stem[stem].exists()
+    ]
+    if len(pc_stems) < 2 or len(source_stems) < 2:
+        return dict(mask_paths_by_pc_stem)
+
+    score_matrix = np.zeros((len(pc_stems), len(source_stems)), dtype=np.float32)
+    positive_counts = np.zeros_like(score_matrix, dtype=np.int32)
+    total_counts = np.zeros_like(score_matrix, dtype=np.int32)
+    for row, pc_stem in enumerate(pc_stems):
+        outline_path = outline_paths_by_pc_stem[pc_stem]
+        for col, source_stem in enumerate(source_stems):
+            positive, total, mean_overlap = _score_ki67_mask_for_outline(
+                outline_path, mask_paths_by_pc_stem[source_stem], threshold
+            )
+            positive_counts[row, col] = positive
+            total_counts[row, col] = total
+            score_matrix[row, col] = float(positive * 1000.0 + mean_overlap * 100.0)
+
+    assignment = _linear_assignment(score_matrix)
+    source_col_by_stem = {stem: col for col, stem in enumerate(source_stems)}
+    identity_pairs = [
+        (row, source_col_by_stem[stem])
+        for row, stem in enumerate(pc_stems)
+        if stem in source_col_by_stem
+    ]
+
+    changed = any(pc_stems[row] != source_stems[col] for row, col in assignment)
+    if not changed:
+        print("[INFO] Ki67 masks match PC filenames; no remap needed.")
+        return dict(mask_paths_by_pc_stem)
+
+    assigned_positive = int(sum(positive_counts[row, col] for row, col in assignment))
+    identity_positive = int(sum(positive_counts[row, col] for row, col in identity_pairs))
+    required_gain = max(20, len(pc_stems) * 2)
+    if assigned_positive < identity_positive * 3 or assigned_positive - identity_positive < required_gain:
+        print(
+            "[INFO] Ki67 remap skipped; best assignment did not improve enough "
+            f"({assigned_positive} vs {identity_positive} positives)."
+        )
+        return dict(mask_paths_by_pc_stem)
+
+    remapped = dict(mask_paths_by_pc_stem)
+    for row, col in assignment:
+        target_stem = pc_stems[row]
+        source_stem = source_stems[col]
+        remapped[target_stem] = mask_paths_by_pc_stem[source_stem]
+
+        positive = int(positive_counts[row, col])
+        total = int(total_counts[row, col])
+        if total > 0 and positive / total < 0.05:
+            print(
+                f"[WARN] Low-confidence Ki67 remap: {source_stem} -> {target_stem} "
+                f"({positive}/{total} positive nuclei)."
+            )
+
+    print(
+        f"[INFO] Remapped Ki67 masks for {len(assignment)} PC images "
+        f"({assigned_positive} positives vs {identity_positive} by filename)."
+    )
+    return remapped
 
 
 def merge_ki67_labels(param_csv: Path, label_file: Path, output_csv: Path):
@@ -1013,7 +1230,7 @@ def run_all(
     pc_dir = data_path / "PC"
     ki67_dir = data_path / "KI67"
 
-    fluor_subdirs = ["DF", "LT"]
+    fluor_subdirs = ["DF", "LT", "IDO"]
     existing_fluor_dirs = [
         (sub, data_path / sub)
         for sub in fluor_subdirs
@@ -1068,6 +1285,35 @@ def run_all(
 
     analy_dir = output_dir(data_path, "results")
     outline_dir = output_dir(data_path, "outline")
+    ki67_masks_by_pc_stem: dict[str, Path] = {}
+    if ki67:
+        binary_dir = output_dir(data_path, "binary")
+        raw_ki67_masks_by_pc_stem: dict[str, Path] = {}
+        outline_paths_by_pc_stem: dict[str, Path] = {}
+        for _, map_row in mapping.iterrows():
+            pc_name = str(map_row.get("PC_Name", "")).strip()
+            ki67_name = str(map_row.get("KI67_Name", "")).strip()
+            if not pc_name:
+                continue
+
+            pc_stem = Path(pc_name).stem
+            outline_paths_by_pc_stem[pc_stem] = (
+                outline_dir / f"{pc_stem}_merged_cp_outlines.txt"
+            )
+            if not ki67_name:
+                continue
+
+            ki67_img = ki67_dir / ki67_name
+            if not ki67_img.exists():
+                print(f"[WARN] Missing Ki67 image: {ki67_img}")
+                continue
+            raw_ki67_masks_by_pc_stem[pc_stem] = ki67_binarize(
+                ki67_img, backend=ki67_backend
+            )
+
+        ki67_masks_by_pc_stem = _remap_ki67_masks_to_outlines(
+            outline_paths_by_pc_stem, raw_ki67_masks_by_pc_stem
+        )
 
     for i in trange(len(mapping), desc="Processing images(analysis)"):
         row = mapping.iloc[i]
@@ -1093,11 +1339,19 @@ def run_all(
         fluor_outputs: dict[str, dict[str, Path]] = {}
         for label, _ in existing_fluor_dirs:
             suffix = label.lower()
-            fluor_outputs[label] = {
-                "fluor_csv": analy_dir / f"{pc_img.stem}_{suffix}_fluorescence.csv",
-                "flat_csv": analy_dir / f"{pc_img.stem}_{suffix}_fluor_flat.csv",
-                "merged_csv": analy_dir / f"{pc_img.stem}_final_{suffix}.csv",
-            }
+            if label.upper() == "IDO":
+                fluor_outputs[label] = {
+                    "measure_csv": analy_dir / f"{pc_img.stem}_{suffix}_measurements.csv",
+                    "flat_csv": analy_dir / f"{pc_img.stem}_{suffix}_measurements.csv",
+                    "merged_csv": analy_dir / f"{pc_img.stem}_final_{suffix}.csv",
+                }
+            else:
+                fluor_outputs[label] = {
+                    "measure_csv": analy_dir
+                    / f"{pc_img.stem}_{suffix}_fluorescence.csv",
+                    "flat_csv": analy_dir / f"{pc_img.stem}_{suffix}_fluor_flat.csv",
+                    "merged_csv": analy_dir / f"{pc_img.stem}_final_{suffix}.csv",
+                }
 
         param_anal(pc_img, outlines_txt, param_csv)
         merged_excel(param_csv, merged_param_csv)
@@ -1119,12 +1373,18 @@ def run_all(
                     continue
 
                 outputs = fluor_outputs[label]
-                flour_anal(df_img, outlines_txt, outputs["fluor_csv"])
-                flatten_fluor_table(outputs["fluor_csv"], outputs["flat_csv"])
+                merge_input_path: Path
+                if label.upper() == "IDO":
+                    ido_anal(df_img, outlines_txt, outputs["measure_csv"])
+                    merge_input_path = outputs["measure_csv"]
+                else:
+                    flour_anal(df_img, outlines_txt, outputs["measure_csv"])
+                    flatten_fluor_table(outputs["measure_csv"], outputs["flat_csv"])
+                    merge_input_path = outputs["flat_csv"]
 
                 if (
-                    not outputs["flat_csv"].exists()
-                    or outputs["flat_csv"].stat().st_size == 0
+                    not merge_input_path.exists()
+                    or merge_input_path.stat().st_size == 0
                 ):
                     print(
                         f"[警告] {label} 螢光分析結果為空，略過合併：{outputs['flat_csv']}"
@@ -1132,7 +1392,7 @@ def run_all(
                     continue
 
                 merge_with_flour(
-                    current_final_path, outputs["flat_csv"], outputs["merged_csv"]
+                    current_final_path, merge_input_path, outputs["merged_csv"]
                 )
                 current_final_path = outputs["merged_csv"]
                 processed_fluor = True
@@ -1151,21 +1411,16 @@ def run_all(
                 merged_path.unlink()
 
         if ki67:
-            ki67_name = str(row.get("KI67_Name", "")).strip()
-            if not ki67_name:
-                print(f"[警告] {pc_img.stem} 缺少 Ki67 影像，已略過。")
+            ki67_mask = ki67_masks_by_pc_stem.get(pc_img.stem)
+            if ki67_mask is None:
+                print(f"[WARN] Missing Ki67 mask for {pc_img.stem}")
             else:
-                ki67_img = ki67_dir / ki67_name
-                if not ki67_img.exists():
-                    print(f"[警告] 找不到 Ki67 影像：{ki67_img}")
-                else:
-                    ki67_mask = ki67_binarize(ki67_img, backend=ki67_backend)
-                    binary_dir = output_dir(data_path, "binary")
-                    ki67_label = binary_dir / f"{pc_img.stem}_label.txt"
+                binary_dir = output_dir(data_path, "binary")
+                ki67_label = binary_dir / f"{pc_img.stem}_label.txt"
 
-                    detect_ki67_positive(outlines_txt, ki67_mask, ki67_label)
-                    merge_ki67_labels(final_csv, ki67_label, final_csv)
-                    print(f"[資訊] Ki67 合併完成：{final_csv}")
+                detect_ki67_positive(outlines_txt, ki67_mask, ki67_label)
+                merge_ki67_labels(final_csv, ki67_label, final_csv)
+                print(f"[INFO] Ki67 merged into: {final_csv}")
 
     merge_all_final_csvs(data_path)
 

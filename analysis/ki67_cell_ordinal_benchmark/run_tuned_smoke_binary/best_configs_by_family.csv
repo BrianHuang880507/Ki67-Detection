@@ -1,9 +1,0 @@
-variant,family,candidate_id,params_json,status,reason,accuracy,macro_f1,balanced_accuracy,quadratic_weighted_kappa
-without_passage,logistic_regression,cfg_2,"{""C"": 1.0, ""class_weight"": ""balanced""}",ok,,0.7055324211778703,0.6181903278278565,0.6601034568627895,0.25371641770965525
-without_passage,random_forest,cfg_2,"{""max_depth"": 18, ""max_features"": ""sqrt"", ""min_samples_leaf"": 2, ""n_estimators"": 800}",ok,,0.828078524687686,0.6354090914890088,0.612655921037738,0.2906479106040186
-without_passage,extra_trees,cfg_3,"{""max_depth"": null, ""max_features"": 0.8, ""min_samples_leaf"": 2, ""n_estimators"": 1200}",ok,,0.819155264723379,0.6266933155673995,0.6071208656871845,0.2702763680604544
-without_passage,hist_gradient_boosting,cfg_2,"{""learning_rate"": 0.03, ""max_depth"": 8, ""max_iter"": 700, ""min_samples_leaf"": 20}",ok,,0.8143961927424153,0.5554086220576567,0.5552498132343286,0.15692483772548838
-with_passage,logistic_regression,cfg_2,"{""C"": 1.0, ""class_weight"": ""balanced""}",ok,,0.6496133254015467,0.5936155410577557,0.6755008715731329,0.23849777535081007
-with_passage,random_forest,cfg_2,"{""max_depth"": 18, ""max_features"": ""sqrt"", ""min_samples_leaf"": 2, ""n_estimators"": 800}",ok,,0.8007138607971446,0.6446570942694974,0.6317886491748353,0.2925395260020477
-with_passage,extra_trees,cfg_3,"{""max_depth"": null, ""max_features"": 0.8, ""min_samples_leaf"": 2, ""n_estimators"": 1200}",ok,,0.801308744794765,0.6557845200084359,0.6449697779186381,0.31329347703778354
-with_passage,hist_gradient_boosting,cfg_1,"{""learning_rate"": 0.05, ""max_depth"": 6, ""max_iter"": 400, ""min_samples_leaf"": 20}",ok,,0.809042236763831,0.6272147897905678,0.6101657120865687,0.2651040850930536

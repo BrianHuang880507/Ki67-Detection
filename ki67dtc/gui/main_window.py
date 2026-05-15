@@ -51,6 +51,7 @@ class PipelineThread(QThread):
     def __init__(
         self,
         data_folder: Path,
+        nuc_source: str,
         fluor_analy: bool,
         ki67: bool,
         clean_temp: bool,
@@ -58,6 +59,7 @@ class PipelineThread(QThread):
     ) -> None:
         super().__init__(parent)
         self._data_folder = data_folder
+        self._nuc_source = nuc_source
         self._fluor_analy = fluor_analy
         self._ki67 = ki67
         self._clean_temp = clean_temp
@@ -69,6 +71,7 @@ class PipelineThread(QThread):
         try:
             result = run_pipeline(
                 self._data_folder,
+                nuc_source=self._nuc_source,
                 fluor_analy=self._fluor_analy,
                 ki67=self._ki67,
                 clean_temp=self._clean_temp,
@@ -123,8 +126,8 @@ class MainWindow(QMainWindow):
         self._current_overlay_image: QPixmap | None = None
         self._show_nuc: bool = True
         self._show_cyto: bool = True
+        self._show_ki67: bool = False
         self._overlay_alpha: float = 0.5
-        self._view_mode: str = "overlay"  # "raw" or "overlay"
         self._current_data_folder: Path | None = None
         # 新增：目前選中的 Cell_ID（例如 "1_3"）
         self._selected_cell_id: str | None = None
@@ -138,9 +141,6 @@ class MainWindow(QMainWindow):
         # selection change 只會在 selection 真的改變時觸發；再點同一列不一定會觸發
         # 因此用 clicked 事件確保每次點擊都能切換
         self.results_table.cellClicked.connect(self._on_results_table_cell_clicked)
-        self.results_table.itemSelectionChanged.connect(
-            self._on_results_table_selection_changed
-        )
 
     def _on_results_table_cell_clicked(self, row: int, col: int) -> None:
         """滑鼠點擊表格任一格：若點到同一列，切換高亮 on/off。"""
@@ -211,21 +211,19 @@ class MainWindow(QMainWindow):
         self.chk_clean = QCheckBox("清理暫存資料", self)
         self.chk_clean.setChecked(True)
 
-        # 分析選項同一行 + 右側 model 選擇
+        # 分析選項同一行
         options_row = QHBoxLayout()
-        options_row.addWidget(self.chk_fluor)
-        options_row.addWidget(self.chk_ki67)
-        options_row.addWidget(self.chk_clean)
+        options_row.addWidget(QLabel("核來源", self))
+        self.nuc_source_combo = QtWidgets.QComboBox(self)
+        self.nuc_source_combo.addItem("DAPI", "dapi")
+        self.nuc_source_combo.addItem("PC", "pc")
+        options_row.addWidget(self.nuc_source_combo)
 
         options_row.addSpacing(16)
 
-        options_row.addWidget(QLabel("CYTO model", self))
-        self.cyto_model_combo = QtWidgets.QComboBox(self)
-        options_row.addWidget(self.cyto_model_combo)
-
-        options_row.addWidget(QLabel("NUC model", self))
-        self.nuc_model_combo = QtWidgets.QComboBox(self)
-        options_row.addWidget(self.nuc_model_combo)
+        options_row.addWidget(self.chk_fluor)
+        options_row.addWidget(self.chk_ki67)
+        options_row.addWidget(self.chk_clean)
 
         options_row.addStretch(1)
         form.addRow("分析選項", options_row)
@@ -273,6 +271,8 @@ class MainWindow(QMainWindow):
         self.chk_show_nuc.setChecked(True)
         self.chk_show_cyto = QtWidgets.QCheckBox("顯示質輪廓")
         self.chk_show_cyto.setChecked(True)
+        self.chk_show_ki67 = QtWidgets.QCheckBox("顯示ki67")
+        self.chk_show_ki67.setChecked(False)
 
         self.alpha_slider = QtWidgets.QSlider(Qt.Orientation.Horizontal)
         self.alpha_slider.setMinimum(10)  # 0.1
@@ -282,15 +282,12 @@ class MainWindow(QMainWindow):
         self.alpha_slider.setTickPosition(QtWidgets.QSlider.TickPosition.NoTicks)
         alpha_label = QtWidgets.QLabel("透明度")
 
-        self.view_mode_combo = QtWidgets.QComboBox()
-        self.view_mode_combo.addItems(["原圖", "原圖 + 輪廓"])
-        self.view_mode_combo.setCurrentIndex(1)
-
         overlay_controls.addWidget(self.chk_show_nuc)
         overlay_controls.addWidget(self.chk_show_cyto)
+        overlay_controls.addWidget(self.chk_show_ki67)
         overlay_controls.addWidget(alpha_label)
         overlay_controls.addWidget(self.alpha_slider)
-        overlay_controls.addWidget(self.view_mode_combo)
+        overlay_controls.addStretch(1)
         viewer_layout.addLayout(overlay_controls)
 
         bottom_splitter.addWidget(viewer_panel)
@@ -332,13 +329,8 @@ class MainWindow(QMainWindow):
         # 連接 overlay 控制訊號
         self.chk_show_nuc.toggled.connect(self._on_overlay_controls_changed)
         self.chk_show_cyto.toggled.connect(self._on_overlay_controls_changed)
+        self.chk_show_ki67.toggled.connect(self._on_overlay_controls_changed)
         self.alpha_slider.valueChanged.connect(self._on_overlay_controls_changed)
-        self.view_mode_combo.currentIndexChanged.connect(
-            self._on_overlay_controls_changed
-        )
-
-        # 在 build_ui 結尾或建立完 combo 後載入 ./model 內容
-        self._populate_model_combos()
 
     # --- 事件處理 ---
 
@@ -363,12 +355,14 @@ class MainWindow(QMainWindow):
 
         data_folder = Path(path_text)
 
+        nuc_source = str(self.nuc_source_combo.currentData() or "dapi")
         fluor_analy = self.chk_fluor.isChecked()
         ki67 = self.chk_ki67.isChecked()
         clean_temp = self.chk_clean.isChecked()
 
         self._pipeline_thread = PipelineThread(
             data_folder,
+            nuc_source=nuc_source,
             fluor_analy=fluor_analy,
             ki67=ki67,
             clean_temp=clean_temp,
@@ -404,6 +398,9 @@ class MainWindow(QMainWindow):
         self._current_data_folder = None
         self._selected_cell_id = None
         self._highlight_enabled = False
+        self._last_selected_row = None
+        self._cleaned_csv_rows = []
+        self._cleaned_csv_header = None
         self._scene.clear()
         self.statusBar().showMessage("已重設")
 
@@ -442,6 +439,7 @@ class MainWindow(QMainWindow):
         self._current_image_index = row
         img_path = self._pipeline_result.image_files[row]
         self._load_image_and_overlays(img_path)
+        self._refresh_results_table_for_current_image()
         self._update_display_pixmap()
 
     def _load_image_and_overlays(self, img_path: Path) -> None:
@@ -477,13 +475,20 @@ class MainWindow(QMainWindow):
             img_bgr, polygons.nuc_polygons, polygons.cyto_polygons
         )
 
-    def _create_overlay_pixmap(
+    def _pixmap_from_bgr(self, bgr: np.ndarray) -> QPixmap:
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        bytes_per_line = ch * w
+        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        return QPixmap.fromImage(qimg)
+
+    def _create_overlay_bgr(
         self,
         base_bgr: np.ndarray,
         nuc_polys: list[np.ndarray] | None,
         cyto_polys: list[np.ndarray] | None,
-    ) -> QPixmap:
-        """根據目前設定，在 base 影像上畫出輪廓，回傳 QPixmap。"""
+    ) -> np.ndarray:
+        """根據目前設定，在 base 影像上畫出輪廓，回傳 BGR 影像。"""
         overlay = base_bgr.copy()
 
         # 顏色：BGR
@@ -508,97 +513,75 @@ class MainWindow(QMainWindow):
         alpha = self._overlay_alpha
         blended = cv2.addWeighted(overlay, alpha, base_bgr, 1 - alpha, 0)
 
-        # 轉成 QPixmap
-        rgb = cv2.cvtColor(blended, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        bytes_per_line = ch * w
-        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-        return QPixmap.fromImage(qimg)
+        if self._show_ki67:
+            ki67_color = (203, 0, 255)  # 粉色
+            for idx in self._ki67_positive_indices_for_current_image():
+                if cyto_polys and 0 <= idx < len(cyto_polys):
+                    pts = cyto_polys[idx].reshape(-1, 1, 2)
+                elif nuc_polys and 0 <= idx < len(nuc_polys):
+                    pts = nuc_polys[idx].reshape(-1, 1, 2)
+                else:
+                    continue
+                cv2.polylines(
+                    blended, [pts], isClosed=True, color=ki67_color, thickness=3
+                )
+
+        return blended
+
+    def _create_overlay_pixmap(
+        self,
+        base_bgr: np.ndarray,
+        nuc_polys: list[np.ndarray] | None,
+        cyto_polys: list[np.ndarray] | None,
+    ) -> QPixmap:
+        """根據目前設定，在 base 影像上畫出輪廓，回傳 QPixmap。"""
+        return self._pixmap_from_bgr(
+            self._create_overlay_bgr(base_bgr, nuc_polys, cyto_polys)
+        )
 
     def _update_display_pixmap(self) -> None:
         """更新顯示影像。"""
         if self._current_image_array is None:
             return
 
-        def _pixmap_from_bgr(bgr: np.ndarray) -> QPixmap:
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            h, w, ch = rgb.shape
-            bytes_per_line = ch * w
-            qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-            return QPixmap.fromImage(qimg)
-
-        # 若高亮啟用且有選中 cell -> 僅顯示該 cell（核+質）
-        if (
-            self._highlight_enabled
-            and self._selected_cell_id is not None
-            and self._current_image_index is not None
-            and self._pipeline_result is not None
-        ):
-            img_path = self._pipeline_result.image_files[self._current_image_index]
-            polys = self._current_overlay_polygons.get(img_path)
-
-            if polys is None:
-                self._set_pixmap_in_view(_pixmap_from_bgr(self._current_image_array))
-                return
-
-            nuc_polys, cyto_polys = polys
-
-            # Cell_ID: "1_3" -> pair index = 3
-            idx = -1
-            parts = self._selected_cell_id.split("_")
-            if len(parts) == 2:
-                try:
-                    idx = int(parts[1]) - 1
-                except ValueError:
-                    idx = -1
-
-            if 0 <= idx < len(nuc_polys) and 0 <= idx < len(cyto_polys):
-                bgr = self._current_image_array.copy()
-                cyto_pts = cyto_polys[idx].reshape(-1, 1, 2)
-                nuc_pts = nuc_polys[idx].reshape(-1, 1, 2)
-
-                cv2.polylines(
-                    bgr,
-                    [cyto_pts],
-                    isClosed=True,
-                    color=(0, 255, 255),
-                    thickness=4,
-                )
-                cv2.polylines(
-                    bgr,
-                    [nuc_pts],
-                    isClosed=True,
-                    color=(0, 255, 255),
-                    thickness=3,
-                )
-
-                self._set_pixmap_in_view(_pixmap_from_bgr(bgr))
-                return
-
-            self._set_pixmap_in_view(_pixmap_from_bgr(self._current_image_array))
+        img_path = self._current_image_path()
+        if img_path is None:
+            self._set_pixmap_in_view(self._pixmap_from_bgr(self._current_image_array))
             return
 
-        # === 未高亮時：依模式顯示 ===
-        if self.view_mode_combo.currentIndex() == 0:  # 原圖
-            self._set_pixmap_in_view(_pixmap_from_bgr(self._current_image_array))
-            return
-
-        # 原圖 + 輪廓
-        if self._current_image_index is None or not self._pipeline_result:
-            return
-
-        img_path = self._pipeline_result.image_files[self._current_image_index]
         polys = self._current_overlay_polygons.get(img_path)
-
         if polys is None:
-            self._set_pixmap_in_view(_pixmap_from_bgr(self._current_image_array))
+            self._set_pixmap_in_view(self._pixmap_from_bgr(self._current_image_array))
             return
 
         nuc_polys, cyto_polys = polys
-        pixmap = self._create_overlay_pixmap(
+        display_bgr = self._create_overlay_bgr(
             self._current_image_array, nuc_polys, cyto_polys
         )
-        self._set_pixmap_in_view(pixmap)
+
+        if self._highlight_enabled and self._selected_cell_id is not None:
+            idx = self._cell_index_from_cell_id(self._selected_cell_id)
+            if idx is not None:
+                if 0 <= idx < len(cyto_polys):
+                    cyto_pts = cyto_polys[idx].reshape(-1, 1, 2)
+                    cv2.polylines(
+                        display_bgr,
+                        [cyto_pts],
+                        isClosed=True,
+                        color=(0, 255, 255),
+                        thickness=4,
+                    )
+                if 0 <= idx < len(nuc_polys):
+                    nuc_pts = nuc_polys[idx].reshape(-1, 1, 2)
+                    cv2.polylines(
+                        display_bgr,
+                        [nuc_pts],
+                        isClosed=True,
+                        color=(0, 255, 255),
+                        thickness=3,
+                    )
+
+        self._set_pixmap_in_view(self._pixmap_from_bgr(display_bgr))
 
     def _set_pixmap_in_view(self, pixmap: QPixmap) -> None:
         self._scene.clear()
@@ -625,6 +608,7 @@ class MainWindow(QMainWindow):
         """
         self._show_nuc = self.chk_show_nuc.isChecked()
         self._show_cyto = self.chk_show_cyto.isChecked()
+        self._show_ki67 = self.chk_show_ki67.isChecked()
         self._overlay_alpha = self.alpha_slider.value() / 100.0
         self._update_display_pixmap()
 
@@ -686,6 +670,9 @@ class MainWindow(QMainWindow):
             self._cleaned_csv_rows = []
             self._cleaned_csv_header = None
             self.results_table.clear()
+            self.results_table.setRowCount(0)
+            self.results_table.setColumnCount(0)
+            self._update_display_pixmap()
             return
 
         try:
@@ -697,6 +684,11 @@ class MainWindow(QMainWindow):
         lines = [ln for ln in text.splitlines() if ln.strip()]
         if not lines:
             self.statusBar().showMessage("cleaned CSV 為空", 3000)
+            self._cleaned_csv_rows = []
+            self._cleaned_csv_header = None
+            self.results_table.clear()
+            self.results_table.setRowCount(0)
+            self.results_table.setColumnCount(0)
             return
 
         # 自動偵測分隔符（優先 tab，其次 comma，否則用 whitespace）
@@ -719,17 +711,124 @@ class MainWindow(QMainWindow):
         self._cleaned_csv_header = header
         self._cleaned_csv_rows = data_rows
 
-        self.results_table.clear()
-        self.results_table.setColumnCount(len(header))
-        self.results_table.setRowCount(len(data_rows))
-        self.results_table.setHorizontalHeaderLabels(header)
+        self._refresh_results_table_for_current_image()
+        self._update_display_pixmap()
+        self.statusBar().showMessage(f"載入 cleaned CSV: {csv_path}", 3000)
 
-        for r, row in enumerate(data_rows):
-            for c, val in enumerate(row):
-                self.results_table.setItem(r, c, QTableWidgetItem(str(val)))
+    def _column_index(self, column_name: str) -> int | None:
+        if not self._cleaned_csv_header:
+            return None
+        target = column_name.strip().lower()
+        for idx, name in enumerate(self._cleaned_csv_header):
+            if name.strip().lower() == target:
+                return idx
+        return None
+
+    def _current_image_path(self) -> Path | None:
+        if (
+            self._pipeline_result is None
+            or self._current_image_index is None
+            or self._current_image_index < 0
+            or self._current_image_index >= len(self._pipeline_result.image_files)
+        ):
+            return None
+        return self._pipeline_result.image_files[self._current_image_index]
+
+    def _cell_id_to_image_stem(self, cell_id: str) -> str | None:
+        image_stem, sep, cell_number = cell_id.strip().rpartition("_")
+        if sep and cell_number.isdigit() and image_stem:
+            return image_stem
+        return None
+
+    def _cell_index_from_cell_id(self, cell_id: str) -> int | None:
+        _, sep, cell_number = cell_id.strip().rpartition("_")
+        if not sep:
+            return None
+        try:
+            index = int(cell_number) - 1
+        except ValueError:
+            return None
+        return index if index >= 0 else None
+
+    def _row_matches_image(self, row: list[str], image_path: Path) -> bool:
+        image_idx = self._column_index("Image")
+        if image_idx is not None and image_idx < len(row):
+            return row[image_idx].strip() == image_path.stem
+
+        cell_idx = self._column_index("Cell_ID")
+        if cell_idx is None:
+            cell_idx = 0
+        if cell_idx < len(row):
+            image_stem = self._cell_id_to_image_stem(row[cell_idx])
+            return image_stem == image_path.stem
+        return False
+
+    def _rows_for_current_image(self) -> list[list[str]]:
+        image_path = self._current_image_path()
+        if image_path is None:
+            return []
+        return [
+            row
+            for row in self._cleaned_csv_rows
+            if self._row_matches_image(row, image_path)
+        ]
+
+    def _is_positive_value(self, value: str) -> bool:
+        text = value.strip().lower()
+        if text in {"true", "yes", "y", "positive", "pos"}:
+            return True
+        if text in {"", "false", "no", "n", "negative", "neg"}:
+            return False
+        try:
+            return float(text) > 0
+        except ValueError:
+            return False
+
+    def _ki67_positive_indices_for_current_image(self) -> set[int]:
+        ki67_idx = self._column_index("ki67_positive")
+        if ki67_idx is None:
+            return set()
+
+        cell_idx = self._column_index("Cell_ID")
+        if cell_idx is None:
+            cell_idx = 0
+
+        positive_indices: set[int] = set()
+        for row in self._rows_for_current_image():
+            if ki67_idx >= len(row) or cell_idx >= len(row):
+                continue
+            if not self._is_positive_value(row[ki67_idx]):
+                continue
+            cell_index = self._cell_index_from_cell_id(row[cell_idx])
+            if cell_index is not None:
+                positive_indices.add(cell_index)
+        return positive_indices
+
+    def _refresh_results_table_for_current_image(self) -> None:
+        self._selected_cell_id = None
+        self._highlight_enabled = False
+        self._last_selected_row = None
+
+        self.results_table.blockSignals(True)
+        try:
+            self.results_table.clear()
+            if not self._cleaned_csv_header:
+                self.results_table.setRowCount(0)
+                self.results_table.setColumnCount(0)
+                return
+
+            rows = self._rows_for_current_image()
+            self.results_table.setColumnCount(len(self._cleaned_csv_header))
+            self.results_table.setRowCount(len(rows))
+            self.results_table.setHorizontalHeaderLabels(self._cleaned_csv_header)
+
+            for r, row in enumerate(rows):
+                for c, val in enumerate(row):
+                    self.results_table.setItem(r, c, QTableWidgetItem(str(val)))
+        finally:
+            self.results_table.blockSignals(False)
 
         self.results_table.resizeColumnsToContents()
-        self.statusBar().showMessage(f"載入 cleaned CSV: {csv_path}", 3000)
 
     def _on_results_table_selection_changed(self) -> None:
         """點選表格列：
@@ -764,54 +863,3 @@ class MainWindow(QMainWindow):
 
         self._update_display_pixmap()
 
-    def _populate_model_combos(self) -> None:
-        """掃描 ./model 目錄，填入 CYTO/NUC model 下拉選單。
-
-        本專案的模型目前看起來是「無副檔名的檔案」（例如 model_BDL3_label_dapi），
-        因此這裡同時支援：
-        - 常見副檔名模型檔
-        - 無副檔名但檔名以 model_ 開頭的檔案
-        """
-        model_dir = Path.cwd() / "model"
-        self.cyto_model_combo.clear()
-        self.nuc_model_combo.clear()
-
-        if not model_dir.exists() or not model_dir.is_dir():
-            self.cyto_model_combo.addItem("(找不到 ./model)")
-            self.nuc_model_combo.addItem("(找不到 ./model)")
-            return
-
-        exts = {".pth", ".pt", ".onnx", ".pkl", ".h5", ".ckpt"}
-
-        files: list[Path] = []
-        for p in sorted(model_dir.iterdir()):
-            if not p.is_file():
-                continue
-            if p.suffix.lower() in exts:
-                files.append(p)
-                continue
-            # 無副檔名模型檔（例如 model_BDL3_label_dapi）
-            if p.suffix == "" and p.name.lower().startswith("model_"):
-                files.append(p)
-
-        if not files:
-            self.cyto_model_combo.addItem("(model 目錄無模型檔)")
-            self.nuc_model_combo.addItem("(model 目錄無模型檔)")
-            return
-
-        for p in files:
-            self.cyto_model_combo.addItem(p.name, str(p))
-            self.nuc_model_combo.addItem(p.name, str(p))
-
-        # 預設：若檔名含 cyto/nuc，嘗試自動選（找不到就維持第一個）
-        for i in range(self.cyto_model_combo.count()):
-            name = self.cyto_model_combo.itemText(i).lower()
-            if "cyto" in name:
-                self.cyto_model_combo.setCurrentIndex(i)
-                break
-
-        for i in range(self.nuc_model_combo.count()):
-            name = self.nuc_model_combo.itemText(i).lower()
-            if "nuc" in name or "nucleus" in name:
-                self.nuc_model_combo.setCurrentIndex(i)
-                break
