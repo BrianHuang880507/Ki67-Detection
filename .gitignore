@@ -28,4 +28,17 @@ predictions.csv
 # Predictions outputs
 predictions/
 
+# Generated analysis/output folders
+pdf_feature_ki67_analysis/
+iPCS/
+cell_outlines/
+ki67_contours/
+predict_regenerated/
+
+# Temporary scripts
+scripts/batch_total_cell_mask_pyimagej.py
+scripts/generate_cell_outline_images.py
+scripts/generate_ki67_prediction_contours.py
+scripts/generate_ki67_prediction_plots.py
+
 資料集/
