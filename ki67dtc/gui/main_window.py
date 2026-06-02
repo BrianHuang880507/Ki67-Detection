@@ -57,6 +57,7 @@ class PipelineThread(QThread):
         clean_temp: bool,
         parent: Optional[QWidget] = None,
     ) -> None:
+        """初始化背景 pipeline 執行緒。"""
         super().__init__(parent)
         self._data_folder = data_folder
         self._nuc_source = nuc_source
@@ -65,9 +66,11 @@ class PipelineThread(QThread):
         self._clean_temp = clean_temp
 
     def _progress_callback(self, done: int, total: int, message: str) -> None:
+        """將 pipeline 進度轉送為 Qt signal。"""
         self.progress_changed.emit(done, total, message)
 
     def run(self) -> None:  # type: ignore[override]
+        """在背景執行 Ki67 pipeline 並回報成功或錯誤。"""
         try:
             result = run_pipeline(
                 self._data_folder,
@@ -84,6 +87,7 @@ class PipelineThread(QThread):
 
 class ZoomableGraphicsView(QGraphicsView):
     def __init__(self, parent=None):
+        """建立可滾輪縮放與拖曳的影像檢視元件。"""
         super().__init__(parent)
         self._zoom_factor = 1.15
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
@@ -91,6 +95,7 @@ class ZoomableGraphicsView(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
 
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
+        """依滑鼠滾輪方向縮放影像視圖。"""
         angle = event.angleDelta().y()
         if angle == 0:
             return
@@ -101,6 +106,7 @@ class ZoomableGraphicsView(QGraphicsView):
         self.scale(factor, factor)
 
     def reset_view(self):
+        """重設影像視圖縮放矩陣。"""
         self.resetTransform()
 
 
@@ -112,6 +118,7 @@ class MainWindow(QMainWindow):
     """
 
     def __init__(self):
+        """初始化主視窗狀態並建立 UI。"""
         super().__init__()
         self.setWindowTitle("Ki67 細胞影像分析 GUI (Early Prototype)")
         # 預設視窗更大
@@ -185,6 +192,7 @@ class MainWindow(QMainWindow):
     # --- UI 組裝 ---
 
     def _build_ui(self) -> None:
+        """建立主視窗所有輸入、控制、影像與結果表元件。"""
         central = QWidget(self)
         self.setCentralWidget(central)
 
@@ -335,6 +343,7 @@ class MainWindow(QMainWindow):
     # --- 事件處理 ---
 
     def _on_browse_input(self) -> None:
+        """開啟資料夾選擇器並載入影像與 cleaned CSV。"""
         base = Path.cwd() / "data" / "input"
         start_dir = str(base) if base.exists() else ""
         directory = QFileDialog.getExistingDirectory(self, "選擇輸入資料夾", start_dir)
@@ -345,6 +354,7 @@ class MainWindow(QMainWindow):
             self._load_cleaned_csv_for_dataset()
 
     def _on_run_clicked(self) -> None:
+        """使用目前 UI 設定啟動背景 pipeline。"""
         if self._pipeline_thread is not None and self._pipeline_thread.isRunning():
             return
 
@@ -377,6 +387,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Pipeline 執行中...")
 
     def _on_stop_clicked(self) -> None:
+        """停止目前背景 pipeline 執行緒。"""
         # 目前簡單呼叫 thread.terminate()，未來可實作更溫和的中止機制
         if self._pipeline_thread is not None and self._pipeline_thread.isRunning():
             self._pipeline_thread.terminate()
@@ -385,6 +396,7 @@ class MainWindow(QMainWindow):
             self.btn_run.setEnabled(True)
 
     def _on_reset_clicked(self) -> None:
+        """重設 UI 狀態、影像清單、結果表與 overlay。"""
         self.progress_bar.setValue(0)
         self.image_list.clear()
         self.results_table.clear()
@@ -405,11 +417,13 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("已重設")
 
     def _on_progress_changed(self, done: int, total: int, message: str) -> None:
+        """更新進度條與狀態列文字。"""
         percent = int(done / total * 100) if total > 0 else 0
         self.progress_bar.setValue(percent)
         self.statusBar().showMessage(f"{message} ({done}/{total})")
 
     def _on_pipeline_finished(self, result: PipelineResult) -> None:
+        """處理 pipeline 成功結束後的影像清單與結果載入。"""
         self.btn_run.setEnabled(True)
         self.progress_bar.setValue(100)
         self._pipeline_result = result
@@ -426,10 +440,12 @@ class MainWindow(QMainWindow):
         )
 
     def _on_pipeline_failed(self, message: str) -> None:
+        """處理 pipeline 失敗訊息並恢復 Run 按鈕。"""
         self.btn_run.setEnabled(True)
         self.statusBar().showMessage(f"錯誤：{message}")
 
     def _on_image_selection_changed(self, row: int) -> None:
+        """切換目前選取影像並更新 overlay 與結果表。"""
         if (
             not self._pipeline_result
             or row < 0
@@ -476,6 +492,7 @@ class MainWindow(QMainWindow):
         )
 
     def _pixmap_from_bgr(self, bgr: np.ndarray) -> QPixmap:
+        """將 OpenCV BGR 影像轉為 Qt QPixmap。"""
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
@@ -584,6 +601,7 @@ class MainWindow(QMainWindow):
         self._set_pixmap_in_view(self._pixmap_from_bgr(display_bgr))
 
     def _set_pixmap_in_view(self, pixmap: QPixmap) -> None:
+        """將 QPixmap 顯示到 GraphicsView 並自動 fit。"""
         self._scene.clear()
         if pixmap.isNull():
             return
@@ -595,6 +613,7 @@ class MainWindow(QMainWindow):
         self.graphics_view.fitInView(item, Qt.AspectRatioMode.KeepAspectRatio)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        """視窗尺寸改變時重新 fit 目前影像。"""
         super().resizeEvent(event)
         # 視窗縮放時重新 fit 一次當前圖（保持大致適配）
         if self._scene.items():
@@ -716,6 +735,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"載入 cleaned CSV: {csv_path}", 3000)
 
     def _column_index(self, column_name: str) -> int | None:
+        """在 cleaned CSV header 中尋找欄位索引。"""
         if not self._cleaned_csv_header:
             return None
         target = column_name.strip().lower()
@@ -725,6 +745,7 @@ class MainWindow(QMainWindow):
         return None
 
     def _current_image_path(self) -> Path | None:
+        """取得目前影像清單選取的影像路徑。"""
         if (
             self._pipeline_result is None
             or self._current_image_index is None
@@ -735,12 +756,14 @@ class MainWindow(QMainWindow):
         return self._pipeline_result.image_files[self._current_image_index]
 
     def _cell_id_to_image_stem(self, cell_id: str) -> str | None:
+        """由 Cell_ID 解析對應影像 stem。"""
         image_stem, sep, cell_number = cell_id.strip().rpartition("_")
         if sep and cell_number.isdigit() and image_stem:
             return image_stem
         return None
 
     def _cell_index_from_cell_id(self, cell_id: str) -> int | None:
+        """由 Cell_ID 解析 0-based cell index。"""
         _, sep, cell_number = cell_id.strip().rpartition("_")
         if not sep:
             return None
@@ -751,6 +774,7 @@ class MainWindow(QMainWindow):
         return index if index >= 0 else None
 
     def _row_matches_image(self, row: list[str], image_path: Path) -> bool:
+        """判斷 cleaned CSV row 是否屬於目前影像。"""
         image_idx = self._column_index("Image")
         if image_idx is not None and image_idx < len(row):
             return row[image_idx].strip() == image_path.stem
@@ -764,6 +788,7 @@ class MainWindow(QMainWindow):
         return False
 
     def _rows_for_current_image(self) -> list[list[str]]:
+        """取得目前影像對應的 cleaned CSV rows。"""
         image_path = self._current_image_path()
         if image_path is None:
             return []
@@ -774,6 +799,7 @@ class MainWindow(QMainWindow):
         ]
 
     def _is_positive_value(self, value: str) -> bool:
+        """將文字或數值型 Ki67 欄位轉為布林陽性判斷。"""
         text = value.strip().lower()
         if text in {"true", "yes", "y", "positive", "pos"}:
             return True
@@ -785,6 +811,7 @@ class MainWindow(QMainWindow):
             return False
 
     def _ki67_positive_indices_for_current_image(self) -> set[int]:
+        """取得目前影像中 Ki67 positive cell 的 0-based index 集合。"""
         ki67_idx = self._column_index("ki67_positive")
         if ki67_idx is None:
             return set()
@@ -805,6 +832,7 @@ class MainWindow(QMainWindow):
         return positive_indices
 
     def _refresh_results_table_for_current_image(self) -> None:
+        """依目前影像重建右側結果表格內容。"""
         self._selected_cell_id = None
         self._highlight_enabled = False
         self._last_selected_row = None

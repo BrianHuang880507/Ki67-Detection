@@ -5,13 +5,70 @@ import pandas as pd
 import os
 
 
+CELL_LEVEL_PARAMETER_COLUMNS = [
+    "Karyoplasmic Ratio",
+    "Nuc Cyto Mean Ratio",
+    "Nuc Cyto IntDen Ratio",
+    "Nuc Cyto RawIntDen Ratio",
+    "Nuc Cyto Entropy Difference",
+    "Nuc Cyto CV Difference",
+    "Nucleus Centroid Offset",
+    "Halo Outer Mean",
+    "Halo Outer StdDev",
+    "Halo Inner Mean",
+    "Halo Inner StdDev",
+    "Halo Inner Outer Diff",
+    "Halo Width",
+    "Edge Sharpness",
+    "Image Confluency",
+    "Population Area CV",
+    "Population Circularity CV",
+    "Nearest Neighbor Distance",
+    "Nearest Neighbor Distance Norm",
+    "Local Neighbor Count",
+    "Local Density",
+    "Cluster Size",
+    "Cluster Size Norm",
+    "Largest Cluster Ratio",
+    "Protrusion Count",
+    "Mean Convex Defect Depth",
+    "Max Convex Defect Depth",
+    "Fractal Dimension",
+    "Boundary Inflection Count",
+    "Debris Count",
+    "Debris Area Fraction",
+    "Nearest Debris Distance",
+    "Debris Mean Area",
+    "Debris Density",
+    "Mitotic Score",
+    "Daughter Pair Flag",
+    "Protrusion Retraction Score",
+]
+
+
 def extract_id(label):
+    """從螢光 Label 欄位解析主流程 Cell_ID。
+
+    Args:
+        label: 形如 `<image>:NewCell-<id>-and<roi>` 的 Label 字串。
+
+    Returns:
+        str: 主流程使用的 `<image>_<cell_id>` 格式。
+    """
     parts = label.split(":")[1].split("-")  # NewCell-1-and2
     img = label.split(":")[0]
     return f"{img}_{parts[1]}"
 
 
 def extract_index(cell_id):
+    """取得 Cell_ID 最後一段數字索引。
+
+    Args:
+        cell_id: 形如 `<image>_<cell_id>` 的細胞識別字串。
+
+    Returns:
+        int: 細胞數字索引。
+    """
     return int(cell_id.split("_")[-1])
 
 
@@ -62,6 +119,9 @@ def remove_temp_files(folder: Path, keywords: list[str] = None, exts: list[str] 
             "ido_measurements",
             "_cyto_seg_cp_outlines",
             "_nuc_seg_cp_outlines",
+            "_cyto_seg.npy",
+            "_nuc_seg.npy",
+            "_seg.npy",
         ]
 
     deleted_files = []
@@ -87,7 +147,8 @@ def merged_excel(input: Union[str, Path], output: Union[str, Path]):
     """
     合併兩個 CSV 檔案：
     - 將核與質兩部分以 Cell_ID 合併
-    - 並移除重複出現的 Nuc_Cyto_Ratio 欄位
+    - ROI-specific 參數保留 _nuc/_cyto
+    - cell-level 參數只保留一份，不再加 _nuc/_cyto
     """
     df = pd.read_csv(input)
 
@@ -100,16 +161,23 @@ def merged_excel(input: Union[str, Path], output: Union[str, Path]):
     nucleus_df = nucleus_df.drop(columns=["ROI_Type"]).set_index("Cell_ID")
     cyto_df = cyto_df.drop(columns=["ROI_Type"]).set_index("Cell_ID")
 
-    nucleus_df = nucleus_df.drop(columns=["Karyoplasmic Ratio"], errors="ignore")
+    cell_level_cols = [
+        col for col in CELL_LEVEL_PARAMETER_COLUMNS if col in cyto_df.columns
+    ]
+    cell_level_df = cyto_df[cell_level_cols].copy() if cell_level_cols else None
+
+    nucleus_df = nucleus_df.drop(
+        columns=CELL_LEVEL_PARAMETER_COLUMNS, errors="ignore"
+    )
+    cyto_df = cyto_df.drop(columns=cell_level_cols, errors="ignore")
 
     nucleus_df = nucleus_df.add_suffix("_nuc")
     cyto_df = cyto_df.add_suffix("_cyto")
 
-    merged_df = pd.concat([nucleus_df, cyto_df], axis=1).reset_index()
-    if "Karyoplasmic Ratio_nuc" in merged_df.columns:
-        merged_df = merged_df.rename(
-            columns={"Karyoplasmic Ratio_nuc": "Nuc_Cyto_Ratio"}
-        )
+    parts = [nucleus_df, cyto_df]
+    if cell_level_df is not None:
+        parts.append(cell_level_df)
+    merged_df = pd.concat(parts, axis=1).reset_index()
     merged_df.to_csv(output, index=False)
 
 
@@ -188,8 +256,23 @@ def merge_all_final_csvs(input_dir: Union[str, Path]):
 
     nuc_cols = [c for c in merged_df.columns if c.endswith("_nuc")]
     cyto_cols = [c for c in merged_df.columns if c.endswith("_cyto")]
-    cols_to_check = nuc_cols + cyto_cols
-    if cols_to_check:
+    cols_to_check = []
+    if "cell_status" in merged_df.columns:
+        before = len(merged_df)
+        keep_mask = merged_df["cell_status"].isin(
+            ["full_cell", "nuc_only", "cyto_cut"]
+        )
+        merged_df = merged_df[keep_mask].reset_index(drop=True)
+        removed = before - len(merged_df)
+        if removed > 0:
+            print(f"[INFO] 依 cell_status 移除 {removed} 筆不保留的細胞資料")
+
+        status = merged_df.pop("cell_status")
+        merged_df["cell_status"] = status
+    else:
+        cols_to_check = nuc_cols + cyto_cols
+
+    if "cell_status" not in merged_df.columns and cols_to_check:
         before = len(merged_df)
         merged_df = merged_df.dropna(subset=cols_to_check, how="any").reset_index(
             drop=True
@@ -206,11 +289,23 @@ def merge_all_final_csvs(input_dir: Union[str, Path]):
 def generate_image_mapping(
     pc_dir, df_dir, ki67_dir, output_csv="image_mapping.csv"
 ) -> Path:
+    """依 PC/DF/KI67 資料夾建立影像對照表。
+
+    Args:
+        pc_dir: PC 影像資料夾。
+        df_dir: DF 影像資料夾。
+        ki67_dir: Ki67 影像資料夾。
+        output_csv: 輸出的對照表檔名。
+
+    Returns:
+        Path: 產生的 `image_mapping.csv` 路徑。
+    """
     pc_dir = Path(pc_dir)
     df_dir = Path(df_dir)
     ki67_dir = Path(ki67_dir)
 
     def get_images(folder):
+        """列出資料夾內支援的影像檔名。"""
         return natsorted(
             [
                 f.name
@@ -226,6 +321,7 @@ def generate_image_mapping(
     max_len = max(len(pc_imgs), len(df_imgs), len(ki67_imgs))
 
     def safe_get(lst, idx):
+        """安全取得清單元素，索引超出時回傳空字串。"""
         return lst[idx] if idx < len(lst) else ""
 
     rows = []

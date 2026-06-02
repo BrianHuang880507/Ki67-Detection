@@ -5,7 +5,8 @@ from ki67dtc.img_prep import segment_all, mask2txt_all, combined
 from ki67dtc.cell_anal import run_all
 
 
-def main():
+def main() -> None:
+    """解析命令列參數並執行 Ki67 影像分析主流程。"""
     parser = argparse.ArgumentParser(description="細胞影像分析 Pipeline")
     parser.add_argument(
         "--data_folder", type=str, required=True, help="輸入資料夾名稱或路徑"

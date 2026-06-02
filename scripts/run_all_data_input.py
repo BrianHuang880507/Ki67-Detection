@@ -10,12 +10,19 @@ from pathlib import Path
 
 @dataclass
 class RunResult:
+    """單一資料集執行結果。"""
+
     dataset: str
     return_code: int
     elapsed_sec: float
 
 
 def parse_args() -> argparse.Namespace:
+    """解析批次執行 `main.py` 的命令列參數。
+
+    Returns:
+        argparse.Namespace: 使用者指定的資料根目錄、執行選項與篩選條件。
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Run the full main.py pipeline, including segmentation, for every "
@@ -80,12 +87,33 @@ def parse_args() -> argparse.Namespace:
 
 
 def normalize_names(names: list[str] | None) -> set[str]:
+    """將資料夾名稱轉為小寫集合，供 only/exclude 比對使用。
+
+    Args:
+        names (list[str] | None): 使用者輸入的資料夾名稱。
+
+    Returns:
+        set[str]: 去除空白並轉小寫後的名稱集合。
+    """
     if not names:
         return set()
     return {name.strip().lower() for name in names if name.strip()}
 
 
 def collect_datasets(input_root: Path, only: list[str] | None, exclude: list[str] | None) -> list[Path]:
+    """收集要批次執行的第一層資料集資料夾。
+
+    Args:
+        input_root (Path): `data/input` 或其他資料集根目錄。
+        only (list[str] | None): 只執行的資料夾名稱清單。
+        exclude (list[str] | None): 要略過的資料夾名稱清單。
+
+    Returns:
+        list[Path]: 排序後的資料集資料夾路徑。
+
+    Raises:
+        FileNotFoundError: 當輸入根目錄不存在或不是資料夾時拋出。
+    """
     if not input_root.exists() or not input_root.is_dir():
         raise FileNotFoundError(f"Input root not found: {input_root}")
 
@@ -114,6 +142,17 @@ def build_command(
     dataset: Path,
     args: argparse.Namespace,
 ) -> list[str]:
+    """組合執行單一資料集的 `main.py` 命令。
+
+    Args:
+        python_exec (str): Python 執行檔路徑。
+        main_script (Path): 主流程 `main.py` 路徑。
+        dataset (Path): 目標資料集資料夾。
+        args (argparse.Namespace): 批次執行參數。
+
+    Returns:
+        list[str]: 可交給 `subprocess.run()` 的命令參數。
+    """
     cmd = [
         python_exec,
         str(main_script),
@@ -134,6 +173,11 @@ def build_command(
 
 
 def main() -> int:
+    """批次執行 `data/input` 下多個資料集的完整主流程。
+
+    Returns:
+        int: 程式結束碼，0 表示全部成功或 dry-run，1 表示至少一個資料集失敗。
+    """
     args = parse_args()
 
     repo_root = Path(__file__).resolve().parents[1]

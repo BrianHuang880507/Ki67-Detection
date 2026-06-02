@@ -11,6 +11,7 @@ from ki67dtc.gui.main_window import MainWindow
 
 
 def main() -> None:
+    """啟動 Ki67 桌面圖形介面。"""
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()

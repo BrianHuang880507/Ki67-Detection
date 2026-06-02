@@ -13,17 +13,32 @@ ProgressCallback = Callable[[int, int, str], None]
 
 @dataclass
 class PipelineResult:
+    """GUI 執行 pipeline 後回傳的資料集與影像清單。"""
+
     data_folder: Path
     image_files: Sequence[Path]
 
 
 @dataclass
 class OverlayPolygons:
+    """GUI 疊圖所需的 nucleus 與 cytoplasm polygon 集合。"""
+
     nuc_polygons: list[np.ndarray]
     cyto_polygons: list[np.ndarray]
 
 
 def _resolve_data_folder(raw_data_folder: Path) -> Path:
+    """解析 GUI 輸入的資料夾名稱或路徑。
+
+    Args:
+        raw_data_folder (Path): 使用者輸入的資料夾名稱、相對路徑或絕對路徑。
+
+    Returns:
+        Path: 實際存在的資料集資料夾。
+
+    Raises:
+        FileNotFoundError: 找不到任何可用資料夾時拋出。
+    """
     candidates = []
     if raw_data_folder.is_absolute():
         candidates.append(raw_data_folder)
@@ -163,6 +178,7 @@ def load_merged_outlines(merged_path: Path) -> OverlayPolygons:
         lines = [ln.strip() for ln in f.readlines() if ln.strip()]
 
     def _line_to_poly(line: str) -> Optional[np.ndarray]:
+        """將 merged outline 單行座標轉為 polygon 陣列。"""
         if line == "-1,-1":
             return None
         coords = list(map(int, line.split(",")))

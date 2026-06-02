@@ -1,17 +1,18 @@
 import os
 import sys
 import tempfile
+import math
+import json
+import csv
 from contextlib import contextmanager
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from tqdm import trange
-from typing import Any, Union
+from typing import Any, Optional, Union
 from skimage.draw import polygon, polygon2mask
-from skimage.io import imread
 from shapely.affinity import scale
 from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
-from skimage import io as skio
 from shutil import copyfile
 import cv2
 import tifffile
@@ -29,6 +30,41 @@ from ki67dtc.utils.io import (
 )
 
 _PYIMAGEJ = None
+
+
+def _read_image_array(path: Union[str, Path]) -> np.ndarray:
+    """Read an image with OpenCV first, then fall back to tifffile."""
+    path = Path(path)
+    data = np.fromfile(str(path), dtype=np.uint8)
+    image = cv2.imdecode(data, cv2.IMREAD_UNCHANGED) if data.size else None
+    if image is None:
+        image = tifffile.imread(path)
+    return np.squeeze(image)
+
+
+def _read_gray_float(path: Union[str, Path]) -> np.ndarray:
+    """Read an image as grayscale float, keeping skimage-like [0, 1] scaling."""
+    image = _read_image_array(path)
+    if image.ndim == 3:
+        if image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+        else:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    if np.issubdtype(image.dtype, np.integer):
+        max_value = np.iinfo(image.dtype).max
+        return image.astype(np.float32) / float(max_value)
+    return image.astype(np.float32)
+
+
+def _read_binary_mask(path: Union[str, Path]) -> np.ndarray:
+    """Read any mask image as a boolean array."""
+    image = _read_image_array(path)
+    if image.ndim == 3:
+        if image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+        else:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    return image > 0
 
 
 @contextmanager
@@ -118,6 +154,19 @@ setBatchMode(false);
 close("*");
 """
 
+_FIND_EDGES_MACRO = r"""
+#@ String input_path
+#@ String output_path
+
+run("Close All");
+setBatchMode(true);
+open(input_path);
+run("Find Edges");
+saveAs("Tiff", output_path);
+setBatchMode(false);
+close("*");
+"""
+
 _PREPROCESS_MACRO = r"""
 #@ String input_path
 #@ String output_path
@@ -130,10 +179,261 @@ saveAs("Tiff", output_path);
 close();
 """
 
+_DEBRIS_IMAGEJ_MACRO = r"""
+#@ String signal_path
+#@ String background_mask_path
+#@ String debris_mask_path
+#@ String particle_table_path
+#@ String threshold_method
+#@ double min_particle_area
+#@ double max_particle_area
+#@ double rolling_ball_radius
+#@ boolean subtract_background
+#@ boolean watershed
+
+run("Close All");
+run("Clear Results");
+setBatchMode(true);
+
+open(signal_path);
+rename("signal");
+selectWindow("signal");
+run("8-bit");
+if (subtract_background) {
+    run("Subtract Background...", "rolling=" + rolling_ball_radius);
+}
+
+open(background_mask_path);
+rename("background_mask");
+selectWindow("background_mask");
+run("8-bit");
+setThreshold(1, 255);
+run("Convert to Mask");
+run("Create Selection");
+
+if (selectionType() < 0) {
+    File.saveString("Area\tMean\tMin\tMax\tX\tY\n", particle_table_path);
+    selectWindow("signal");
+    width = getWidth();
+    height = getHeight();
+    newImage("DebrisMaskBlank", "8-bit black", width, height, 1);
+    saveAs("PNG", debris_mask_path);
+    run("Clear Results");
+    setBatchMode(false);
+    close("*");
+    exit();
+}
+
+selectWindow("signal");
+run("Restore Selection");
+setBackgroundColor(0, 0, 0);
+run("Clear Outside");
+setAutoThreshold(threshold_method + " dark no-reset");
+setOption("BlackBackground", true);
+run("Convert to Mask");
+rename("threshold_mask");
+
+selectWindow("background_mask");
+run("Create Selection");
+selectWindow("threshold_mask");
+run("Restore Selection");
+setBackgroundColor(0, 0, 0);
+run("Clear Outside");
+
+if (watershed) {
+    run("Watershed");
+}
+
+width = getWidth();
+height = getHeight();
+run("Set Measurements...", "area mean min max centroid perimeter shape feret's display redirect=None decimal=6");
+particle_options = "size=" + min_particle_area + "-" + max_particle_area + " show=Masks display clear";
+run("Analyze Particles...", particle_options);
+particle_count = nResults;
+
+if (particle_count > 0) {
+    saveAs("Results", particle_table_path);
+} else {
+    File.saveString("Area\tMean\tMin\tMax\tX\tY\tPerim.\tCirc.\tFeret\n", particle_table_path);
+}
+
+if (particle_count > 0) {
+    mask_title = "Mask of threshold_mask";
+    if (isOpen(mask_title)) {
+        selectWindow(mask_title);
+    } else if (isOpen("Mask")) {
+        selectWindow("Mask");
+    } else {
+        newImage("DebrisMaskBlank", "8-bit black", width, height, 1);
+    }
+    run("Invert");
+} else {
+    newImage("DebrisMaskBlank", "8-bit black", width, height, 1);
+}
+run("8-bit");
+saveAs("PNG", debris_mask_path);
+
+run("Clear Results");
+setBatchMode(false);
+close("*");
+"""
+
+_LBP_ROI_MACRO = r"""
+#@ String signal_path
+#@ String mask_path
+#@ String output_path
+
+function bitAt(code, bit) {
+    return floor(code / pow(2, bit)) % 2;
+}
+
+function isUniform(code) {
+    previous = bitAt(code, 7);
+    transitions = 0;
+    for (bit = 0; bit < 8; bit++) {
+        current = bitAt(code, bit);
+        if (current != previous) {
+            transitions++;
+        }
+        previous = current;
+    }
+    if (transitions <= 2) {
+        return 1;
+    }
+    return 0;
+}
+
+run("Close All");
+setBatchMode(true);
+open(signal_path);
+rename("signal");
+selectWindow("signal");
+run("8-bit");
+open(mask_path);
+rename("mask");
+selectWindow("mask");
+run("8-bit");
+setThreshold(1, 255);
+run("Convert to Mask");
+
+selectWindow("signal");
+w = getWidth();
+h = getHeight();
+hist = newArray(256);
+total = 0;
+sum_code = 0;
+sum_sq_code = 0;
+uniform_count = 0;
+
+for (y = 1; y < h - 1; y++) {
+    for (x = 1; x < w - 1; x++) {
+        selectWindow("mask");
+        if (getPixel(x, y) <= 0) {
+            continue;
+        }
+
+        selectWindow("signal");
+        center = getPixel(x, y);
+        code = 0;
+        if (getPixel(x - 1, y - 1) >= center) code += 1;
+        if (getPixel(x, y - 1) >= center) code += 2;
+        if (getPixel(x + 1, y - 1) >= center) code += 4;
+        if (getPixel(x + 1, y) >= center) code += 8;
+        if (getPixel(x + 1, y + 1) >= center) code += 16;
+        if (getPixel(x, y + 1) >= center) code += 32;
+        if (getPixel(x - 1, y + 1) >= center) code += 64;
+        if (getPixel(x - 1, y) >= center) code += 128;
+
+        hist[code]++;
+        total++;
+        sum_code += code;
+        sum_sq_code += code * code;
+        if (isUniform(code) == 1) {
+            uniform_count++;
+        }
+    }
+}
+
+if (total <= 0) {
+    File.saveString("valid=0\n", output_path);
+    setBatchMode(false);
+    close("*");
+    exit();
+}
+
+mean_code = sum_code / total;
+variance_code = sum_sq_code / total - mean_code * mean_code;
+if (variance_code < 0) variance_code = 0;
+std_code = sqrt(variance_code);
+entropy = 0;
+for (i = 0; i < 256; i++) {
+    if (hist[i] > 0) {
+        p = hist[i] / total;
+        entropy -= p * log(p) / log(2);
+    }
+}
+uniform_ratio = uniform_count / total;
+
+result_txt = "";
+result_txt = result_txt + "valid=1\n";
+result_txt = result_txt + "mean=" + mean_code + "\n";
+result_txt = result_txt + "std=" + std_code + "\n";
+result_txt = result_txt + "entropy=" + entropy + "\n";
+result_txt = result_txt + "uniform_ratio=" + uniform_ratio + "\n";
+for (bin = 0; bin < 16; bin++) {
+    bin_count = 0;
+    for (code = bin * 16; code < bin * 16 + 16; code++) {
+        bin_count += hist[code];
+    }
+    result_txt = result_txt + "hist_bin_" + bin + "=" + (bin_count / total) + "\n";
+}
+
+File.saveString(result_txt, output_path);
+setBatchMode(false);
+close("*");
+"""
+
 _MEASURE_ROI_MACRO = r"""
 #@ String signal_path
 #@ String mask_path
 #@ String output_path
+
+function percentileFromHistogram(values, counts, q) {
+    total = 0;
+    for (i = 0; i < counts.length; i++) {
+        total = total + counts[i];
+    }
+    if (total <= 0) {
+        return 0/0;
+    }
+    target = q * total;
+    cumulative = 0;
+    for (i = 0; i < counts.length; i++) {
+        cumulative = cumulative + counts[i];
+        if (cumulative >= target) {
+            return values[i];
+        }
+    }
+    return values[values.length - 1];
+}
+
+function entropyFromHistogram(counts) {
+    total = 0;
+    for (i = 0; i < counts.length; i++) {
+        total = total + counts[i];
+    }
+    if (total <= 0) {
+        return 0/0;
+    }
+    entropy = 0;
+    for (i = 0; i < counts.length; i++) {
+        if (counts[i] > 0) {
+            p = counts[i] / total;
+            entropy = entropy - p * log(p) / log(2);
+        }
+    }
+    return entropy;
+}
 
 run("Close All");
 run("Clear Results");
@@ -161,7 +461,7 @@ getSelectionCoordinates(xpoints, ypoints);
 
 selectWindow("signal");
 makeSelection("polygon", xpoints, ypoints);
-run("Set Measurements...", "area mean standard min integrated perimeter shape feret's fit decimal=6");
+run("Set Measurements...", "area mean standard min integrated centroid perimeter shape feret's fit median skewness kurtosis decimal=6");
 run("Measure");
 
 area = getResult("Area", 0);
@@ -171,6 +471,11 @@ minv = getResult("Min", 0);
 maxv = getResult("Max", 0);
 intden = getResult("IntDen", 0);
 rawintden = getResult("RawIntDen", 0);
+medianv = getResult("Median", 0);
+skewv = getResult("Skew", 0);
+kurtv = getResult("Kurt", 0);
+xcentroid = getResult("X", 0);
+ycentroid = getResult("Y", 0);
 perim = getResult("Perim.", 0);
 feret = getResult("Feret", 0);
 minferet = getResult("MinFeret", 0);
@@ -179,6 +484,18 @@ minor = getResult("Minor", 0);
 ar = getResult("AR", 0);
 roundv = getResult("Round", 0);
 circ = getResult("Circ.", 0);
+cv = 0/0;
+if (mean != 0) {
+    cv = std / mean;
+}
+rangev = maxv - minv;
+getHistogram(hist_values, hist_counts, 256);
+p10 = percentileFromHistogram(hist_values, hist_counts, 0.10);
+p25 = percentileFromHistogram(hist_values, hist_counts, 0.25);
+p75 = percentileFromHistogram(hist_values, hist_counts, 0.75);
+p90 = percentileFromHistogram(hist_values, hist_counts, 0.90);
+iqr80 = p90 - p10;
+entropyv = entropyFromHistogram(hist_counts);
 
 selectWindow("signal");
 makeSelection("polygon", xpoints, ypoints);
@@ -197,6 +514,19 @@ result_txt = result_txt + "min=" + minv + "\n";
 result_txt = result_txt + "max=" + maxv + "\n";
 result_txt = result_txt + "intden=" + intden + "\n";
 result_txt = result_txt + "raw_intden=" + rawintden + "\n";
+result_txt = result_txt + "cv=" + cv + "\n";
+result_txt = result_txt + "range=" + rangev + "\n";
+result_txt = result_txt + "median=" + medianv + "\n";
+result_txt = result_txt + "p10=" + p10 + "\n";
+result_txt = result_txt + "p25=" + p25 + "\n";
+result_txt = result_txt + "p75=" + p75 + "\n";
+result_txt = result_txt + "p90=" + p90 + "\n";
+result_txt = result_txt + "iqr80=" + iqr80 + "\n";
+result_txt = result_txt + "entropy=" + entropyv + "\n";
+result_txt = result_txt + "skewness=" + skewv + "\n";
+result_txt = result_txt + "kurtosis=" + kurtv + "\n";
+result_txt = result_txt + "x_centroid=" + xcentroid + "\n";
+result_txt = result_txt + "y_centroid=" + ycentroid + "\n";
 result_txt = result_txt + "perimeter=" + perim + "\n";
 result_txt = result_txt + "feret=" + feret + "\n";
 result_txt = result_txt + "minferet=" + minferet + "\n";
@@ -212,6 +542,118 @@ run("Clear Results");
 setBatchMode(false);
 close("*");
 """
+
+INTENSITY_FEATURE_PARAMETER_COLUMNS = [
+    "Mean",
+    "StdDev",
+    "Min",
+    "Max",
+    "IntDen",
+    "RawIntDen",
+    "CV",
+    "Range",
+    "P10",
+    "P25",
+    "P75",
+    "P90",
+    "IQR80",
+    "Entropy",
+    "Skewness",
+    "Kurtosis",
+]
+
+TEXTURE_FEATURE_PARAMETER_COLUMNS = [
+    "GLCM ASM",
+    "GLCM Contrast",
+    "GLCM Correlation",
+    "GLCM Difference Variance",
+    "GLCM Entropy",
+    "GLCM Homogeneity",
+    "LBP Mean",
+    "LBP StdDev",
+    "LBP Entropy",
+    "LBP Uniform Ratio",
+    *[f"LBP Hist Bin {idx:02d}" for idx in range(16)],
+]
+
+DERIVED_FEATURE_PARAMETER_COLUMNS = [
+    "Nuc Cyto Mean Ratio",
+    "Nuc Cyto IntDen Ratio",
+    "Nuc Cyto RawIntDen Ratio",
+    "Nuc Cyto Entropy Difference",
+    "Nuc Cyto CV Difference",
+    "Nucleus Centroid Offset",
+]
+
+HALO_FEATURE_PARAMETER_COLUMNS = [
+    "Halo Outer Mean",
+    "Halo Outer StdDev",
+    "Halo Inner Mean",
+    "Halo Inner StdDev",
+    "Halo Inner Outer Diff",
+    "Halo Width",
+    "Edge Sharpness",
+]
+
+POPULATION_FEATURE_PARAMETER_COLUMNS = [
+    "Image Confluency",
+    "Population Area CV",
+    "Population Circularity CV",
+    "Nearest Neighbor Distance",
+    "Nearest Neighbor Distance Norm",
+    "Local Neighbor Count",
+    "Local Density",
+    "Cluster Size",
+    "Cluster Size Norm",
+    "Largest Cluster Ratio",
+]
+
+SHAPE_COMPLEXITY_FEATURE_PARAMETER_COLUMNS = [
+    "Protrusion Count",
+    "Mean Convex Defect Depth",
+    "Max Convex Defect Depth",
+    "Fractal Dimension",
+    "Boundary Inflection Count",
+]
+
+MITOSIS_FEATURE_PARAMETER_COLUMNS = [
+    "Mitotic Score",
+    "Daughter Pair Flag",
+    "Protrusion Retraction Score",
+]
+
+DEBRIS_FEATURE_PARAMETER_COLUMNS = [
+    "Debris Count",
+    "Debris Area Fraction",
+    "Nearest Debris Distance",
+    "Debris Mean Area",
+    "Debris Density",
+]
+
+EXTRA_FEATURE_PARAMETER_COLUMNS = (
+    DERIVED_FEATURE_PARAMETER_COLUMNS
+    + HALO_FEATURE_PARAMETER_COLUMNS
+    + POPULATION_FEATURE_PARAMETER_COLUMNS
+    + SHAPE_COMPLEXITY_FEATURE_PARAMETER_COLUMNS
+    + DEBRIS_FEATURE_PARAMETER_COLUMNS
+    + MITOSIS_FEATURE_PARAMETER_COLUMNS
+)
+CELL_LEVEL_FEATURE_PARAMETER_COLUMNS = ["Karyoplasmic Ratio"] + EXTRA_FEATURE_PARAMETER_COLUMNS
+
+DEBRIS_CONFIG_PATH = Path(__file__).with_name("debris_feature_config.json")
+DEFAULT_DEBRIS_CONFIG: dict[str, Any] = {
+    "threshold_method": "Triangle",
+    "min_size_px": 5,
+    "max_size_fraction_of_median_nucleus_area": 0.08,
+    "cell_dilate_px": 3,
+    "subtract_background": False,
+    "rolling_ball_radius": 50.0,
+    "watershed": False,
+}
+
+TEXTURE_GLCM_GRAY_LEVELS = 64
+TEXTURE_GLCM_DISTANCE = 2
+_GLCM_ORIENTATIONS = None
 
 
 def _get_pyimagej():
@@ -312,11 +754,25 @@ def _empty_imagej_measurements() -> dict[str, float]:
         "max": np.nan,
         "intden": np.nan,
         "raw_intden": np.nan,
+        "cv": np.nan,
+        "range": np.nan,
+        "median": np.nan,
+        "p10": np.nan,
+        "p25": np.nan,
+        "p75": np.nan,
+        "p90": np.nan,
+        "iqr80": np.nan,
+        "entropy": np.nan,
+        "skewness": np.nan,
+        "kurtosis": np.nan,
+        "x_centroid": np.nan,
+        "y_centroid": np.nan,
         "perimeter": np.nan,
         "feret": np.nan,
         "minferet": np.nan,
         "major": np.nan,
         "minor": np.nan,
+        "eccentricity": np.nan,
         "ar": np.nan,
         "round": np.nan,
         "circ": np.nan,
@@ -366,6 +822,308 @@ def _read_kv_measurements(path: Path) -> dict[str, float]:
     return out
 
 
+def _intensity_feature_parameter_values(measurement: dict[str, float]) -> list[float]:
+    """Return intensity feature parameters in INTENSITY_FEATURE_PARAMETER_COLUMNS order."""
+    return [
+        measurement["mean"],
+        measurement["std"],
+        measurement["min"],
+        measurement["max"],
+        measurement["intden"],
+        measurement["raw_intden"],
+        measurement["cv"],
+        measurement["range"],
+        measurement["p10"],
+        measurement["p25"],
+        measurement["p75"],
+        measurement["p90"],
+        measurement["iqr80"],
+        measurement["entropy"],
+        measurement["skewness"],
+        measurement["kurtosis"],
+    ]
+
+
+def _empty_texture_feature_values() -> list[float]:
+    """回傳 texture 參數的空值清單。"""
+    return [np.nan] * len(TEXTURE_FEATURE_PARAMETER_COLUMNS)
+
+
+def _empty_glcm_feature_values() -> list[float]:
+    """回傳 GLCM 參數的空值清單。"""
+    return [np.nan] * 6
+
+
+def _empty_lbp_feature_values() -> list[float]:
+    """回傳 LBP 參數的空值清單。"""
+    return [np.nan] * 20
+
+
+def _get_glcm_orientations() -> list[Any]:
+    """取得 PyImageJ Haralick GLCM 的四個量測方向。"""
+    global _GLCM_ORIENTATIONS
+    if _GLCM_ORIENTATIONS is not None:
+        return _GLCM_ORIENTATIONS
+    import imagej as imagej_module
+
+    matrix_orientation = imagej_module.sj.jimport(
+        "net.imagej.ops.image.cooccurrenceMatrix.MatrixOrientation2D"
+    )
+    _GLCM_ORIENTATIONS = [
+        matrix_orientation.ANTIDIAGONAL,
+        matrix_orientation.DIAGONAL,
+        matrix_orientation.HORIZONTAL,
+        matrix_orientation.VERTICAL,
+    ]
+    return _GLCM_ORIENTATIONS
+
+
+def _java_numeric_value(ij: Any, value: Any) -> float:
+    """將 Java numeric 物件轉為 Python float。"""
+    converted = ij.py.from_java(value)
+    if hasattr(converted, "value"):
+        return float(converted.value)
+    return float(converted)
+
+
+def _prepare_texture_crop(
+    signal: np.ndarray,
+    roi_mask: np.ndarray,
+    erode_px: int,
+    distance: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """裁切 ROI texture 量測區域，並以 ROI 平均值填補背景。
+
+    Args:
+        signal (np.ndarray): 2D 影像強度。
+        roi_mask (np.ndarray): ROI 布林遮罩。
+        erode_px (int): 量測前 mask erosion 次數。
+        distance (int): 紋理演算法使用的鄰近距離。
+
+    Returns:
+        tuple[np.ndarray, np.ndarray] | None: 裁切後影像與 mask；ROI 太小時回傳 `None`。
+    """
+    if roi_mask is None or not np.any(roi_mask):
+        return None
+
+    mask = roi_mask.astype(bool)
+    if erode_px > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        eroded = cv2.erode(mask.astype(np.uint8), kernel, iterations=erode_px).astype(bool)
+        if np.count_nonzero(eroded) >= max(16, (distance + 1) ** 2):
+            mask = eroded
+
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+
+    pad = max(1, int(distance))
+    y1 = max(int(ys.min()) - pad, 0)
+    y2 = min(int(ys.max()) + pad + 1, signal.shape[0])
+    x1 = max(int(xs.min()) - pad, 0)
+    x2 = min(int(xs.max()) + pad + 1, signal.shape[1])
+    if (y2 - y1) <= distance or (x2 - x1) <= distance:
+        return None
+
+    crop = signal[y1:y2, x1:x2].astype(np.float32, copy=True)
+    crop_mask = mask[y1:y2, x1:x2]
+    roi_values = crop[crop_mask]
+    if roi_values.size < max(16, (distance + 1) ** 2):
+        return None
+
+    fill_value = float(np.mean(roi_values))
+    crop[~crop_mask] = fill_value
+    return crop, crop_mask
+
+
+def _texture_feature_parameter_values(
+    ij: Any,
+    signal: np.ndarray,
+    roi_mask: np.ndarray,
+    erode_px: int,
+    gray_levels: int = TEXTURE_GLCM_GRAY_LEVELS,
+    distance: int = TEXTURE_GLCM_DISTANCE,
+) -> list[float]:
+    """使用 PyImageJ Haralick ops 提取 GLCM texture 參數。
+
+    Args:
+        ij (Any): 已初始化的 PyImageJ 物件。
+        signal (np.ndarray): 2D 影像強度。
+        roi_mask (np.ndarray): ROI 布林遮罩。
+        erode_px (int): 量測前 mask erosion 次數。
+        gray_levels (int): GLCM 灰階層數。
+        distance (int): GLCM pixel distance。
+
+    Returns:
+        list[float]: GLCM ASM、Contrast、Correlation、Difference Variance、Entropy、Homogeneity。
+    """
+    prepared = _prepare_texture_crop(signal, roi_mask, erode_px, distance)
+    if prepared is None:
+        return _empty_glcm_feature_values()
+    crop, _ = prepared
+
+    try:
+        dataset = ij.py.to_dataset(crop)
+        orientations = _get_glcm_orientations()
+        angle_values: list[list[float]] = []
+        for angle in orientations:
+            angle_values.append(
+                [
+                    _java_numeric_value(
+                        ij,
+                        ij.op().haralick().asm(
+                            dataset, int(gray_levels), int(distance), angle
+                        ),
+                    ),
+                    _java_numeric_value(
+                        ij,
+                        ij.op().haralick().contrast(
+                            dataset, int(gray_levels), int(distance), angle
+                        ),
+                    ),
+                    _java_numeric_value(
+                        ij,
+                        ij.op().haralick().correlation(
+                            dataset, int(gray_levels), int(distance), angle
+                        ),
+                    ),
+                    _java_numeric_value(
+                        ij,
+                        ij.op().haralick().differenceVariance(
+                            dataset, int(gray_levels), int(distance), angle
+                        ),
+                    ),
+                    _java_numeric_value(
+                        ij,
+                        ij.op().haralick().entropy(
+                            dataset, int(gray_levels), int(distance), angle
+                        ),
+                    ),
+                    _java_numeric_value(
+                        ij,
+                        ij.op().haralick().textureHomogeneity(
+                            dataset, int(gray_levels), int(distance), angle
+                        ),
+                    ),
+                ]
+            )
+    except Exception as exc:
+        print(f"[WARN] GLCM texture extraction failed: {exc}")
+        return _empty_glcm_feature_values()
+
+    values = np.asarray(angle_values, dtype=np.float64)
+    if values.size == 0:
+        return _empty_glcm_feature_values()
+    with np.errstate(all="ignore"):
+        means = np.nanmean(values, axis=0)
+    return [float(value) if np.isfinite(value) else np.nan for value in means]
+
+
+def _read_lbp_measurements(path: Path) -> list[float]:
+    """讀取 ImageJ LBP macro 輸出的 key-value 結果。"""
+    if not path.exists():
+        return _empty_lbp_feature_values()
+    parsed: dict[str, str] = {}
+    with path.open("r", encoding="utf-8", errors="ignore") as file:
+        for line in file:
+            line = line.strip()
+            if not line or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            parsed[key.strip()] = value.strip()
+    if parsed.get("valid") != "1":
+        return _empty_lbp_feature_values()
+    keys = ["mean", "std", "entropy", "uniform_ratio"] + [
+        f"hist_bin_{idx}" for idx in range(16)
+    ]
+    values: list[float] = []
+    for key in keys:
+        try:
+            values.append(float(parsed.get(key, "nan")))
+        except Exception:
+            values.append(np.nan)
+    return values
+
+
+def _lbp_feature_parameter_values(
+    ij: Any,
+    signal: np.ndarray,
+    roi_mask: np.ndarray,
+    erode_px: int,
+    temp_dir: Path,
+    slot: str,
+) -> list[float]:
+    """使用 ImageJ macro 提取 LBP texture 參數。
+
+    Args:
+        ij (Any): 已初始化的 PyImageJ 物件。
+        signal (np.ndarray): 2D 影像強度。
+        roi_mask (np.ndarray): ROI 布林遮罩。
+        erode_px (int): 量測前 mask erosion 次數。
+        temp_dir (Path): 暫存影像與文字結果的資料夾。
+        slot (str): 暫存檔名識別字。
+
+    Returns:
+        list[float]: LBP summary 與 16 個 histogram bin。
+    """
+    prepared = _prepare_texture_crop(signal, roi_mask, erode_px, distance=1)
+    if prepared is None:
+        return _empty_lbp_feature_values()
+    crop, crop_mask = prepared
+    signal_path = temp_dir / f"{slot}_lbp_signal.tif"
+    mask_path = temp_dir / f"{slot}_lbp_mask.tif"
+    output_path = temp_dir / f"{slot}_lbp.txt"
+    tifffile.imwrite(signal_path, crop.astype(np.float32))
+    tifffile.imwrite(mask_path, (crop_mask.astype(np.uint8) * 255))
+    try:
+        _run_macro_quiet(
+            ij,
+            _LBP_ROI_MACRO,
+            args={
+                "signal_path": str(signal_path),
+                "mask_path": str(mask_path),
+                "output_path": str(output_path),
+            },
+        )
+    except Exception as exc:
+        print(f"[WARN] LBP texture extraction failed: {exc}")
+        return _empty_lbp_feature_values()
+    return _read_lbp_measurements(output_path)
+
+
+def _safe_divide(numerator: float, denominator: float) -> float:
+    """安全除法，遇到 NaN 或近零分母時回傳 NaN。"""
+    if np.isnan(numerator) or np.isnan(denominator) or abs(denominator) < 1e-12:
+        return np.nan
+    return float(numerator / denominator)
+
+
+def _safe_difference(left: float, right: float) -> float:
+    """安全相減，任一輸入為 NaN 時回傳 NaN。"""
+    if np.isnan(left) or np.isnan(right):
+        return np.nan
+    return float(left - right)
+
+
+def _safe_abs_difference(left: float, right: float) -> float:
+    """安全絕對差，任一輸入為 NaN 時回傳 NaN。"""
+    if np.isnan(left) or np.isnan(right):
+        return np.nan
+    return float(abs(left - right))
+
+
+def _safe_cv(values: np.ndarray) -> float:
+    """計算變異係數，資料不足或平均近零時回傳 NaN。"""
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return np.nan
+    mean_value = float(values.mean())
+    if abs(mean_value) < 1e-12:
+        return np.nan
+    return float(values.std() / mean_value)
+
+
 def _measure_roi_with_imagej(
     ij: Any,
     signal_path: Path,
@@ -403,6 +1161,347 @@ def _measure_roi_with_imagej(
     return _read_kv_measurements(out_path)
 
 
+def _make_edge_signal_with_imagej(ij: Any, signal_path: Path, temp_dir: Path) -> Path:
+    """Create an ImageJ Find Edges image and return its temporary path."""
+    edge_path = temp_dir / "signal_find_edges.tif"
+    _run_macro_quiet(
+        ij,
+        _FIND_EDGES_MACRO,
+        args={"input_path": str(signal_path), "output_path": str(edge_path)},
+    )
+    if not edge_path.exists():
+        raise RuntimeError(f"ImageJ Find Edges failed: {edge_path}")
+    return edge_path
+
+
+def _load_debris_config() -> dict[str, Any]:
+    """讀取 debris feature 的門檻設定。
+
+    Returns:
+        dict[str, Any]: 合併預設值與 JSON 設定檔後的 debris 參數。
+    """
+    config = dict(DEFAULT_DEBRIS_CONFIG)
+    config_path = Path(os.environ.get("KI67_DEBRIS_CONFIG_PATH", DEBRIS_CONFIG_PATH))
+    if config_path.exists():
+        try:
+            loaded = json.loads(config_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                config.update(loaded)
+        except Exception as exc:
+            print(f"[WARN] Failed to read debris config {config_path}: {exc}")
+    return config
+
+
+def _find_ki67_image_for_pc(pc_path: Path) -> Path | None:
+    """尋找 PC 影像對應的 Ki67 影像。
+
+    Args:
+        pc_path (Path): PC 影像路徑。
+
+    Returns:
+        Path | None: 對應 Ki67 影像路徑；找不到時回傳 `None`。
+    """
+    dataset_dir = pc_path.parent.parent if pc_path.parent.name.upper() == "PC" else pc_path.parent
+    ki67_dir = dataset_dir / "KI67"
+    if not ki67_dir.exists():
+        return None
+
+    mapping_path = dataset_dir / "image_mapping.csv"
+    if mapping_path.exists():
+        try:
+            mapping = pd.read_csv(mapping_path)
+            if "PC_Name" in mapping.columns and "KI67_Name" in mapping.columns:
+                matched = mapping[mapping["PC_Name"].astype(str) == pc_path.name]
+                if not matched.empty:
+                    ki67_name = str(matched.iloc[0]["KI67_Name"]).strip()
+                    ki67_path = ki67_dir / ki67_name
+                    if ki67_name and ki67_path.exists():
+                        return ki67_path
+        except Exception as exc:
+            print(f"[WARN] Failed to read image mapping for debris: {exc}")
+
+    pc_images = list_files(pc_path.parent, [".jpg", ".jpeg", ".png", ".tif", ".tiff"])
+    ki67_images = list_files(ki67_dir, [".jpg", ".jpeg", ".png", ".tif", ".tiff"])
+    stems = [path.stem for path in pc_images]
+    if pc_path.stem in stems:
+        idx = stems.index(pc_path.stem)
+        if idx < len(ki67_images):
+            return ki67_images[idx]
+    return None
+
+
+def _debris_background_mask(cell_union_mask: np.ndarray, cell_dilate_px: int) -> np.ndarray:
+    """由細胞 union mask 建立 debris 分析用 background mask。
+
+    Args:
+        cell_union_mask (np.ndarray): 所有細胞 ROI 的 union mask。
+        cell_dilate_px (int): 排除細胞邊緣時的 dilation 半徑。
+
+    Returns:
+        np.ndarray: background 區域布林遮罩。
+    """
+    cell_mask = cell_union_mask.astype(np.uint8)
+    if cell_dilate_px > 0 and np.any(cell_mask):
+        kernel_size = int(cell_dilate_px) * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        cell_mask = cv2.dilate(cell_mask, kernel, iterations=1)
+    return cell_mask == 0
+
+
+def _parse_debris_particle_table(table_path: Path) -> dict[str, Any]:
+    """解析 ImageJ Analyze Particles 輸出的 debris 表格。
+
+    Args:
+        table_path (Path): ImageJ 輸出的 TSV 結果路徑。
+
+    Returns:
+        dict[str, Any]: debris 面積陣列與 centroid 座標陣列。
+    """
+    areas: list[float] = []
+    centroids: list[list[float]] = []
+    if not table_path.exists():
+        return {"areas": np.asarray([], dtype=np.float64), "centroids": np.empty((0, 2), dtype=np.float64)}
+
+    with table_path.open("r", encoding="utf-8", errors="ignore", newline="") as file:
+        reader = csv.DictReader(file, delimiter="\t")
+        for row in reader:
+            try:
+                area = float(row.get("Area", "nan"))
+                x = float(row.get("X", "nan"))
+                y = float(row.get("Y", "nan"))
+            except Exception:
+                continue
+            if not np.isfinite(area) or area <= 0:
+                continue
+            areas.append(area)
+            centroids.append([x, y])
+
+    return {
+        "areas": np.asarray(areas, dtype=np.float64),
+        "centroids": np.asarray(centroids, dtype=np.float64).reshape(-1, 2),
+    }
+
+
+def _nearest_distances_to_debris(
+    cell_centroids: np.ndarray, debris_centroids: np.ndarray
+) -> np.ndarray:
+    """計算每顆細胞到最近 debris centroid 的距離。
+
+    Args:
+        cell_centroids (np.ndarray): 細胞 centroid 座標，shape 為 `(N, 2)`。
+        debris_centroids (np.ndarray): debris centroid 座標，shape 為 `(M, 2)`。
+
+    Returns:
+        np.ndarray: 每顆細胞的最近 debris 距離。
+    """
+    nearest = np.full(len(cell_centroids), np.nan, dtype=np.float64)
+    if len(cell_centroids) == 0 or len(debris_centroids) == 0:
+        return nearest
+    valid_cells = np.isfinite(cell_centroids).all(axis=1)
+    valid_debris = np.isfinite(debris_centroids).all(axis=1)
+    if not np.any(valid_cells) or not np.any(valid_debris):
+        return nearest
+    debris_points = debris_centroids[valid_debris]
+    for idx in np.where(valid_cells)[0]:
+        diffs = debris_points - cell_centroids[idx]
+        nearest[idx] = float(np.sqrt(np.sum(diffs * diffs, axis=1)).min())
+    return nearest
+
+
+def _empty_debris_feature_values(n_cells: int) -> list[list[float]]:
+    """回傳指定細胞數的 debris 空值矩陣。"""
+    return [[np.nan] * len(DEBRIS_FEATURE_PARAMETER_COLUMNS) for _ in range(n_cells)]
+
+
+def _debris_feature_values_for_cells(
+    ij: Any,
+    pc_path: Path,
+    cell_union_mask: np.ndarray,
+    cell_centroids: np.ndarray,
+    median_nucleus_area: float,
+    temp_dir: Path,
+) -> list[list[float]]:
+    """使用 ImageJ threshold 與 Analyze Particles 提取 debris 特徵。
+
+    Args:
+        ij (Any): 已初始化的 PyImageJ 物件。
+        pc_path (Path): 目前 PC 影像路徑，用於定位對應 Ki67/debris 影像。
+        cell_union_mask (np.ndarray): 所有細胞 ROI 的 union mask。
+        cell_centroids (np.ndarray): 每顆細胞 centroid 座標。
+        median_nucleus_area (float): 同張影像 nucleus 面積中位數。
+        temp_dir (Path): 暫存檔資料夾。
+
+    Returns:
+        list[list[float]]: 每顆細胞的 debris feature parameter 清單。
+    """
+    n_cells = len(cell_centroids)
+    if n_cells == 0:
+        return []
+
+    config = _load_debris_config()
+    ki67_path = _find_ki67_image_for_pc(pc_path)
+    if ki67_path is None:
+        return _empty_debris_feature_values(n_cells)
+
+    min_size = float(config.get("min_size_px", DEFAULT_DEBRIS_CONFIG["min_size_px"]))
+    max_fraction = float(
+        config.get(
+            "max_size_fraction_of_median_nucleus_area",
+            DEFAULT_DEBRIS_CONFIG["max_size_fraction_of_median_nucleus_area"],
+        )
+    )
+    if not np.isfinite(median_nucleus_area) or median_nucleus_area <= 0:
+        return _empty_debris_feature_values(n_cells)
+    max_size = float(median_nucleus_area * max_fraction)
+    if max_size < min_size:
+        return _empty_debris_feature_values(n_cells)
+
+    cell_dilate_px = int(config.get("cell_dilate_px", DEFAULT_DEBRIS_CONFIG["cell_dilate_px"]))
+    background_mask = _debris_background_mask(cell_union_mask, cell_dilate_px)
+    background_area = int(np.count_nonzero(background_mask))
+    if background_area <= 0:
+        return _empty_debris_feature_values(n_cells)
+
+    signal_path = temp_dir / f"debris_signal{ki67_path.suffix.lower()}"
+    background_mask_path = temp_dir / "debris_background_mask.tif"
+    debris_mask_path = temp_dir / "debris_mask.png"
+    particle_table_path = temp_dir / "debris_particles.tsv"
+    try:
+        copyfile(ki67_path, signal_path)
+        tifffile.imwrite(background_mask_path, (background_mask.astype(np.uint8) * 255))
+
+        _run_macro_quiet(
+            ij,
+            _DEBRIS_IMAGEJ_MACRO,
+            args={
+                "signal_path": str(signal_path),
+                "background_mask_path": str(background_mask_path),
+                "debris_mask_path": str(debris_mask_path),
+                "particle_table_path": str(particle_table_path),
+                "threshold_method": str(config.get("threshold_method", "Triangle")),
+                "min_particle_area": float(min_size),
+                "max_particle_area": float(max_size),
+                "rolling_ball_radius": float(config.get("rolling_ball_radius", 50.0)),
+                "subtract_background": bool(config.get("subtract_background", False)),
+                "watershed": bool(config.get("watershed", False)),
+            },
+        )
+    except Exception as exc:
+        print(f"[WARN] Debris feature extraction failed for {pc_path.name}: {exc}")
+        return _empty_debris_feature_values(n_cells)
+
+    particles = _parse_debris_particle_table(particle_table_path)
+    areas = particles["areas"]
+    debris_centroids = particles["centroids"]
+    debris_count = float(len(areas))
+    debris_area_sum = float(np.sum(areas)) if len(areas) else 0.0
+    debris_area_fraction = float(debris_area_sum / background_area)
+    debris_mean_area = float(np.mean(areas)) if len(areas) else np.nan
+    debris_density = float(debris_count / background_area)
+    nearest_distances = _nearest_distances_to_debris(cell_centroids, debris_centroids)
+
+    return [
+        [
+            debris_count,
+            debris_area_fraction,
+            float(nearest_distances[idx]),
+            debris_mean_area,
+            debris_density,
+        ]
+        for idx in range(n_cells)
+    ]
+
+
+def _derived_feature_parameter_values(
+    nuc_m: dict[str, float],
+    cyto_m: dict[str, float],
+    nuc_g: dict[str, float],
+    cell_g: dict[str, float],
+) -> list[float]:
+    """Build cross-ROI parameters from ImageJ-produced measurements."""
+    dx = _safe_difference(nuc_g["x_centroid"], cell_g["x_centroid"])
+    dy = _safe_difference(nuc_g["y_centroid"], cell_g["y_centroid"])
+    whole_cell_radius = (
+        math.sqrt(cell_g["area"] / math.pi)
+        if not np.isnan(cell_g["area"]) and cell_g["area"] > 0
+        else np.nan
+    )
+    centroid_offset = (
+        _safe_divide(math.hypot(dx, dy), whole_cell_radius)
+        if not np.isnan(dx) and not np.isnan(dy)
+        else np.nan
+    )
+    return [
+        _safe_divide(nuc_m["mean"], cyto_m["mean"]),
+        _safe_divide(nuc_m["intden"], cyto_m["intden"]),
+        _safe_divide(nuc_m["raw_intden"], cyto_m["raw_intden"]),
+        _safe_difference(nuc_m["entropy"], cyto_m["entropy"]),
+        _safe_difference(nuc_m["cv"], cyto_m["cv"]),
+        centroid_offset,
+    ]
+
+
+def _halo_feature_parameter_values(
+    ij: Any,
+    signal_path: Path,
+    edge_signal_path: Path,
+    cell_mask: np.ndarray,
+    background_m: dict[str, float],
+    temp_dir: Path,
+    roi_id: int,
+) -> list[float]:
+    """Measure halo and edge feature parameters using ImageJ measurements."""
+    cell_u8 = cell_mask.astype(np.uint8)
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    inner_eroded = cv2.erode(cell_u8, kernel, iterations=2).astype(bool)
+    inner_ring = np.logical_and(cell_mask, np.logical_not(inner_eroded))
+    outer_dilated = cv2.dilate(cell_u8, kernel, iterations=2).astype(bool)
+    outer_ring = np.logical_and(outer_dilated, np.logical_not(cell_mask))
+    boundary_dilated = cv2.dilate(cell_u8, kernel, iterations=1).astype(bool)
+    boundary_eroded = cv2.erode(cell_u8, kernel, iterations=1).astype(bool)
+    boundary_ring = np.logical_and(boundary_dilated, np.logical_not(boundary_eroded))
+
+    outer_m = _measure_roi_with_imagej(
+        ij, signal_path, outer_ring, temp_dir, f"roi_{roi_id}_halo_outer"
+    )
+    inner_m = _measure_roi_with_imagej(
+        ij, signal_path, inner_ring, temp_dir, f"roi_{roi_id}_halo_inner"
+    )
+    edge_m = _measure_roi_with_imagej(
+        ij, edge_signal_path, boundary_ring, temp_dir, f"roi_{roi_id}_edge"
+    )
+
+    threshold = (
+        background_m["mean"] + 1.5 * background_m["std"]
+        if not np.isnan(background_m["mean"]) and not np.isnan(background_m["std"])
+        else np.nan
+    )
+    halo_width = np.nan
+    previous = cell_mask.copy()
+    for width in [3, 5, 7, 9, 11, 13, 15]:
+        dilated = cv2.dilate(cell_u8, kernel, iterations=width).astype(bool)
+        ring = np.logical_and(dilated, np.logical_not(previous))
+        previous = dilated
+        if not np.any(ring):
+            continue
+        ring_m = _measure_roi_with_imagej(
+            ij, signal_path, ring, temp_dir, f"roi_{roi_id}_halo_width_{width}"
+        )
+        if not np.isnan(threshold) and not np.isnan(ring_m["mean"]) and ring_m["mean"] <= threshold:
+            halo_width = float(width)
+            break
+
+    return [
+        outer_m["mean"],
+        outer_m["std"],
+        inner_m["mean"],
+        inner_m["std"],
+        _safe_abs_difference(outer_m["mean"], inner_m["mean"]),
+        halo_width,
+        edge_m["mean"],
+    ]
+
+
 def _geometry_from_imagej_measurements(m: dict[str, float]) -> dict[str, float]:
     """將 ImageJ 量測結果轉為主流程幾何欄位。
 
@@ -438,6 +1537,7 @@ def _geometry_from_imagej_measurements(m: dict[str, float]) -> dict[str, float]:
     aspect_ratio = m["ar"]
     roundness = m["round"]
     circularity = np.nan
+    eccentricity = m.get("eccentricity", np.nan)
 
     if (
         np.isnan(aspect_ratio)
@@ -450,6 +1550,14 @@ def _geometry_from_imagej_measurements(m: dict[str, float]) -> dict[str, float]:
     if np.isnan(roundness) and not np.isnan(area) and not np.isnan(major) and major > 0:
         roundness = (4 * area) / (np.pi * major**2)
 
+    if (
+        np.isnan(eccentricity)
+        and not np.isnan(major)
+        and not np.isnan(minor)
+        and major > 0
+    ):
+        eccentricity = float(np.sqrt(max(0.0, 1.0 - (minor / major) ** 2)))
+
     if not np.isnan(area) and not np.isnan(perimeter) and perimeter > 0:
         circularity = (2 * np.sqrt(np.pi * area)) / (perimeter**2)
 
@@ -461,10 +1569,13 @@ def _geometry_from_imagej_measurements(m: dict[str, float]) -> dict[str, float]:
         "feret_length": m["feret"],
         "feret_width": m["minferet"],
         "aspect_ratio": aspect_ratio,
+        "eccentricity": eccentricity,
         "roundness": roundness,
         "circularity": circularity,
         "sphericity": sphericity,
         "roughness": roughness,
+        "x_centroid": m["x_centroid"],
+        "y_centroid": m["y_centroid"],
     }
 
 
@@ -501,6 +1612,134 @@ def _parse_outline_pairs(
     return pairs
 
 
+def _parse_outline_line(line: str) -> Optional[np.ndarray]:
+    """Parse one outline line; return None for missing or malformed outlines."""
+    line = line.strip()
+    if not line or line == "-1,-1":
+        return None
+
+    try:
+        coords = list(map(int, line.split(",")))
+    except Exception:
+        return None
+
+    if len(coords) < 6 or len(coords) % 2:
+        return None
+
+    points = np.array(coords, dtype=np.int32).reshape(-1, 2)
+    if points.shape[0] < 3:
+        return None
+    return points
+
+
+def _parse_outline_pairs(
+    outlines_txt: Union[str, Path],
+    include_unpaired: bool = False,
+) -> list[tuple[int, Optional[np.ndarray], Optional[np.ndarray]]]:
+    """Parse merged outline pairs, optionally keeping nuc-only/cyto-only rows."""
+    with open(outlines_txt, "r", encoding="utf-8", errors="ignore") as f:
+        lines = [line.strip() for line in f if line.strip()]
+
+    pairs: list[tuple[int, Optional[np.ndarray], Optional[np.ndarray]]] = []
+    num_pairs = len(lines) // 2
+    for i in range(num_pairs):
+        nuc = _parse_outline_line(lines[2 * i])
+        cyto = _parse_outline_line(lines[2 * i + 1])
+        if nuc is None and cyto is None:
+            continue
+        if not include_unpaired and (nuc is None or cyto is None):
+            continue
+        pairs.append((i + 1, nuc, cyto))
+    return pairs
+
+
+def _empty_geometry() -> dict[str, float]:
+    """回傳 geometry 欄位的空值字典。"""
+    return {
+        "area": np.nan,
+        "perimeter": np.nan,
+        "convex_perimeter": np.nan,
+        "circular_diameter": np.nan,
+        "feret_length": np.nan,
+        "feret_width": np.nan,
+        "aspect_ratio": np.nan,
+        "eccentricity": np.nan,
+        "roundness": np.nan,
+        "circularity": np.nan,
+        "sphericity": np.nan,
+        "roughness": np.nan,
+        "x_centroid": np.nan,
+        "y_centroid": np.nan,
+    }
+
+
+def _outline_touches_image_edge(
+    points_xy: Optional[np.ndarray],
+    shape: tuple[int, int],
+    margin: int = 1,
+    min_edge_points: int = 2,
+) -> bool:
+    """判斷 outline 是否觸碰影像邊界。
+
+    Args:
+        points_xy (Optional[np.ndarray]): outline 座標，shape 為 `(N, 2)`。
+        shape (tuple[int, int]): 影像 `(height, width)`。
+        margin (int): 距離邊界多少 pixel 內視為切邊。
+        min_edge_points (int): 同一側至少幾個點才判定為切邊。
+
+    Returns:
+        bool: 是否觸碰影像邊界。
+    """
+    if points_xy is None or points_xy.shape[0] < 3:
+        return False
+
+    height, width = shape
+    x = points_xy[:, 0]
+    y = points_xy[:, 1]
+    side_counts = (
+        np.count_nonzero(x <= margin),
+        np.count_nonzero(y <= margin),
+        np.count_nonzero(x >= width - 1 - margin),
+        np.count_nonzero(y >= height - 1 - margin),
+    )
+    return any(count >= min_edge_points for count in side_counts)
+
+
+def _classify_outline_status(
+    nuc_xy: Optional[np.ndarray],
+    cyto_xy: Optional[np.ndarray],
+    shape: tuple[int, int],
+) -> str:
+    """依 nucleus/cytoplasm outline 完整性分類 cell_status。
+
+    Args:
+        nuc_xy (Optional[np.ndarray]): nucleus outline 座標。
+        cyto_xy (Optional[np.ndarray]): cytoplasm outline 座標。
+        shape (tuple[int, int]): 影像 `(height, width)`。
+
+    Returns:
+        str: `full_cell`、`nuc_only`、`cyto_only`、`nuc_cut`、`cyto_cut` 或 `both_cut`。
+    """
+    has_nuc = nuc_xy is not None
+    has_cyto = cyto_xy is not None
+    nuc_cut = _outline_touches_image_edge(nuc_xy, shape)
+    cyto_cut = _outline_touches_image_edge(cyto_xy, shape)
+
+    if has_nuc and not has_cyto:
+        return "nuc_cut" if nuc_cut else "nuc_only"
+    if has_cyto and not has_nuc:
+        return "cyto_only"
+    if nuc_cut and cyto_cut:
+        return "both_cut"
+    if nuc_cut:
+        return "nuc_cut"
+    if cyto_cut:
+        return "cyto_cut"
+    if has_nuc and has_cyto:
+        return "full_cell"
+    return "empty"
+
+
 def _polygon_to_mask(points_xy: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     """將 polygon 座標轉為二值遮罩。
 
@@ -515,6 +1754,267 @@ def _polygon_to_mask(points_xy: np.ndarray, shape: tuple[int, int]) -> np.ndarra
     mask = np.zeros(shape, dtype=bool)
     mask[rr, cc] = True
     return mask
+
+
+def add_outline_status_column(
+    final_csv: Union[str, Path],
+    outlines_txt: Union[str, Path],
+    img_path: Union[str, Path],
+) -> None:
+    """Append per-cell outline completeness/cut status to a final CSV."""
+    final_csv = Path(final_csv)
+    img_path = Path(img_path)
+    signal = _read_gray_float(img_path)
+    shape = signal.shape
+    status_by_cell_id = {
+        f"{img_path.stem}_{roi_id}": _classify_outline_status(nuc_xy, cyto_xy, shape)
+        for roi_id, nuc_xy, cyto_xy in _parse_outline_pairs(
+            outlines_txt, include_unpaired=True
+        )
+    }
+
+    df = pd.read_csv(final_csv)
+    df["cell_status"] = df["Cell_ID"].map(status_by_cell_id).fillna("unknown")
+    status = df.pop("cell_status")
+    df["cell_status"] = status
+    df.to_csv(final_csv, index=False)
+
+
+def _empty_extra_feature_values() -> list[float]:
+    """回傳 cell-level 額外 feature 參數的空值清單。"""
+    return [np.nan] * len(EXTRA_FEATURE_PARAMETER_COLUMNS)
+
+
+def merged_excel(input: Union[str, Path], output: Union[str, Path]):
+    """Merge nuc/cyto long-form rows into wide-form feature parameters.
+
+    ROI-specific parameters keep _nuc/_cyto suffixes. Cell-level parameters are
+    stored once without ROI suffixes to avoid empty duplicate columns.
+    """
+    df = pd.read_csv(input)
+    df["ROI_Type"] = df["Cell_ID"].apply(lambda x: x.split("_")[-1])
+    df["Cell_ID"] = df["Cell_ID"].apply(lambda x: "_".join(x.split("_")[:-1]))
+
+    nucleus_df = df[df["ROI_Type"].str.lower() == "nuc"].copy()
+    cyto_df = df[df["ROI_Type"].str.lower() == "cyto"].copy()
+
+    nucleus_df = nucleus_df.drop(columns=["ROI_Type"]).set_index("Cell_ID")
+    cyto_df = cyto_df.drop(columns=["ROI_Type"]).set_index("Cell_ID")
+
+    cell_level_cols = [
+        col
+        for col in CELL_LEVEL_FEATURE_PARAMETER_COLUMNS
+        if col in cyto_df.columns
+    ]
+    cell_level_df = cyto_df[cell_level_cols].copy() if cell_level_cols else None
+
+    nucleus_df = nucleus_df.drop(columns=CELL_LEVEL_FEATURE_PARAMETER_COLUMNS, errors="ignore")
+    cyto_df = cyto_df.drop(columns=cell_level_cols, errors="ignore")
+
+    nucleus_df = nucleus_df.add_suffix("_nuc")
+    cyto_df = cyto_df.add_suffix("_cyto")
+
+    parts = [nucleus_df, cyto_df]
+    if cell_level_df is not None:
+        parts.append(cell_level_df)
+    merged_df = pd.concat(parts, axis=1).reset_index()
+    merged_df.to_csv(output, index=False)
+
+
+def _shape_complexity_feature_values(cell_mask: np.ndarray) -> list[float]:
+    """計算 whole-cell 邊界形狀複雜度參數。
+
+    Args:
+        cell_mask (np.ndarray): whole-cell 布林遮罩。
+
+    Returns:
+        list[float]: protrusion、convex defect、fractal dimension 與 inflection 參數。
+    """
+    cell_u8 = (cell_mask.astype(np.uint8) * 255)
+    contours, _ = cv2.findContours(cell_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return [np.nan] * len(SHAPE_COMPLEXITY_FEATURE_PARAMETER_COLUMNS)
+    contour = max(contours, key=cv2.contourArea)
+    area = float(cv2.contourArea(contour))
+    if area <= 0:
+        return [np.nan] * len(SHAPE_COMPLEXITY_FEATURE_PARAMETER_COLUMNS)
+
+    protrusion_count = np.nan
+    mean_depth = np.nan
+    max_depth = np.nan
+    try:
+        hull_indices = cv2.convexHull(contour, returnPoints=False)
+        if hull_indices is not None and len(hull_indices) >= 3 and len(contour) >= 4:
+            defects = cv2.convexityDefects(contour, hull_indices)
+            protrusion_count = 0
+            if defects is not None and len(defects) > 0:
+                depths = defects[:, 0, 3].astype(np.float64) / 256.0
+                depth_threshold = max(3.0, 0.03 * math.sqrt(area / math.pi) * 2.0)
+                valid_depths = depths[depths > depth_threshold]
+                protrusion_count = int(len(valid_depths))
+                if len(valid_depths) > 0:
+                    mean_depth = float(valid_depths.mean())
+                    max_depth = float(valid_depths.max())
+    except cv2.error as exc:
+        print(f"[WARN] Convex defect features skipped for self-intersecting contour: {exc}")
+
+    boundary = cv2.morphologyEx(cell_u8, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)) > 0
+    box_sizes = np.asarray([2, 4, 8, 16, 32], dtype=int)
+    counts = []
+    height, width = boundary.shape
+    for box_size in box_sizes:
+        pad_h = (box_size - height % box_size) % box_size
+        pad_w = (box_size - width % box_size) % box_size
+        padded = np.pad(boundary, ((0, pad_h), (0, pad_w)), mode="constant")
+        blocks = padded.reshape(
+            padded.shape[0] // box_size,
+            box_size,
+            padded.shape[1] // box_size,
+            box_size,
+        )
+        counts.append(int(np.any(blocks, axis=(1, 3)).sum()))
+    valid = np.asarray(counts) > 0
+    fractal_dimension = (
+        float(np.polyfit(np.log(1.0 / box_sizes[valid]), np.log(np.asarray(counts)[valid]), 1)[0])
+        if valid.sum() >= 2
+        else np.nan
+    )
+
+    points = contour[:, 0, :].astype(np.float64)
+    if len(points) >= 8:
+        prev_points = np.roll(points, 1, axis=0)
+        next_points = np.roll(points, -1, axis=0)
+        v1 = points - prev_points
+        v2 = next_points - points
+        cross = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
+        signs = np.sign(cross)
+        nonzero = signs != 0
+        signs = signs[nonzero]
+        boundary_inflection_count = int(np.sum(signs != np.roll(signs, 1))) if len(signs) else 0
+    else:
+        boundary_inflection_count = np.nan
+
+    return [
+        float(protrusion_count) if not np.isnan(protrusion_count) else np.nan,
+        mean_depth,
+        max_depth,
+        fractal_dimension,
+        float(boundary_inflection_count) if not np.isnan(boundary_inflection_count) else np.nan,
+    ]
+
+
+def _distance_matrix(points: np.ndarray) -> np.ndarray:
+    """計算點集合的兩兩歐氏距離矩陣。"""
+    diffs = points[:, None, :] - points[None, :, :]
+    return np.sqrt(np.sum(diffs * diffs, axis=2))
+
+
+def _cluster_sizes_from_distances(distances: np.ndarray, eps: float) -> tuple[np.ndarray, float]:
+    """用距離門檻建立連通群集並回傳每點 cluster size。
+
+    Args:
+        distances (np.ndarray): 點與點之間的距離矩陣。
+        eps (float): 視為同群的距離門檻。
+
+    Returns:
+        tuple[np.ndarray, float]: 每個點所屬 cluster 大小與最大 cluster 比例。
+    """
+    n = distances.shape[0]
+    if n == 0:
+        return np.asarray([], dtype=int), np.nan
+    visited = np.zeros(n, dtype=bool)
+    cluster_sizes = np.ones(n, dtype=int)
+    largest = 1
+    for start in range(n):
+        if visited[start]:
+            continue
+        queue = [start]
+        component = []
+        visited[start] = True
+        while queue:
+            idx = queue.pop()
+            component.append(idx)
+            neighbors = np.where(distances[idx] <= eps)[0]
+            for neighbor in neighbors:
+                if neighbor == idx or visited[neighbor]:
+                    continue
+                visited[neighbor] = True
+                queue.append(int(neighbor))
+        size = len(component)
+        largest = max(largest, size)
+        for idx in component:
+            cluster_sizes[idx] = size
+    return cluster_sizes, float(largest / n)
+
+
+def _scale_0_1(value: float, low: float, high: float) -> float:
+    """將數值依指定上下界縮放到 0 到 1。"""
+    if np.isnan(value) or high <= low:
+        return np.nan
+    return float(np.clip((value - low) / (high - low), 0.0, 1.0))
+
+
+def _mitosis_feature_values(
+    cell_g: dict[str, float],
+    cyto_g: dict[str, float],
+    nuc_m: dict[str, float],
+    shape_values: list[float],
+    median_area: float,
+    nearest_neighbor: float,
+    nearest_neighbor_index: int,
+    cell_areas: np.ndarray,
+) -> list[float]:
+    """依形狀、紋理與鄰近關係計算 mitosis proxy 參數。
+
+    Args:
+        cell_g (dict[str, float]): whole-cell 幾何量測結果。
+        cyto_g (dict[str, float]): cytoplasm 幾何量測結果。
+        nuc_m (dict[str, float]): nucleus ImageJ 強度量測結果。
+        shape_values (list[float]): shape complexity 參數。
+        median_area (float): 同張影像 whole-cell 面積中位數。
+        nearest_neighbor (float): 最近鄰細胞距離。
+        nearest_neighbor_index (int): 最近鄰細胞索引。
+        cell_areas (np.ndarray): 全影像 cell area 陣列。
+
+    Returns:
+        list[float]: `Mitotic Score`、`Daughter Pair Flag`、`Protrusion Retraction Score`。
+    """
+    area = cell_g["area"]
+    circularity = cyto_g["sphericity"]
+    area_norm = _safe_divide(area, median_area)
+    small_area_score = 1.0 - _scale_0_1(area_norm, 0.5, 1.2) if not np.isnan(area_norm) else np.nan
+    round_score = _scale_0_1(circularity, 0.65, 0.95)
+    uniform_texture_score = 1.0 - _scale_0_1(nuc_m["entropy"], 4.0, 7.0)
+    valid_score_parts = [
+        value
+        for value in [round_score, small_area_score, uniform_texture_score]
+        if not np.isnan(value)
+    ]
+    mitotic_score = float(np.mean(valid_score_parts)) if valid_score_parts else np.nan
+
+    daughter_pair_flag = 0.0
+    if (
+        nearest_neighbor_index >= 0
+        and not np.isnan(nearest_neighbor)
+        and not np.isnan(median_area)
+        and median_area > 0
+    ):
+        mean_diameter = 2.0 * math.sqrt(median_area / math.pi)
+        neighbor_area = cell_areas[nearest_neighbor_index]
+        area_delta = abs(area - neighbor_area) / max((area + neighbor_area) / 2.0, 1e-12)
+        if nearest_neighbor < 0.5 * mean_diameter and area_delta < 0.25:
+            daughter_pair_flag = 1.0
+
+    protrusion_count = shape_values[0]
+    protrusion_score = 1.0 - _scale_0_1(protrusion_count, 0.0, 6.0)
+    retraction_parts = [
+        value
+        for value in [round_score, small_area_score, protrusion_score]
+        if not np.isnan(value)
+    ]
+    protrusion_retraction_score = float(np.mean(retraction_parts)) if retraction_parts else np.nan
+
+    return [mitotic_score, daughter_pair_flag, protrusion_retraction_score]
 
 
 # ===============================
@@ -557,31 +2057,156 @@ def param_anal(img_path, outlines_txt, output_csv):
     if not img_path.exists():
         raise FileNotFoundError(f"找不到影像：{img_path}")
 
-    signal = imread(img_path, as_gray=True).astype(np.float32)
+    signal = _read_gray_float(img_path)
     shape = signal.shape
     ij = _get_pyimagej()
-    pairs = _parse_outline_pairs(outlines_txt)
+    pairs = _parse_outline_pairs(outlines_txt, include_unpaired=True)
     rows: list[list[float | str]] = []
 
     with tempfile.TemporaryDirectory(prefix="pyimagej_param_") as tmp:
         tmp_dir = Path(tmp)
         signal_path = tmp_dir / f"{img_path.stem}_pc_signal.tif"
         tifffile.imwrite(signal_path, signal)
+        edge_signal_path = _make_edge_signal_with_imagej(ij, signal_path, tmp_dir)
 
+        mask_records: list[dict[str, Any]] = []
+        cell_union_mask = np.zeros(shape, dtype=bool)
         for roi_id, nuc_xy, cyto_xy in pairs:
-            nuc_mask = _polygon_to_mask(nuc_xy, shape)
-            cyto_raw_mask = _polygon_to_mask(cyto_xy, shape)
-            cyto_mask = np.logical_and(cyto_raw_mask, np.logical_not(nuc_mask))
+            nuc_mask = np.zeros(shape, dtype=bool)
+            cell_mask = np.zeros(shape, dtype=bool)
+            cyto_mask = np.zeros(shape, dtype=bool)
 
-            nuc_m = _measure_roi_with_imagej(
-                ij, signal_path, nuc_mask, tmp_dir, f"roi_{roi_id}_nuc"
+            if nuc_xy is not None:
+                nuc_mask = _polygon_to_mask(nuc_xy, shape)
+            if cyto_xy is not None:
+                cell_mask = _polygon_to_mask(cyto_xy, shape)
+
+            has_nuc = bool(np.any(nuc_mask))
+            has_cyto = bool(np.any(cell_mask))
+            if has_cyto:
+                cyto_mask = (
+                    np.logical_and(cell_mask, np.logical_not(nuc_mask))
+                    if has_nuc
+                    else cell_mask.copy()
+                )
+
+            if not has_nuc and not has_cyto:
+                continue
+
+            reference_mask = cell_mask if has_cyto else nuc_mask
+            cell_union_mask |= reference_mask
+            mask_records.append(
+                {
+                    "roi_id": roi_id,
+                    "nuc_mask": nuc_mask,
+                    "cyto_mask": cyto_mask,
+                    "cell_mask": cell_mask,
+                    "reference_mask": reference_mask,
+                    "has_nuc": has_nuc,
+                    "has_cyto": has_cyto,
+                }
             )
-            cyto_m = _measure_roi_with_imagej(
-                ij, signal_path, cyto_mask, tmp_dir, f"roi_{roi_id}_cyto"
+
+        background_mask = np.logical_not(cell_union_mask)
+        background_m = _measure_roi_with_imagej(
+            ij, signal_path, background_mask, tmp_dir, "image_background"
+        )
+
+        cell_records: list[dict[str, Any]] = []
+        for record in mask_records:
+            roi_id = int(record["roi_id"])
+            nuc_mask = record["nuc_mask"]
+            cyto_mask = record["cyto_mask"]
+            cell_mask = record["cell_mask"]
+            reference_mask = record["reference_mask"]
+            has_nuc = bool(record["has_nuc"])
+            has_cyto = bool(record["has_cyto"])
+            has_cyto_roi = has_cyto and bool(np.any(cyto_mask))
+
+            nuc_m = (
+                _measure_roi_with_imagej(
+                    ij, signal_path, nuc_mask, tmp_dir, f"roi_{roi_id}_nuc"
+                )
+                if has_nuc
+                else _empty_imagej_measurements()
+            )
+            cyto_m = (
+                _measure_roi_with_imagej(
+                    ij, signal_path, cyto_mask, tmp_dir, f"roi_{roi_id}_cyto"
+                )
+                if has_cyto_roi
+                else _empty_imagej_measurements()
+            )
+            cell_m = (
+                _measure_roi_with_imagej(
+                    ij, signal_path, reference_mask, tmp_dir, f"roi_{roi_id}_cell"
+                )
+                if bool(np.any(reference_mask))
+                else _empty_imagej_measurements()
             )
 
             nuc_g = _geometry_from_imagej_measurements(nuc_m)
             cyto_g = _geometry_from_imagej_measurements(cyto_m)
+            cell_g = _geometry_from_imagej_measurements(cell_m)
+            nuc_intensity_features = (
+                _intensity_feature_parameter_values(nuc_m)
+                if has_nuc
+                else _intensity_feature_parameter_values(_empty_imagej_measurements())
+            )
+            cyto_intensity_features = (
+                _intensity_feature_parameter_values(cyto_m)
+                if has_cyto_roi
+                else _intensity_feature_parameter_values(_empty_imagej_measurements())
+            )
+            nuc_texture_features = (
+                _texture_feature_parameter_values(ij, signal, nuc_mask, erode_px=1)
+                + _lbp_feature_parameter_values(
+                    ij,
+                    signal,
+                    nuc_mask,
+                    erode_px=1,
+                    temp_dir=tmp_dir,
+                    slot=f"roi_{roi_id}_nuc",
+                )
+                if has_nuc
+                else _empty_texture_feature_values()
+            )
+            cyto_texture_features = (
+                _texture_feature_parameter_values(ij, signal, cyto_mask, erode_px=2)
+                + _lbp_feature_parameter_values(
+                    ij,
+                    signal,
+                    cyto_mask,
+                    erode_px=2,
+                    temp_dir=tmp_dir,
+                    slot=f"roi_{roi_id}_cyto",
+                )
+                if has_cyto_roi
+                else _empty_texture_feature_values()
+            )
+            derived_values = (
+                _derived_feature_parameter_values(nuc_m, cyto_m, nuc_g, cell_g)
+                if has_nuc and has_cyto_roi
+                else [np.nan] * len(DERIVED_FEATURE_PARAMETER_COLUMNS)
+            )
+            halo_values = (
+                _halo_feature_parameter_values(
+                    ij,
+                    signal_path,
+                    edge_signal_path,
+                    cell_mask,
+                    background_m,
+                    tmp_dir,
+                    roi_id,
+                )
+                if has_cyto
+                else [np.nan] * len(HALO_FEATURE_PARAMETER_COLUMNS)
+            )
+            shape_values = (
+                _shape_complexity_feature_values(cell_mask)
+                if has_cyto
+                else [np.nan] * len(SHAPE_COMPLEXITY_FEATURE_PARAMETER_COLUMNS)
+            )
 
             karyoplasmic_ratio = np.nan
             if (
@@ -593,40 +2218,174 @@ def param_anal(img_path, outlines_txt, output_csv):
                 # biological interpretation of a nucleocytoplasmic ratio.
                 karyoplasmic_ratio = float(nuc_g["area"] / cyto_g["area"])
 
-            rows.append(
-                [
-                    f"{img_path.stem}_{roi_id}_nuc",
-                    nuc_g["area"],
-                    nuc_g["perimeter"],
-                    nuc_g["convex_perimeter"],
-                    nuc_g["circular_diameter"],
-                    nuc_g["feret_length"],
-                    nuc_g["feret_width"],
-                    nuc_g["aspect_ratio"],
-                    nuc_g["roundness"],
-                    nuc_g["circularity"],
-                    nuc_g["sphericity"],
-                    nuc_g["roughness"],
-                    np.nan,
-                ]
+            cell_records.append(
+                {
+                    "roi_id": roi_id,
+                    "nuc_g": nuc_g,
+                    "cyto_g": cyto_g,
+                    "cell_g": cell_g,
+                    "nuc_m": nuc_m,
+                    "nuc_intensity_features": nuc_intensity_features,
+                    "cyto_intensity_features": cyto_intensity_features,
+                    "nuc_texture_features": nuc_texture_features,
+                    "cyto_texture_features": cyto_texture_features,
+                    "derived_values": derived_values,
+                    "halo_values": halo_values,
+                    "shape_values": shape_values,
+                    "karyoplasmic_ratio": karyoplasmic_ratio,
+                    "has_nuc": has_nuc,
+                    "has_cyto": has_cyto,
+                }
             )
-            rows.append(
-                [
-                    f"{img_path.stem}_{roi_id}_cyto",
-                    cyto_g["area"],
-                    cyto_g["perimeter"],
-                    cyto_g["convex_perimeter"],
-                    cyto_g["circular_diameter"],
-                    cyto_g["feret_length"],
-                    cyto_g["feret_width"],
-                    cyto_g["aspect_ratio"],
-                    cyto_g["roundness"],
-                    cyto_g["circularity"],
-                    cyto_g["sphericity"],
-                    cyto_g["roughness"],
-                    karyoplasmic_ratio,
-                ]
+
+        cell_areas = np.asarray([r["cell_g"]["area"] for r in cell_records], dtype=np.float64)
+        cell_circularities = np.asarray([r["cyto_g"]["sphericity"] for r in cell_records], dtype=np.float64)
+        centroids = np.asarray(
+            [
+                [r["cell_g"]["x_centroid"], r["cell_g"]["y_centroid"]]
+                for r in cell_records
+            ],
+            dtype=np.float64,
+        )
+        valid_centroids = np.isfinite(centroids).all(axis=1) if len(centroids) else np.asarray([], dtype=bool)
+        median_area = float(np.nanmedian(cell_areas)) if len(cell_areas) else np.nan
+        nucleus_areas = np.asarray([r["nuc_g"]["area"] for r in cell_records], dtype=np.float64)
+        median_nucleus_area = (
+            float(np.nanmedian(nucleus_areas)) if len(nucleus_areas) else np.nan
+        )
+        median_diameter = (
+            2.0 * math.sqrt(median_area / math.pi)
+            if not np.isnan(median_area) and median_area > 0
+            else np.nan
+        )
+        image_confluency = (
+            float(np.nansum(cell_areas) / (shape[0] * shape[1]))
+            if shape[0] > 0 and shape[1] > 0
+            else np.nan
+        )
+        population_area_cv = _safe_cv(cell_areas)
+        population_circularity_cv = _safe_cv(cell_circularities)
+
+        nearest_distances = np.full(len(cell_records), np.nan, dtype=np.float64)
+        nearest_indices = np.full(len(cell_records), -1, dtype=int)
+        local_counts = np.zeros(len(cell_records), dtype=int)
+        cluster_sizes = np.ones(len(cell_records), dtype=int)
+        largest_cluster_ratio = np.nan
+        if len(cell_records) >= 2 and valid_centroids.sum() >= 2:
+            valid_indices = np.where(valid_centroids)[0]
+            valid_points = centroids[valid_indices]
+            distances = _distance_matrix(valid_points)
+            np.fill_diagonal(distances, np.inf)
+            valid_nearest_local = np.argmin(distances, axis=1)
+            nearest_distances[valid_indices] = distances[np.arange(len(valid_indices)), valid_nearest_local]
+            nearest_indices[valid_indices] = valid_indices[valid_nearest_local]
+            if not np.isnan(median_diameter):
+                radius = 2.0 * median_diameter
+                local_counts[valid_indices] = (distances <= radius).sum(axis=1)
+                valid_cluster_sizes, largest_cluster_ratio = _cluster_sizes_from_distances(
+                    distances,
+                    eps=2.5 * median_diameter,
+                )
+                cluster_sizes[valid_indices] = valid_cluster_sizes
+
+        debris_values_by_cell = _debris_feature_values_for_cells(
+            ij=ij,
+            pc_path=img_path,
+            cell_union_mask=cell_union_mask,
+            cell_centroids=centroids,
+            median_nucleus_area=median_nucleus_area,
+            temp_dir=tmp_dir,
+        )
+
+        for idx, record in enumerate(cell_records):
+            nuc_g = record["nuc_g"]
+            cyto_g = record["cyto_g"]
+            cell_g = record["cell_g"]
+            nn_distance = float(nearest_distances[idx])
+            nn_distance_norm = _safe_divide(nn_distance, median_diameter)
+            local_density = (
+                _safe_divide(float(local_counts[idx]), math.pi * (2.0 * median_diameter) ** 2)
+                if not np.isnan(median_diameter)
+                else np.nan
             )
+            cluster_size = float(cluster_sizes[idx])
+            cluster_size_norm = _safe_divide(cluster_size, float(len(cell_records)))
+            population_values = [
+                image_confluency,
+                population_area_cv,
+                population_circularity_cv,
+                nn_distance,
+                nn_distance_norm,
+                float(local_counts[idx]),
+                local_density,
+                cluster_size,
+                cluster_size_norm,
+                largest_cluster_ratio,
+            ]
+            mitosis_values = _mitosis_feature_values(
+                cell_g=cell_g,
+                cyto_g=cyto_g,
+                nuc_m=record["nuc_m"],
+                shape_values=record["shape_values"],
+                median_area=median_area,
+                nearest_neighbor=nn_distance,
+                nearest_neighbor_index=int(nearest_indices[idx]),
+                cell_areas=cell_areas,
+            )
+            extra_values = (
+                record["derived_values"]
+                + record["halo_values"]
+                + population_values
+                + record["shape_values"]
+                + debris_values_by_cell[idx]
+                + mitosis_values
+            )
+
+            roi_id = int(record["roi_id"])
+            if record["has_nuc"]:
+                rows.append(
+                    [
+                        f"{img_path.stem}_{roi_id}_nuc",
+                        nuc_g["area"],
+                        nuc_g["perimeter"],
+                        nuc_g["convex_perimeter"],
+                        nuc_g["circular_diameter"],
+                        nuc_g["feret_length"],
+                        nuc_g["feret_width"],
+                        nuc_g["aspect_ratio"],
+                        nuc_g["eccentricity"],
+                        nuc_g["roundness"],
+                        nuc_g["circularity"],
+                        nuc_g["sphericity"],
+                        nuc_g["roughness"],
+                        np.nan,
+                        *record["nuc_intensity_features"],
+                        *record["nuc_texture_features"],
+                        *_empty_extra_feature_values(),
+                    ]
+                )
+            if record["has_cyto"]:
+                rows.append(
+                    [
+                        f"{img_path.stem}_{roi_id}_cyto",
+                        cyto_g["area"],
+                        cyto_g["perimeter"],
+                        cyto_g["convex_perimeter"],
+                        cyto_g["circular_diameter"],
+                        cyto_g["feret_length"],
+                        cyto_g["feret_width"],
+                        cyto_g["aspect_ratio"],
+                        cyto_g["eccentricity"],
+                        cyto_g["roundness"],
+                        cyto_g["circularity"],
+                        cyto_g["sphericity"],
+                        cyto_g["roughness"],
+                        record["karyoplasmic_ratio"],
+                        *record["cyto_intensity_features"],
+                        *record["cyto_texture_features"],
+                        *extra_values,
+                    ]
+                )
 
     df = pd.DataFrame(
         rows,
@@ -639,11 +2398,15 @@ def param_anal(img_path, outlines_txt, output_csv):
             "Feret Length",
             "Feret Width",
             "Aspect Ratio",
+            "Eccentricity",
             "Roundness",
             "Circularity",
             "Sphericity",
             "Roughness",
             "Karyoplasmic Ratio",
+            *INTENSITY_FEATURE_PARAMETER_COLUMNS,
+            *TEXTURE_FEATURE_PARAMETER_COLUMNS,
+            *EXTRA_FEATURE_PARAMETER_COLUMNS,
         ],
     )
     df.to_csv(output_csv, index=False)
@@ -670,7 +2433,7 @@ def flour_anal(
     if not img_path.exists():
         raise FileNotFoundError(f"找不到影像：{img_path}")
 
-    signal = imread(img_path, as_gray=True).astype(np.float32)
+    signal = _read_gray_float(img_path)
     h, w = signal.shape
     ij = _get_pyimagej()
     signal_bgsub = _preprocess_signal_with_imagej(ij, signal, rolling_ball_radius=50.0)
@@ -742,7 +2505,7 @@ def ido_anal(img_path, outlines_txt, output_csv):
     if not img_path.exists():
         raise FileNotFoundError(f"?曆??啣蔣??{img_path}")
 
-    signal = imread(img_path, as_gray=True).astype(np.float32)
+    signal = _read_gray_float(img_path)
     shape = signal.shape
     pairs = _parse_outline_pairs(outlines_txt)
 
@@ -912,13 +2675,16 @@ def _ki67_binarize_pyimagej(
     """
 
     ij = _get_pyimagej()
+    img_path = Path(img_path).resolve()
+    out_path = Path(out_path).resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     if out_path.exists():
         out_path.unlink()
 
     particle_options = f"size={int(max(0, min_obj_area))}-Infinity show=Masks clear"
     args = {
-        "input_path": str(img_path),
-        "binary_path": str(out_path),
+        "input_path": img_path.as_posix(),
+        "binary_path": out_path.as_posix(),
         "particle_options": particle_options,
     }
     _run_macro_quiet(ij, _KI67_IMAGEJ_MACRO, args=args)
@@ -1009,7 +2775,7 @@ def detect_ki67_positive(
         print(f"[WARN] 找不到 Ki67 mask: {ki67_dir}")
         return
 
-    ki67_mask = skio.imread(str(ki67_dir)) > 0
+    ki67_mask = _read_binary_mask(ki67_dir)
     positive_labels = _ki67_positive_labels_from_mask(roi_dir, ki67_mask, threshold)
     np.savetxt(output_dir, positive_labels, fmt="%d")
     print(f"[INFO] 已輸出 Ki67 陽性 label: {output_dir}")
@@ -1048,7 +2814,7 @@ def _score_ki67_mask_for_outline(
     if not roi_dir.exists() or not ki67_mask_path.exists():
         return 0, 0, 0.0
 
-    ki67_mask = skio.imread(str(ki67_mask_path)) > 0
+    ki67_mask = _read_binary_mask(ki67_mask_path)
     shape = ki67_mask.shape
     with open(roi_dir) as f:
         lines = [line.strip() for line in f if line.strip()]
@@ -1198,7 +2964,17 @@ def merge_ki67_labels(param_csv: Path, label_file: Path, output_csv: Path):
         positive_labels = [int(positive_labels)]
     positive_groups = set((label - 1) // 2 for label in positive_labels)
 
-    df["ki67_positive"] = [1 if idx in positive_groups else 0 for idx in df.index]
+    def cell_outline_group(cell_id: object) -> Optional[int]:
+        """由 Cell_ID 解析 merged outline 的 0-based group index。"""
+        try:
+            return int(str(cell_id).rsplit("_", 1)[1]) - 1
+        except Exception:
+            return None
+
+    df["ki67_positive"] = [
+        1 if cell_outline_group(cell_id) in positive_groups else 0
+        for cell_id in df["Cell_ID"]
+    ]
     df.to_csv(output_csv, index=False)
     print(f"[INFO] 已合併 Ki67 標記 → {output_csv}")
 
@@ -1248,6 +3024,7 @@ def run_all(
         print("[警告] 已啟用螢光分析，但未找到 DF 或 LT 資料夾；僅輸出幾何參數。")
 
     def get_image_names(folder: Path) -> list[str]:
+        """列出資料夾內支援的影像檔名。"""
         if not folder.exists() or not folder.is_dir():
             return []
         return [f.name for f in list_files(folder, [".jpg", ".png", ".tif", ".tiff"])]
@@ -1268,6 +3045,7 @@ def run_all(
     max_len = max(counts) if counts else 0
 
     def safe_get(items: list[str], idx: int) -> str:
+        """安全取得清單元素，索引超出時回傳空字串。"""
         return items[idx] if idx < len(items) else ""
 
     rows = []
@@ -1421,6 +3199,8 @@ def run_all(
                 detect_ki67_positive(outlines_txt, ki67_mask, ki67_label)
                 merge_ki67_labels(final_csv, ki67_label, final_csv)
                 print(f"[INFO] Ki67 merged into: {final_csv}")
+
+        add_outline_status_column(final_csv, outlines_txt, pc_img)
 
     merge_all_final_csvs(data_path)
 

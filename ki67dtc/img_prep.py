@@ -64,6 +64,14 @@ def segment(
 
 
 def _last_numeric_token(stem: str) -> int | None:
+    """取出檔名 stem 中最後一段數字。
+
+    Args:
+        stem (str): 不含副檔名的檔名。
+
+    Returns:
+        int | None: 最後一段數字；若沒有數字則回傳 `None`。
+    """
     match = re.search(r"(\d+)(?!.*\d)", stem)
     return int(match.group(1)) if match else None
 
@@ -82,9 +90,9 @@ def _label_centroids(mask: np.ndarray) -> np.ndarray:
     if valid.size == 0:
         return np.empty((0, 2), dtype=np.float32)
 
-    return np.column_stack((sum_x[valid] / counts[valid], sum_y[valid] / counts[valid])).astype(
-        np.float32
-    )
+    return np.column_stack(
+        (sum_x[valid] / counts[valid], sum_y[valid] / counts[valid])
+    ).astype(np.float32)
 
 
 def _score_nuc_centers_in_cyto(
@@ -126,7 +134,10 @@ def _linear_assignment(score_matrix: np.ndarray) -> list[tuple[int, int]]:
             pairs.append((int(row), int(col)))
             used_rows.add(int(row))
             used_cols.add(int(col))
-            if len(used_rows) == score_matrix.shape[0] or len(used_cols) == score_matrix.shape[1]:
+            if (
+                len(used_rows) == score_matrix.shape[0]
+                or len(used_cols) == score_matrix.shape[1]
+            ):
                 break
         return pairs
 
@@ -172,7 +183,9 @@ def remap_nuc_segments_to_cyto(
     if len(valid_cyto_stems) < 2 or len(valid_nuc_stems) < 2:
         return {}
 
-    score_matrix = np.zeros((len(valid_cyto_stems), len(valid_nuc_stems)), dtype=np.float32)
+    score_matrix = np.zeros(
+        (len(valid_cyto_stems), len(valid_nuc_stems)), dtype=np.float32
+    )
     inside_counts = np.zeros_like(score_matrix, dtype=np.int32)
     total_counts = np.zeros_like(score_matrix, dtype=np.int32)
     for row, cyto_mask in enumerate(cyto_masks):
@@ -194,7 +207,9 @@ def remap_nuc_segments_to_cyto(
     ]
     identity_score = float(sum(score_matrix[row, col] for row, col in identity_pairs))
 
-    changed = any(valid_cyto_stems[row] != valid_nuc_stems[col] for row, col in assignment)
+    changed = any(
+        valid_cyto_stems[row] != valid_nuc_stems[col] for row, col in assignment
+    )
     if not changed:
         print("[INFO] DAPI nucleus masks match PC filenames; no remap needed.")
         return {}
@@ -324,7 +339,9 @@ def segment_all(input_dir: str, nuc_source: str = "dapi", dapi_dir_name: str = "
             dapi_output_stems.append(pc.stem)
 
     if fallback_pc_count > 0:
-        print(f"[WARN] 有 {fallback_pc_count} 張 PC 找不到對應 DAPI，該些影像的細胞核仍使用 PC。")
+        print(
+            f"[WARN] 有 {fallback_pc_count} 張 PC 找不到對應 DAPI，該些影像的細胞核仍使用 PC。"
+        )
 
     if dapi_nuc_img_files:
         segment(
@@ -346,6 +363,7 @@ def segment_all(input_dir: str, nuc_source: str = "dapi", dapi_dir_name: str = "
             output_stems=fallback_pc_output_stems,
             channels=(0, 0),
         )
+
 
 # ===============================
 # Mask 轉換為 outlines
@@ -493,4 +511,3 @@ def combined(input_dir: str):
         match_and_write(cyto_lines, nuc_lines, cyto_mask, nuc_mask, out_path)
 
     remove_temp_files(outline_dir)
-

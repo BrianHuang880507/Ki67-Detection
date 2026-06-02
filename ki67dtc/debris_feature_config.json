@@ -1,0 +1,12 @@
+{
+  "threshold_method": "Triangle",
+  "min_size_px": 5,
+  "max_size_fraction_of_median_nucleus_area": 0.08,
+  "cell_dilate_px": 3,
+  "subtract_background": false,
+  "rolling_ball_radius": 50.0,
+  "watershed": false,
+  "generated_by": "scripts/calibrate_debris_thresholds.py",
+  "generated_at": "2026-06-02T13:42:20",
+  "source_summary": "D:\\Project\\Ki67-Detection\\data\\output\\debris_calibration\\debris_calibration_summary.csv"
+}

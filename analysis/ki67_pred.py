@@ -141,6 +141,14 @@ def add_image_count_diagnostics(
 
 
 def answer_path_candidates(cleaned_csv_path: Path) -> list[Path]:
+    """產生 cleaned CSV 對應的人工答案檔候選路徑。
+
+    Args:
+        cleaned_csv_path (Path): 單一資料集的 `*_cleaned.csv` 路徑。
+
+    Returns:
+        list[Path]: 依優先順序排列且不重複的答案檔候選路徑。
+    """
     candidates = []
     if cleaned_csv_path.name.endswith("_cleaned.csv"):
         candidates.append(
@@ -162,6 +170,14 @@ def answer_path_candidates(cleaned_csv_path: Path) -> list[Path]:
 
 
 def pick_ground_truth_column(columns: pd.Index) -> str | None:
+    """從答案表欄位中挑選 Ki67 標籤欄位。
+
+    Args:
+        columns (pd.Index): 答案表的欄位索引。
+
+    Returns:
+        str | None: 找到的標籤欄位名稱；找不到時回傳 `None`。
+    """
     column_lookup = {str(column).strip().lower(): str(column) for column in columns}
     for candidate in LABEL_CANDIDATES:
         found = column_lookup.get(str(candidate).strip().lower())
@@ -171,6 +187,14 @@ def pick_ground_truth_column(columns: pd.Index) -> str | None:
 
 
 def load_answer_labels(csv_files: list[Path]) -> pd.DataFrame:
+    """讀取多個 cleaned CSV 對應的人工答案標籤。
+
+    Args:
+        csv_files (list[Path]): 預測輸入的 cleaned CSV 檔案清單。
+
+    Returns:
+        pd.DataFrame: 包含 `source_file`、`_source_row_id` 與答案標籤的表格。
+    """
     frames = []
     for csv_path in csv_files:
         answer_path = next(
@@ -211,6 +235,15 @@ def attach_ground_truth_from_answers(
     predict_df: pd.DataFrame,
     csv_files: list[Path],
 ) -> pd.DataFrame:
+    """將人工答案標籤合併回 cell-level 預測資料。
+
+    Args:
+        predict_df (pd.DataFrame): 模型預測前後的 cell-level 資料表。
+        csv_files (list[Path]): 與資料列來源對應的 cleaned CSV 清單。
+
+    Returns:
+        pd.DataFrame: 補上 `ki67_ground_truth` 的預測資料表。
+    """
     work_df = predict_df.copy()
     work_df["_source_row_id"] = work_df.groupby("source_file", sort=False).cumcount()
 
@@ -246,6 +279,14 @@ def attach_ground_truth_from_answers(
 
 
 def build_cell_prediction_output(predict_df: pd.DataFrame) -> pd.DataFrame:
+    """建立 cell-level 預測輸出表。
+
+    Args:
+        predict_df (pd.DataFrame): 含 `cell_prob` 與 ground truth 的預測資料。
+
+    Returns:
+        pd.DataFrame: 只保留報表需要欄位的 cell-level 預測表。
+    """
     cell_df = predict_df.copy()
     cell_df["predicted_ki67_positive"] = (
         cell_df["cell_prob"] >= PREDICTION_THRESHOLD
@@ -265,6 +306,14 @@ def build_cell_prediction_output(predict_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_image_prediction_output(image_df: pd.DataFrame) -> pd.DataFrame:
+    """建立 image-level 預測輸出表。
+
+    Args:
+        image_df (pd.DataFrame): 以影像彙總後的預測資料。
+
+    Returns:
+        pd.DataFrame: 移除內部欄位並補上誤差欄位的影像預測表。
+    """
     image_output_df = image_df.copy()
     if "true_ratio" in image_output_df.columns:
         image_output_df["answer_ratio"] = image_output_df["true_ratio"]
@@ -282,6 +331,14 @@ def build_image_prediction_output(image_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_folder_vs_answer_output(folder_df: pd.DataFrame) -> pd.DataFrame:
+    """建立資料夾層級 prediction-vs-answer 比對表。
+
+    Args:
+        folder_df (pd.DataFrame): 以資料夾彙總的預測比例與答案比例。
+
+    Returns:
+        pd.DataFrame: 固定欄位順序的資料夾層級比對表。
+    """
     folder_output_df = folder_df.copy()
     if "true_ratio" in folder_output_df.columns:
         folder_output_df["answer_ratio"] = folder_output_df["true_ratio"]
@@ -310,6 +367,16 @@ def save_prediction_workbooks(
     image_output_df: pd.DataFrame,
     cell_output_df: pd.DataFrame,
 ) -> list[Path]:
+    """依資料夾輸出 prediction Excel 工作簿。
+
+    Args:
+        folder_output_df (pd.DataFrame): 資料夾層級 prediction-vs-answer 表。
+        image_output_df (pd.DataFrame): 影像層級預測表。
+        cell_output_df (pd.DataFrame): 細胞層級預測表。
+
+    Returns:
+        list[Path]: 已輸出的 Excel 工作簿路徑清單。
+    """
     workbook_paths = []
     source_folders = sorted(
         image_output_df["source_folder"].dropna().astype(str).unique()
