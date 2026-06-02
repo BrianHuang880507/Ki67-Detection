@@ -1,10 +1,12 @@
 # Ki67 Detection
 
-Ki67 Detection是一套自動化細胞影像分析系統，用於細胞分割、輪廓合併、形態與螢光特徵量測，以及無染色 Ki67 陽性比例預測，降低人工圈選與統計多通道影像的重複成本。
+Ki67 Detection是一套自動化細胞影像分析系統，用於細胞分割、形態/螢光特徵分析，以及無染色 Ki67 預測，降低人工圈選失誤與細胞染色成本。
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![Cellpose](https://img.shields.io/badge/Cellpose-3.1.1.1-purple)
 ![授權狀態](https://img.shields.io/badge/%E6%8E%88%E6%AC%8A-%E5%B0%9A%E6%9C%AA%E6%8C%87%E5%AE%9A-lightgrey)
+
+---
 
 ## 目錄
 
@@ -12,30 +14,27 @@ Ki67 Detection是一套自動化細胞影像分析系統，用於細胞分割、
 - [功能特色](#功能特色)
 - [環境需求](#環境需求)
 - [安裝步驟](#安裝步驟)
+- [專案架構](#專案架構)
 - [使用方式](#使用方式)
 - [常見問題](#常見問題)
 - [貢獻指南](#貢獻指南)
 - [授權條款](#授權條款)
 
+---
+
 ## 專案簡介
 
-本專案整合 Cellpose、PyImageJ、OpenCV、scikit-learn、LightGBM、XGBoost 與 PyQt6，將 Ki67 細胞影像分析拆成可重複執行的流程：
+本專案將細胞影像分析拆成可重複執行的流程：
 
-1. 使用 PC 影像分割細胞質，並可使用 DAPI 或 PC 影像分割細胞核。
+1. 使用 Phase Contrast 影像分割細胞質/細胞核。
 2. 將 Cellpose `*_seg.npy` 轉成輪廓文字檔，合併細胞核與細胞質 ROI。
 3. 量測細胞形態、細胞核/細胞質幾何參數與螢光強度。
 4. 產生 Ki67 二值化遮罩與細胞層級 `ki67_positive` 標記。
-5. 以已訓練模型輸出細胞、影像、資料夾層級的 Ki67 預測結果與報表。
+5. 以已訓練模型輸出細胞、影像、資料夾層級的 Ki67 預測結果與報表。(開發中)
 
-主要入口包含命令列管線 `main.py`、圖形介面 `app.py`、批次處理腳本 `scripts/run_all_data_input.py`，以及模型訓練與推論腳本 `analysis/ki67_pred_training.py`、`analysis/ki67_pred.py`。
+**本專案目前只適用於MSC**
 
-## 功能特色
-
-- **細胞影像分析**：一步完成影像分割、遮罩轉輪廓、細胞核/細胞質合併、幾何量測與螢光量測。
-
-- **無染色 Ki67 判斷**：支援 `pyimagej` 與 `opencv` 後端產生 Ki67 二值化遮罩，並以細胞核 ROI 重疊比例標記陽性細胞。
-
-- **圖形介面操作**：提供 GUI 視窗介面，可執行管線、瀏覽影像與檢視 cleaned CSV。
+---
 
 ## 環境需求
 
@@ -47,6 +46,8 @@ Ki67 Detection是一套自動化細胞影像分析系統，用於細胞分割、
 - 影像資料放在 `data/input/<資料集>/`
 
 主要 Python 套件列在 [requirements.txt](requirements.txt)。圖形介面入口使用 PyQt6；若環境尚未安裝，請另外安裝 `PyQt6`。
+
+---
 
 ## 安裝步驟
 
@@ -73,22 +74,75 @@ pip install PyQt6
 
 若使用既有 Fiji 安裝，可設定 `FIJI_APP_PATH` 指向 Fiji 應用程式路徑；若未設定，程式會嘗試透過 PyImageJ 初始化 Fiji。
 
-## 使用方式
+---
 
-### 輸入資料夾格式
+## 專案架構
 
-`PC/` 為必要資料夾；`DAPI/`、`IDO/`、`DF/`、`LT/`、`KI67/` 依分析需求提供。
+資料集請放在 `data/input/<資料集>/`，其中 `PC/` 為必要資料夾；`DAPI/`、`IDO/`、`DF/`、`LT/`、`KI67/` 依分析需求提供。分析後的中間檔、CSV 與視覺化結果會輸出到 `data/output/` 對應子資料夾。
+
+Ki67 特徵與特徵參數定義請見 [ki67dtc/feature_param.md](ki67dtc/feature_param.md)。
 
 ```text
-data/
-  input/
-    example_data/
-      PC/
-      DAPI/
-      IDO/
-      KI67/
-  output/
+Ki67-Detection/
+├── main.py                          # 命令列分析管線入口
+├── app.py                           # 圖形介面入口
+├── requirements.txt                 # Python 相依套件
+├── model/                           # Cellpose 分割模型
+├── data/
+│   ├── input/
+│   │   └── <資料集>/
+│   │       ├── PC/                  # 必要；Phase Contrast 影像
+│   │       ├── DAPI/                # 選用；細胞核螢光影像
+│   │       ├── IDO/                 # 選用；螢光通道
+│   │       ├── DF/                  # 選用；螢光/影像通道
+│   │       ├── LT/                  # 選用；螢光/影像通道
+│   │       └── KI67/                # 選用；Ki67 染色影像
+│   └── output/
+│       ├── segment/<資料集>/        # Cellpose 分割遮罩
+│       ├── outline/<資料集>/        # 細胞質、細胞核、合併輪廓 txt
+│       ├── binary/<資料集>/         # Ki67 二值化遮罩與陽性標記
+│       ├── results/<資料集>/        # 每張影像 final CSV 與 <資料集>_cleaned.csv
+│       ├── train
+│       │     └──ki67_pred/
+│       │        └──model/           # 訓練後模型輸出檔
+│       │        └──report/          # 訓練報告
+│       ├── predict/                 # Ki67 正式推論 CSV/XLSX/圖表
+│       ├── cell_outlines/<資料集>/   # 細胞輪廓 PNG
+│       └── ki67_contours/<資料集>/   # Ki67 預測輪廓 PNG
+├── ki67dtc/
+│   ├── app_pipeline.py              # GUI 使用的分析流程封裝
+│   ├── img_prep.py                  # 影像前處理與分割準備
+│   ├── cell_anal.py                 # 細胞分析與特徵量測主程式
+│   ├── cell_anal_backup.py          # 備份/實驗版分析流程
+│   ├── feature_param.md             # Ki67 特徵與特徵參數定義
+│   ├── debris_feature_config.json   # debris 特徵設定
+│   ├── gui/
+│   │   └── main_window.py           # PyQt6 圖形介面
+│   └── utils/
+│       └── io.py                    # 檔案與路徑工具
+├── analysis/
+│   ├── ki67_pred_training.py        # Ki67 預測模型訓練
+│   ├── ki67_pred.py                 # Ki67 預測流程
+│   ├── ki67_pred_utils.py           # 預測工具函式
+│   └── ki67_pdf_feature_analysis.py  # PDF 特徵分析輔助工具
+├── scripts/
+│   ├── run_all_data_input.py                 # 批次處理 data/input 內資料集
+│   ├── batch_total_cell_mask_pyimagej.py     # 批次產生 total cell mask
+│   ├── calibrate_debris_thresholds.py        # debris 閾值校正
+│   ├── generate_cell_outline_images.py       # 產生細胞輪廓圖
+│   ├── generate_ki67_prediction_contours.py  # 產生 Ki67 預測輪廓圖
+│   ├── generate_ki67_prediction_plots.py     # 產生比例圖與混淆矩陣
+│   ├── train_ki67_pred.bat                   # Windows 訓練批次檔
+│   └── predict_ki67.bat                      # Windows 推論批次檔
+├── docs/
+│   ├── ki67_prediction_workflow.md  # Ki67 預測流程文件
+│   └── ki67_prediction_workflow.png # Ki67 預測流程圖
+└── README.md                        # 專案說明文件
 ```
+
+---
+
+## 使用方式
 
 ### 單一資料集分析
 
@@ -134,26 +188,7 @@ python app.py
 
 ### Ki67 模型訓練與推論
 
-訓練會從 `data/output/results/**/**_cleaned.csv` 載入資料，輸出模型檔與報告到 `data/output/train/ki67_pred/`。
-
-```bash
-python analysis/ki67_pred_training.py
-```
-
-正式推論會讀取 `data/output/train/ki67_pred/model/` 中的模型，輸出細胞、影像、資料夾層級結果到 `data/output/predict/`。
-
-```bash
-python analysis/ki67_pred.py
-```
-
-Windows 批次檔也可使用：
-
-```bat
-train_ki67_pred.bat
-predict_ki67.bat
-```
-
-注意：這兩個 `.bat` 檔目前寫死 `D:\anaconda3\envs\ki67dtc\python.exe`，若本機環境不同，請先修改 `PYTHON_EXE`。
+開發中...
 
 ### 視覺化輸出
 
@@ -168,50 +203,19 @@ python scripts/generate_ki67_prediction_contours.py
 python scripts/generate_ki67_prediction_plots.py
 ```
 
-### 輸出資料夾
-
-```text
-data/output/
-  segment/<資料集>/               # Cellpose 分割遮罩
-  outline/<資料集>/               # 細胞質、細胞核、合併輪廓 txt
-  binary/<資料集>/                # Ki67 二值化遮罩與陽性標記
-  results/<資料集>/               # 每張影像 final CSV 與 <資料集>_cleaned.csv
-  train/ki67_pred/model/          # 訓練後模型輸出檔
-  train/ki67_pred/report/         # 訓練報告
-  predict/                        # Ki67 正式推論 CSV/XLSX/圖表
-  cell_outlines/<資料集>/          # 細胞輪廓 PNG
-  ki67_contours/<資料集>/          # Ki67 預測輪廓 PNG
-```
+---
 
 ## 常見問題
 
-**Q: 程式找不到資料集資料夾怎麼辦？**
+--
 
-A: `main.py --data_folder example_data` 會先找 `data/input/example_data`，再找目前目錄下的 `example_data`。請確認資料夾存在，且至少包含 `PC/` 影像資料夾。
-
-**Q: PyImageJ 或 Java 初始化失敗怎麼辦？**
-
-A: 先確認環境中有 `pyimagej`、`scyjava`、`jpype1` 與 OpenJDK 11。若有既有 Fiji 安裝，可設定 `FIJI_APP_PATH`；若只想避開 ImageJ 後端，可在 Ki67 分析時使用 `--ki67_backend opencv`。
-
-**Q: 圖形介面啟動時找不到 PyQt6？**
-
-A: 目前 `requirements.txt` 未列入 PyQt6。請在同一個 Python 環境執行 `pip install PyQt6`。
-
-**Q: `.bat` 檔顯示 Python not found？**
-
-A: `train_ki67_pred.bat` 與 `predict_ki67.bat` 內的 `PYTHON_EXE` 是本機絕對路徑，請改成你的 conda/mamba 環境 Python 路徑。
-
-**Q: 複製專案後缺少 `data/` 或 `model/` 怎麼辦？**
-
-A: `.gitignore` 目前會忽略 `data/` 與 `model/`。請從團隊共享位置或實驗輸出檔補齊資料與 Cellpose 模型後再執行分析。
-
-**Q: 沒有 GPU 可以跑嗎？**
-
-A: 目前 `ki67dtc/img_prep.py` 以 `CellposeModel(gpu=True, ...)` 初始化。若環境沒有可用 GPU，請先調整 Cellpose 初始化設定，或改在具備 CUDA 的環境執行影像分割。
+---
 
 ## 貢獻指南
 
 --
+
+---
 
 ## 授權條款
 
