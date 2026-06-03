@@ -127,11 +127,6 @@ Ki67-Detection/
 │   └── ki67_pdf_feature_analysis.py  # PDF 特徵分析輔助工具
 ├── scripts/
 │   ├── run_all_data_input.py                 # 批次處理 data/input 內資料集
-│   ├── batch_total_cell_mask_pyimagej.py     # 批次產生 total cell mask
-│   ├── calibrate_debris_thresholds.py        # debris 閾值校正
-│   ├── generate_cell_outline_images.py       # 產生細胞輪廓圖
-│   ├── generate_ki67_prediction_contours.py  # 產生 Ki67 預測輪廓圖
-│   ├── generate_ki67_prediction_plots.py     # 產生比例圖與混淆矩陣
 │   ├── train_ki67_pred.bat                   # Windows 訓練批次檔
 │   └── predict_ki67.bat                      # Windows 推論批次檔
 ├── docs/
