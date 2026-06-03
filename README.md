@@ -113,9 +113,7 @@ Ki67-Detection/
 │   ├── app_pipeline.py              # GUI 使用的分析流程封裝
 │   ├── img_prep.py                  # 影像前處理與分割準備
 │   ├── cell_anal.py                 # 細胞分析與特徵量測主程式
-│   ├── cell_anal_backup.py          # 備份/實驗版分析流程
 │   ├── feature_param.md             # Ki67 特徵與特徵參數定義
-│   ├── debris_feature_config.json   # debris 特徵設定
 │   ├── gui/
 │   │   └── main_window.py           # PyQt6 圖形介面
 │   └── utils/
@@ -129,9 +127,6 @@ Ki67-Detection/
 │   ├── run_all_data_input.py                 # 批次處理 data/input 內資料集
 │   ├── train_ki67_pred.bat                   # Windows 訓練批次檔
 │   └── predict_ki67.bat                      # Windows 推論批次檔
-├── docs/
-│   ├── ki67_prediction_workflow.md  # Ki67 預測流程文件
-│   └── ki67_prediction_workflow.png # Ki67 預測流程圖
 └── README.md                        # 專案說明文件
 ```
 
