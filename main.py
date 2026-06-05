@@ -1,8 +1,24 @@
 ﻿import argparse
 from pathlib import Path
 
-from ki67dtc.img_prep import segment_all, mask2txt_all, combined
 from ki67dtc.cell_anal import run_all
+
+
+def run_preprocessing(data_folder: Path, nuc_source: str) -> None:
+    """Run segmentation and outline preparation."""
+    from ki67dtc.img_prep import combined, mask2txt_all, segment_all
+
+    # Step 1: segmentation
+    print("\n[STEP 1] 執行 segmentation (cyto & nuc)")
+    segment_all(data_folder, nuc_source=nuc_source)
+
+    # Step 2: mask -> outlines
+    print("\n[STEP 2] 將 segmentation npy 轉成 outlines txt")
+    mask2txt_all(data_folder)
+
+    # Step 3: combine outlines
+    print("\n[STEP 3] 合併 nucleus 與 cytoplasm outlines")
+    combined(data_folder)
 
 
 def main() -> None:
@@ -70,17 +86,7 @@ def main() -> None:
     print(f"[資訊] 清理暫存檔：{args.clean_temp}")
     print("=" * 50)
 
-    # Step 1: segmentation
-    print("\n[STEP 1] 執行 segmentation (cyto & nuc)")
-    segment_all(data_folder, nuc_source=args.nuc_source)
-
-    # Step 2: mask -> outlines
-    print("\n[STEP 2] 將 segmentation npy 轉成 outlines txt")
-    mask2txt_all(data_folder)
-
-    # Step 3: combine outlines
-    print("\n[STEP 3] 合併 nucleus 與 cytoplasm outlines")
-    combined(data_folder)
+    run_preprocessing(data_folder, args.nuc_source)
 
     # Step 4: geometry & intensity analysis
     print("\n[STEP 4] 幾何參數與螢光/陽性分析")

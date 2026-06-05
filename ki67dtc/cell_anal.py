@@ -3207,3 +3207,9 @@ def run_all(
     if clean_temp:
         remove_temp_files(analy_dir)
         remove_temp_files(output_dir(data_path, "outline"))
+        segment_dir = Path("data/output/segment") / data_path.name
+        if segment_dir.exists():
+            remove_temp_files(segment_dir, keywords=["_seg.npy"])
+        for raw_image_dir in (data_path / "PC", data_path / "DAPI"):
+            if raw_image_dir.exists():
+                remove_temp_files(raw_image_dir, keywords=["_seg.npy"])
