@@ -43,6 +43,13 @@ def main() -> None:
         choices=["pyimagej", "opencv"],
         help="Ki67 二值化方法（預設 pyimagej）",
     )
+    parser.add_argument(
+        "--feature_backend",
+        type=str,
+        default="pyimagej",
+        choices=["pyimagej", "python"],
+        help="特徵提取方法（預設 pyimagej）",
+    )
     parser.add_argument("--clean_temp", action="store_true", help="是否清理暫存資料")
 
     args = parser.parse_args()
@@ -83,6 +90,7 @@ def main() -> None:
     print(f"[資訊] 啟用螢光分析：{args.fluor_analy}")
     print(f"[資訊] 啟用 Ki67 分析：{args.ki67}")
     print(f"[資訊] Ki67 backend：{args.ki67_backend}")
+    print(f"[資訊] Feature backend：{args.feature_backend}")
     print(f"[資訊] 清理暫存檔：{args.clean_temp}")
     print("=" * 50)
 
@@ -95,6 +103,7 @@ def main() -> None:
         fluor_analy=args.fluor_analy,
         ki67=args.ki67,
         ki67_backend=args.ki67_backend,
+        feature_backend=args.feature_backend,
         clean_temp=args.clean_temp,
     )
 

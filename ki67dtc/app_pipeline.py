@@ -71,6 +71,7 @@ def run_pipeline(
     fluor_analy: bool = True,
     ki67: bool = True,
     ki67_backend: str = "pyimagej",
+    feature_backend: str = "pyimagej",
     clean_temp: bool = True,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> PipelineResult:
@@ -118,6 +119,7 @@ def run_pipeline(
         fluor_analy=fluor_analy,
         ki67=ki67,
         ki67_backend=ki67_backend,
+        feature_backend=feature_backend,
         clean_temp=clean_temp,
     )
     current_step += 1

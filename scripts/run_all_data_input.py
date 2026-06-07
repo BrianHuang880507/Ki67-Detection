@@ -60,6 +60,13 @@ def parse_args() -> argparse.Namespace:
         choices=["pyimagej", "opencv"],
         help="Ki67 binarization backend.",
     )
+    parser.add_argument(
+        "--feature_backend",
+        type=str,
+        default="pyimagej",
+        choices=["pyimagej", "python"],
+        help="Feature extraction backend.",
+    )
     parser.add_argument("--clean_temp", action="store_true", help="Clean temp files.")
     parser.add_argument(
         "--only",
@@ -162,6 +169,8 @@ def build_command(
         args.nuc_source,
         "--ki67_backend",
         args.ki67_backend,
+        "--feature_backend",
+        args.feature_backend,
     ]
     if args.fluor_analy:
         cmd.append("--fluor_analy")

@@ -54,6 +54,8 @@ class PipelineThread(QThread):
         nuc_source: str,
         fluor_analy: bool,
         ki67: bool,
+        ki67_backend: str,
+        feature_backend: str,
         clean_temp: bool,
         parent: Optional[QWidget] = None,
     ) -> None:
@@ -63,6 +65,8 @@ class PipelineThread(QThread):
         self._nuc_source = nuc_source
         self._fluor_analy = fluor_analy
         self._ki67 = ki67
+        self._ki67_backend = ki67_backend
+        self._feature_backend = feature_backend
         self._clean_temp = clean_temp
 
     def _progress_callback(self, done: int, total: int, message: str) -> None:
@@ -77,6 +81,8 @@ class PipelineThread(QThread):
                 nuc_source=self._nuc_source,
                 fluor_analy=self._fluor_analy,
                 ki67=self._ki67,
+                ki67_backend=self._ki67_backend,
+                feature_backend=self._feature_backend,
                 clean_temp=self._clean_temp,
                 progress_callback=self._progress_callback,
             )
@@ -228,6 +234,20 @@ class MainWindow(QMainWindow):
         options_row.addWidget(self.nuc_source_combo)
 
         options_row.addSpacing(16)
+        options_row.addWidget(QLabel("特徵後端", self))
+        self.feature_backend_combo = QtWidgets.QComboBox(self)
+        self.feature_backend_combo.addItem("PyImageJ", "pyimagej")
+        self.feature_backend_combo.addItem("Python", "python")
+        options_row.addWidget(self.feature_backend_combo)
+
+        options_row.addSpacing(16)
+        options_row.addWidget(QLabel("Ki67 後端", self))
+        self.ki67_backend_combo = QtWidgets.QComboBox(self)
+        self.ki67_backend_combo.addItem("PyImageJ", "pyimagej")
+        self.ki67_backend_combo.addItem("OpenCV", "opencv")
+        options_row.addWidget(self.ki67_backend_combo)
+
+        options_row.addSpacing(16)
 
         options_row.addWidget(self.chk_fluor)
         options_row.addWidget(self.chk_ki67)
@@ -366,6 +386,12 @@ class MainWindow(QMainWindow):
         data_folder = Path(path_text)
 
         nuc_source = str(self.nuc_source_combo.currentData() or "dapi")
+        feature_backend = str(
+            self.feature_backend_combo.currentData() or "pyimagej"
+        )
+        ki67_backend = str(
+            self.ki67_backend_combo.currentData() or "pyimagej"
+        )
         fluor_analy = self.chk_fluor.isChecked()
         ki67 = self.chk_ki67.isChecked()
         clean_temp = self.chk_clean.isChecked()
@@ -375,6 +401,8 @@ class MainWindow(QMainWindow):
             nuc_source=nuc_source,
             fluor_analy=fluor_analy,
             ki67=ki67,
+            ki67_backend=ki67_backend,
+            feature_backend=feature_backend,
             clean_temp=clean_temp,
             parent=self,
         )
@@ -890,4 +918,3 @@ class MainWindow(QMainWindow):
             self._highlight_enabled = True
 
         self._update_display_pixmap()
-

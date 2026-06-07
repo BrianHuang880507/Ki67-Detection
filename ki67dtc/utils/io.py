@@ -5,19 +5,68 @@ import pandas as pd
 import os
 
 
+_INTENSITY_PARAMETER_COLUMNS = [
+    "Mean",
+    "StdDev",
+    "Min",
+    "Max",
+    "IntDen",
+    "RawIntDen",
+    "CV",
+    "Range",
+    "P10",
+    "P25",
+    "P75",
+    "P90",
+    "IQR80",
+    "Entropy",
+    "Skewness",
+    "Kurtosis",
+]
+_TEXTURE_PARAMETER_COLUMNS = [
+    "GLCM ASM",
+    "GLCM Contrast",
+    "GLCM Correlation",
+    "GLCM Difference Variance",
+    "GLCM Entropy",
+    "GLCM Homogeneity",
+    "LBP Mean",
+    "LBP StdDev",
+    "LBP Entropy",
+    "LBP Uniform Ratio",
+    *[f"LBP Hist Bin {idx:02d}" for idx in range(16)],
+    *[
+        f"LBP Uniform R{radius} Hist Bin {idx:02d}"
+        for radius in (1, 2, 3)
+        for idx in range(10)
+    ],
+    "Tamura Coarseness",
+    *[f"Zernike Moment {idx:02d}" for idx in range(25)],
+]
+
+
 CELL_LEVEL_PARAMETER_COLUMNS = [
     "Karyoplasmic Ratio",
     "Nuc Cyto Mean Ratio",
     "Nuc Cyto IntDen Ratio",
     "Nuc Cyto RawIntDen Ratio",
+    "Nuc Cell IntDen Ratio",
     "Nuc Cyto Entropy Difference",
     "Nuc Cyto CV Difference",
     "Nucleus Centroid Offset",
+    *[f"Whole Cell {column}" for column in _INTENSITY_PARAMETER_COLUMNS],
+    *[f"Whole Cell {column}" for column in _TEXTURE_PARAMETER_COLUMNS],
+    "Nucleolus Count",
+    "Mean Nucleolus Area",
+    "Max Nucleolus Area",
     "Halo Outer Mean",
     "Halo Outer StdDev",
+    "Halo Outer CV",
     "Halo Inner Mean",
     "Halo Inner StdDev",
     "Halo Inner Outer Diff",
+    "Halo Angular Variance",
+    "Halo Radial Gradient",
     "Halo Width",
     "Edge Sharpness",
     "Image Confluency",
@@ -27,11 +76,14 @@ CELL_LEVEL_PARAMETER_COLUMNS = [
     "Nearest Neighbor Distance Norm",
     "Local Neighbor Count",
     "Local Density",
+    "Neighbour Area Ratio",
     "Cluster Size",
     "Cluster Size Norm",
     "Largest Cluster Ratio",
+    "Mitotic Index",
     "Protrusion Count",
     "Mean Convex Defect Depth",
+    "Mean Protrusion Length Norm",
     "Max Convex Defect Depth",
     "Fractal Dimension",
     "Boundary Inflection Count",

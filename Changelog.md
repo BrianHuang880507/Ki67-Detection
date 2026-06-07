@@ -1,4 +1,13 @@
 # Changelog
+## 2026.06.06
+
+  * 新增 `feature_backend=pyimagej|python`，支援以 NumPy、SciPy、scikit-image 與 OpenCV 提取既有特徵欄位
+  * Debris 特徵改由 phase-contrast 影像計算，避免使用 Ki67 影像造成標籤洩漏
+  * 修正 circularity 公式為 `4πA/P²`
+  * 新增兩種特徵後端的批次差異比較腳本
+  * 導入 PDF 中除 Dynamic/time-lapse 外的剩餘特徵：multi-distance GLCM、multi-radius uniform LBP、Tamura、Zernike、whole-cell texture/intensity、核仁候選、Halo angular/radial、Neighbour Area Ratio 與 Mitotic Index
+  * 新增 Python backend 的多尺度紋理、核仁、expanded schema、欄位合併與螢光提取測試
+
 ## 2026.06.02
 
   * 新增 Ki67 特徵參數擴充主流程，導入 Intensity distribution、Nuclear sub-region、Halo 基礎量、Population context、Protrusion/Shape complexity、Debris 與 Mitosis proxy 參數

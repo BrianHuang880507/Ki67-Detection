@@ -153,7 +153,35 @@ python main.py --data_folder data/input/example_data --nuc_source dapi --ki67_ba
 - `--fluor_analy`：啟用螢光強度分析。
 - `--ki67`：啟用 Ki67 陽性分析。
 - `--ki67_backend`：Ki67 二值化後端，可用 `pyimagej` 或 `opencv`。
+- `--feature_backend`：特徵提取後端，可用 `pyimagej` 或 `python`。`python` 特徵提取本身不會啟動 JVM。
 - `--clean_temp`：清理中間暫存檔。
+
+純 Python 特徵提取：
+
+```bash
+python main.py --data_folder data/input/example_data --nuc_source dapi --feature_backend python --ki67_backend opencv
+```
+
+Python backend 已包含 PDF 中除 Dynamic/time-lapse 外的特徵擴充，包括
+multi-distance GLCM、multi-radius LBP、Tamura、Zernike、whole-cell
+intensity/texture、核仁候選、Halo angular/radial、Neighbour Area Ratio
+與 Mitotic Index。Zernike 需要 `mahotas`，安裝 `requirements.txt` 時會一併安裝。
+新增欄位會改變訓練資料 schema，既有模型需重新訓練。
+
+驗證 Python 特徵提取：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+比較同一批影像的 PyImageJ 與 Python 特徵：
+
+```bash
+python scripts/compare_feature_backends.py --data-folder data/input/example_data --max-images 10
+```
+
+比較報表會輸出到
+`data/output/backend_comparison/<資料集>/feature_backend_comparison.csv`。
 
 ### 批次處理
 
