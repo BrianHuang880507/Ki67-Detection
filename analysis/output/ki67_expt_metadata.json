@@ -1,0 +1,14 @@
+{
+  "output_policy": "?????????? CSV???????? ki67_expt_summary.csv?",
+  "split_policy": "?? source_folder ????????? train / valid / test???????? split?",
+  "formal_best_model": "Texture + Attachment???? image embedding?",
+  "charts": [
+    "feature_combo_embedding_mae.png",
+    "feature_group_relation.png",
+    "formal_combo_image_mae.png",
+    "formal_confusion_matrices.png",
+    "formal_embedding_mae.png",
+    "version_effect_comparison.png"
+  ],
+  "summary_table": "ki67_expt_summary.csv"
+}

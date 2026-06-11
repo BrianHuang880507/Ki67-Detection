@@ -2,7 +2,7 @@
 
 Ki67 Detection是一套自動化細胞影像分析系統，用於細胞分割、形態/螢光特徵分析，以及無染色 Ki67 預測，降低人工圈選失誤與細胞染色成本。
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+![Python](https://img.shields.io/badge/Python-3.10--3.12-blue)
 ![Cellpose](https://img.shields.io/badge/Cellpose-3.1.1.1-purple)
 ![授權狀態](https://img.shields.io/badge/%E6%8E%88%E6%AC%8A-%E5%B0%9A%E6%9C%AA%E6%8C%87%E5%AE%9A-lightgrey)
 
@@ -38,14 +38,14 @@ Ki67 Detection是一套自動化細胞影像分析系統，用於細胞分割、
 
 ## 環境需求
 
-- Python 3.10+
+- Python 3.10-3.12
 - Mamba 或 Conda
 - OpenJDK 11，供 PyImageJ/Fiji 後端使用
 - NVIDIA GPU/CUDA 建議使用；目前 Cellpose 影像分割以 `gpu=True` 初始化模型
 - 專案 Cellpose 模型，例如 `model/model_BDL6_label_new`
 - 影像資料放在 `data/input/<資料集>/`
 
-主要 Python 套件列在 [requirements.txt](requirements.txt)。圖形介面入口使用 PyQt6；若環境尚未安裝，請另外安裝 `PyQt6`。
+主要 Python 套件列在 [requirements.txt](requirements.txt)。`cellpose==3.1.1.1` 需要 `numpy<2.1`，目前不建議使用 Python 3.13。圖形介面入口使用 PyQt6；若環境尚未安裝，請另外安裝 `PyQt6`。
 
 ---
 

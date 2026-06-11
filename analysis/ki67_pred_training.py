@@ -1,555 +1,405 @@
-"""Ki67 正式訓練流程。
-
-此版本包含三個重點:
-1. 正式驗證改成 leave-source-folder-out。
-2. stage1 加入 probability calibration。
-3. 自動比較 `class_weight=True/False` 與不同 stage2 模型。
-"""
+"""Ki67 新版 Stage 1 / Stage 2 訓練流程。"""
 
 from __future__ import annotations
 
-import shutil
+import argparse
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any
 
-import joblib
 import numpy as np
 import pandas as pd
 
 from ki67_pred_utils import (
-    DEFAULT_BDL_RATIO_REFERENCE,
-    DEFAULT_DATA_PATTERN,
     DEFAULT_EXCLUDED_SOURCE_FOLDERS,
-    DEFAULT_HOLDOUT_SOURCE_FOLDERS,
-    DEFAULT_LABEL_CANDIDATES,
-    DEFAULT_PASSAGE_CANDIDATES,
+    DEFAULT_RESULTS_DIR,
+    DEFAULT_SUMMARY_HTML,
+    DEFAULT_TRAIN_OUTPUT_DIR,
+    ExperimentConfig,
     aggregate_to_image_features,
-    apply_probability_calibration,
-    build_image_design_matrices,
-    compare_folder_ratio_to_reference,
+    attach_image_embeddings,
+    build_feature_groups,
+    default_experiment_configs,
     detect_numeric_feature_columns,
-    evaluate_ratio_predictions,
+    evaluate_cell_predictions,
+    evaluate_image_predictions,
+    extract_image_embeddings,
+    filter_extreme_image_ratios,
     find_cleaned_csv_files,
-    filter_similar_features,
-    fit_preprocessor,
-    fit_probability_calibrator,
-    fit_ratio_models,
-    fit_stage1_cell_model_with_oof,
+    fit_feature_group_models,
+    fit_selected_parameter_transformer,
+    fit_stage1_classifier_with_oof,
+    fit_stage2_ratio_model,
+    fit_table_transformer,
+    format_percent,
+    format_pp,
     load_ki67_dataset,
-    predict_stage1_probability,
-    save_calibration_curve_plot,
-    save_config_comparison_plot,
-    save_feature_correlation_plot,
+    predict_feature_group_scores,
+    predict_positive_probability,
+    predict_stage2_ratio,
+    render_summary_html,
+    reset_directory,
     save_json,
-    select_positive_correlation_features,
-    split_dev_and_holdout,
-    summarize_folder_ratio,
-    transform_features,
+    save_model_bundle,
+    split_images_within_source_folder,
+    summarize_split,
+    transform_table_features,
 )
 
 pd.set_option("display.max_columns", 200)
-pd.set_option("display.width", 200)
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-RESULTS_DIR = PROJECT_ROOT / "data" / "output" / "results"
-OUTPUT_ROOT = PROJECT_ROOT / "data" / "output" / "train" / "ki67_pred"
-MODEL_DIR = OUTPUT_ROOT / "model"
-REPORT_DIR = OUTPUT_ROOT / "report"
-
-DATA_PATTERN = DEFAULT_DATA_PATTERN
-EXCLUDED_SOURCE_FOLDERS = sorted(DEFAULT_EXCLUDED_SOURCE_FOLDERS)
-HOLDOUT_SOURCE_FOLDERS = list(DEFAULT_HOLDOUT_SOURCE_FOLDERS)
-LABEL_CANDIDATES = list(DEFAULT_LABEL_CANDIDATES)
-PASSAGE_CANDIDATES = list(DEFAULT_PASSAGE_CANDIDATES)
-BDL_RATIO_REFERENCE = dict(DEFAULT_BDL_RATIO_REFERENCE)
+pd.set_option("display.width", 220)
 
 RANDOM_STATE = 42
-SIMILARITY_THRESHOLD = 0.90
-POSITIVE_CORR_THRESHOLD = 0.00
-STAGE1_CALIBRATION_METHOD = "isotonic"
-CLASS_WEIGHT_OPTIONS = [False, True]
-FORMAL_SELECTED_CONFIG_NAME = "cw_false__LightGBMRegressor"
+BASE_FEATURE_GROUPS = ("Texture", "Intensity distribution", "Halo / rounding")
+FORMAL_CONFIG_KEY = "feature_cnn_s1"
 
 
-def ensure_clean_output_dirs() -> None:
-    """清空並重建正式訓練輸出目錄。"""
-    if OUTPUT_ROOT.exists():
-        shutil.rmtree(OUTPUT_ROOT)
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+def parse_args() -> argparse.Namespace:
+    """解析命令列參數。"""
+    parser = argparse.ArgumentParser(description="Train the new Ki67 Stage 1 / Stage 2 pipeline.")
+    parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_TRAIN_OUTPUT_DIR)
+    parser.add_argument("--summary-html", type=Path, default=DEFAULT_SUMMARY_HTML)
+    parser.add_argument("--selected-top-k", type=int, default=40)
+    parser.add_argument("--formal-config", default=FORMAL_CONFIG_KEY)
+    parser.add_argument("--cv-splits", type=int, default=5)
+    parser.add_argument("--skip-cnn", action="store_true")
+    parser.add_argument("--cnn-pretrained", action="store_true")
+    parser.add_argument("--keep-extreme-image-ratios", action="store_true")
+    parser.add_argument("--save-prediction-table", action="store_true")
+    return parser.parse_args()
 
 
-def build_feature_pipeline(train_df: pd.DataFrame, feature_cols: Sequence[str]) -> Dict[str, Any]:
-    """只用訓練資料建立前處理與特徵選擇。
-
-    Args:
-        train_df: 訓練資料。
-        feature_cols: 原始數值特徵欄位。
-
-    Returns:
-        前處理與最終特徵相關資訊。
-    """
-    prep = fit_preprocessor(train_df, feature_cols)
-    x_train_all = transform_features(train_df, feature_cols, prep)
-
-    similarity_result = filter_similar_features(
-        x_train=x_train_all,
-        y_train=train_df["ki67_label"].astype(int),
-        threshold=SIMILARITY_THRESHOLD,
-    )
-    kept_after_similarity = similarity_result["kept_features"]
-    x_train_sim = x_train_all[kept_after_similarity].copy()
-
-    corr_result = select_positive_correlation_features(
-        x_train=x_train_sim,
-        y_train=train_df["ki67_label"].astype(int),
-        min_corr=POSITIVE_CORR_THRESHOLD,
-    )
-    selected_features = corr_result["selected_features"]
-
-    return {
-        "prep": prep,
-        "correlation_report": corr_result["correlation_report"],
-        "selected_features": selected_features,
-        "x_train_final": x_train_sim[selected_features].copy(),
-    }
-
-
-def transform_selected_features(
-    df: pd.DataFrame,
-    feature_cols: Sequence[str],
-    prep: Dict[str, Any],
-    selected_features: Sequence[str],
+def build_stage1_matrix(
+    frame: pd.DataFrame,
+    config: ExperimentConfig,
+    evidence_scores: pd.DataFrame,
+    image_embeddings: pd.DataFrame,
+    selected_transformer: Any,
+    all_parameter_transformer: Any,
 ) -> pd.DataFrame:
-    """將資料轉成最終特徵空間。
+    """依實驗設定組合 Stage 1 input matrix。"""
+    parts: list[pd.DataFrame] = []
+    if config.include_feature_scores:
+        parts.append(evidence_scores.reset_index(drop=True))
+    if config.include_cnn_embedding:
+        parts.append(attach_image_embeddings(frame, image_embeddings).reset_index(drop=True))
+    if config.parameter_mode == "selected":
+        parts.append(transform_table_features(frame, selected_transformer).reset_index(drop=True))
+    elif config.parameter_mode == "all":
+        parts.append(transform_table_features(frame, all_parameter_transformer).reset_index(drop=True))
 
-    Args:
-        df: 待轉換資料。
-        feature_cols: 原始特徵欄位。
-        prep: 前處理器。
-        selected_features: 最終選用特徵。
-
-    Returns:
-        最終特徵矩陣。
-    """
-    x_all = transform_features(df, feature_cols, prep)
-    return x_all.loc[:, list(selected_features)].copy()
+    if not parts:
+        raise ValueError(f"實驗 {config.key} 沒有任何 Stage 1 輸入欄位。")
+    matrix = pd.concat(parts, axis=1)
+    matrix = matrix.loc[:, ~matrix.columns.duplicated()].copy()
+    return matrix.apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
 
-def fit_stage1_with_calibration(
+def attach_scores_and_probability(
+    frame: pd.DataFrame,
+    probability: np.ndarray,
+    evidence_scores: pd.DataFrame,
+) -> pd.DataFrame:
+    """建立含 evidence score 與 cell probability 的 cell-level table。"""
+    scored = frame.reset_index(drop=True).copy()
+    for column in evidence_scores.columns:
+        scored[column] = evidence_scores.reset_index(drop=True)[column].to_numpy(dtype=np.float64)
+    scored["cell_prob"] = np.asarray(probability, dtype=np.float64)
+    return scored
+
+
+def evaluate_config(
+    config: ExperimentConfig,
     train_df: pd.DataFrame,
-    x_train_final: pd.DataFrame,
-    use_class_weight: bool,
-) -> Dict[str, Any]:
-    """訓練 stage1 並用 OOF probability 擬合 calibrator。
+    valid_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    train_evidence: pd.DataFrame,
+    valid_evidence: pd.DataFrame,
+    test_evidence: pd.DataFrame,
+    image_embeddings: pd.DataFrame,
+    selected_transformer: Any,
+    all_parameter_transformer: Any,
+    cv_splits: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """訓練並評估單一實驗設定。
 
     Args:
-        train_df: 訓練資料。
-        x_train_final: stage1 最終特徵。
-        use_class_weight: 是否使用 `balanced`。
+        config: 實驗設定。
+        train_df: Train split cell-level table。
+        valid_df: Valid split cell-level table。
+        test_df: Test split cell-level table。
+        train_evidence: Train OOF feature-group evidence scores。
+        valid_evidence: Valid feature-group evidence scores。
+        test_evidence: Test feature-group evidence scores。
+        image_embeddings: image_key indexed CNN embedding table。
+        selected_transformer: Selected parameters 前處理器。
+        all_parameter_transformer: All parameters 前處理器。
+        cv_splits: Stage 1 GroupKFold 切分數。
 
     Returns:
-        stage1 模型、校正器與校正前後 OOF probability。
+        tuple[dict[str, Any], dict[str, Any]]: metric row 與可供部署的模型 artifacts。
     """
-    stage1_result = fit_stage1_cell_model_with_oof(
-        x_train=x_train_final,
-        y_train=train_df["ki67_label"].astype(int),
-        image_keys=train_df["image_key"].astype(str),
+    x_train = build_stage1_matrix(
+        train_df,
+        config,
+        train_evidence,
+        image_embeddings,
+        selected_transformer,
+        all_parameter_transformer,
+    )
+    x_valid = build_stage1_matrix(
+        valid_df,
+        config,
+        valid_evidence,
+        image_embeddings,
+        selected_transformer,
+        all_parameter_transformer,
+    ).reindex(columns=x_train.columns, fill_value=0.0)
+    x_test = build_stage1_matrix(
+        test_df,
+        config,
+        test_evidence,
+        image_embeddings,
+        selected_transformer,
+        all_parameter_transformer,
+    ).reindex(columns=x_train.columns, fill_value=0.0)
+
+    stage1_model, train_prob = fit_stage1_classifier_with_oof(
+        x_train,
+        train_df["ki67_label"],
+        train_df["image_key"].astype(str),
         random_state=RANDOM_STATE,
-        use_class_weight=use_class_weight,
+        cv_splits=cv_splits,
     )
-    raw_oof_prob = np.asarray(stage1_result["train_oof_prob"], dtype=np.float64)
-    calibrator = fit_probability_calibrator(
-        raw_prob=raw_oof_prob,
-        y_true=train_df["ki67_label"].to_numpy(dtype=np.int64),
-        method=STAGE1_CALIBRATION_METHOD,
-    )
-    calibrated_oof_prob = apply_probability_calibration(calibrator, raw_oof_prob)
-    return {
-        "stage1_model": stage1_result["model"],
-        "calibrator": calibrator,
-        "raw_oof_prob": raw_oof_prob,
-        "calibrated_oof_prob": calibrated_oof_prob,
-        "n_splits": int(stage1_result["n_splits"]),
+    valid_prob = predict_positive_probability(stage1_model, x_valid)
+    test_prob = predict_positive_probability(stage1_model, x_test)
+
+    train_cell = attach_scores_and_probability(train_df, train_prob, train_evidence)
+    valid_cell = attach_scores_and_probability(valid_df, valid_prob, valid_evidence)
+    test_cell = attach_scores_and_probability(test_df, test_prob, test_evidence)
+    evidence_columns = list(train_evidence.columns)
+
+    train_image = aggregate_to_image_features(train_cell, "cell_prob", evidence_columns)
+    valid_image = aggregate_to_image_features(valid_cell, "cell_prob", evidence_columns)
+    test_image = aggregate_to_image_features(test_cell, "cell_prob", evidence_columns)
+
+    stage2_model, stage2_columns = fit_stage2_ratio_model(train_image, config.stage2_mode)
+    train_image["pred_ratio"] = predict_stage2_ratio(train_image, stage2_model, config.stage2_mode, stage2_columns)
+    valid_image["pred_ratio"] = predict_stage2_ratio(valid_image, stage2_model, config.stage2_mode, stage2_columns)
+    test_image["pred_ratio"] = predict_stage2_ratio(test_image, stage2_model, config.stage2_mode, stage2_columns)
+
+    train_cell_metrics = evaluate_cell_predictions(train_df["ki67_label"], train_prob)
+    valid_cell_metrics = evaluate_cell_predictions(valid_df["ki67_label"], valid_prob)
+    test_cell_metrics = evaluate_cell_predictions(test_df["ki67_label"], test_prob)
+    train_image_metrics = evaluate_image_predictions(train_image, train_image["pred_ratio"])
+    valid_image_metrics = evaluate_image_predictions(valid_image, valid_image["pred_ratio"])
+    test_image_metrics = evaluate_image_predictions(test_image, test_image["pred_ratio"])
+
+    row = {
+        "config_key": config.key,
+        "display_name": config.display_name,
+        "stage1_input": config.stage1_input_name,
+        "stage2_input": config.stage2_name,
+        "train_cell_accuracy": train_cell_metrics["accuracy"],
+        "valid_cell_accuracy": valid_cell_metrics["accuracy"],
+        "test_cell_accuracy": test_cell_metrics["accuracy"],
+        "train_image_mae": train_image_metrics["image_mae"],
+        "valid_image_mae": valid_image_metrics["image_mae"],
+        "test_image_mae": test_image_metrics["image_mae"],
+        "train_image_bias": train_image_metrics["image_bias"],
+        "valid_image_bias": valid_image_metrics["image_bias"],
+        "test_image_bias": test_image_metrics["image_bias"],
+        "test_tn": test_cell_metrics["tn"],
+        "test_fp": test_cell_metrics["fp"],
+        "test_fn": test_cell_metrics["fn"],
+        "test_tp": test_cell_metrics["tp"],
     }
-
-
-def predict_calibrated_stage1(
-    stage1_model: Any,
-    calibrator: Any,
-    x_df: pd.DataFrame,
-) -> np.ndarray:
-    """輸出校正後的 stage1 機率。
-
-    Args:
-        stage1_model: stage1 模型。
-        calibrator: 機率校正器。
-        x_df: 特徵矩陣。
-
-    Returns:
-        校正後的陽性機率。
-    """
-    raw_prob = predict_stage1_probability(stage1_model, x_df)
-    return apply_probability_calibration(calibrator, raw_prob)
-
-
-def evaluate_single_config_on_fold(
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    feature_cols: Sequence[str],
-    use_class_weight: bool,
-    stage2_model_name: str,
-) -> Dict[str, Any]:
-    """在單一 leave-source-folder-out fold 上評估一組設定。
-
-    Args:
-        train_df: 訓練資料。
-        val_df: 驗證資料，應為單一 source_folder。
-        feature_cols: 原始特徵欄位。
-        use_class_weight: stage1 是否使用 `balanced`。
-        stage2_model_name: stage2 模型名稱。
-
-    Returns:
-        單 fold 評估結果。
-    """
-    feature_pipeline = build_feature_pipeline(train_df, feature_cols)
-    x_train_final = feature_pipeline["x_train_final"]
-    x_val_final = transform_selected_features(
-        df=val_df,
-        feature_cols=feature_cols,
-        prep=feature_pipeline["prep"],
-        selected_features=feature_pipeline["selected_features"],
-    )
-
-    stage1_artifacts = fit_stage1_with_calibration(
-        train_df=train_df,
-        x_train_final=x_train_final,
-        use_class_weight=use_class_weight,
-    )
-
-    train_scored_df = train_df.copy()
-    train_scored_df["cell_prob"] = stage1_artifacts["calibrated_oof_prob"]
-
-    val_scored_df = val_df.copy()
-    val_scored_df["cell_prob"] = predict_calibrated_stage1(
-        stage1_model=stage1_artifacts["stage1_model"],
-        calibrator=stage1_artifacts["calibrator"],
-        x_df=x_val_final,
-    )
-
-    train_image_df = aggregate_to_image_features(train_scored_df, prob_col="cell_prob")
-    val_image_df = aggregate_to_image_features(val_scored_df, prob_col="cell_prob")
-    design_result = build_image_design_matrices({"Train": train_image_df, "Val": val_image_df})
-
-    ratio_model = fit_ratio_models(RANDOM_STATE)[stage2_model_name]
-    ratio_model.fit(
-        design_result["matrices"]["Train"],
-        train_image_df["true_ratio"].to_numpy(dtype=np.float64),
-    )
-    val_pred = np.clip(ratio_model.predict(design_result["matrices"]["Val"]), 0.0, 1.0)
-
-    image_metrics = evaluate_ratio_predictions(
-        y_true=val_image_df["true_ratio"].to_numpy(dtype=np.float64),
-        y_pred=val_pred,
-    )
-    val_image_eval_df = val_image_df.copy()
-    val_image_eval_df["pred_ratio"] = val_pred
-    folder_df = summarize_folder_ratio(val_image_eval_df)
-
-    return {
-        "fold_source_folder": str(val_df["source_folder"].iloc[0]),
-        "stage1_use_class_weight": bool(use_class_weight),
-        "stage2_model": stage2_model_name,
-        "image_mae": float(image_metrics["mae"]),
-        "image_rmse": float(image_metrics["rmse"]),
-        "folder_mae": float(folder_df["abs_error"].mean()),
-        "folder_within_0p05": float((folder_df["abs_error"] <= 0.05).mean()),
-        "folder_within_0p10": float((folder_df["abs_error"] <= 0.10).mean()),
-    }
-
-
-def run_leave_source_folder_out_cv(
-    dev_df: pd.DataFrame,
-    feature_cols: Sequence[str],
-) -> pd.DataFrame:
-    """執行 leave-source-folder-out 正式驗證。
-
-    Args:
-        dev_df: 開發資料。
-        feature_cols: 原始特徵欄位。
-
-    Returns:
-        每個 fold 的詳細評估表。
-    """
-    rows: List[Dict[str, Any]] = []
-    source_folders = sorted(dev_df["source_folder"].astype(str).unique().tolist())
-    stage2_model_names = list(fit_ratio_models(RANDOM_STATE).keys())
-
-    for fold_source_folder in source_folders:
-        train_df = dev_df[dev_df["source_folder"] != fold_source_folder].copy().reset_index(drop=True)
-        val_df = dev_df[dev_df["source_folder"] == fold_source_folder].copy().reset_index(drop=True)
-
-        for use_class_weight in CLASS_WEIGHT_OPTIONS:
-            for stage2_model_name in stage2_model_names:
-                rows.append(
-                    evaluate_single_config_on_fold(
-                        train_df=train_df,
-                        val_df=val_df,
-                        feature_cols=feature_cols,
-                        use_class_weight=use_class_weight,
-                        stage2_model_name=stage2_model_name,
-                    )
-                )
-
-    return pd.DataFrame(rows)
-
-
-def train_final_pipeline(
-    dev_df: pd.DataFrame,
-    holdout_df: pd.DataFrame,
-    feature_cols: Sequence[str],
-    use_class_weight: bool,
-    stage2_model_name: str,
-) -> Dict[str, Any]:
-    """用完整 dev 資料訓練正式模型，並對 holdout 做推論。
-
-    Args:
-        dev_df: 開發資料。
-        holdout_df: 正式預測資料。
-        feature_cols: 原始特徵欄位。
-        use_class_weight: stage1 是否使用 `balanced`。
-        stage2_model_name: stage2 模型名稱。
-
-    Returns:
-        正式模型、報表與 holdout 比對結果。
-    """
-    feature_pipeline = build_feature_pipeline(dev_df, feature_cols)
-    x_dev_final = feature_pipeline["x_train_final"]
-
-    stage1_artifacts = fit_stage1_with_calibration(
-        train_df=dev_df,
-        x_train_final=x_dev_final,
-        use_class_weight=use_class_weight,
-    )
-
-    dev_scored_df = dev_df.copy()
-    dev_scored_df["cell_prob"] = stage1_artifacts["calibrated_oof_prob"]
-
-    holdout_pred_df = holdout_df.drop(columns=["ki67_label"], errors="ignore").copy()
-    if len(holdout_pred_df) > 0:
-        x_holdout_final = transform_selected_features(
-            df=holdout_pred_df,
-            feature_cols=feature_cols,
-            prep=feature_pipeline["prep"],
-            selected_features=feature_pipeline["selected_features"],
-        )
-        holdout_pred_df["cell_prob"] = predict_calibrated_stage1(
-            stage1_model=stage1_artifacts["stage1_model"],
-            calibrator=stage1_artifacts["calibrator"],
-            x_df=x_holdout_final,
-        )
-
-    dev_image_df = aggregate_to_image_features(dev_scored_df, prob_col="cell_prob")
-    holdout_image_df = (
-        aggregate_to_image_features(holdout_pred_df, prob_col="cell_prob")
-        if len(holdout_pred_df) > 0
-        else pd.DataFrame()
-    )
-
-    design_result = build_image_design_matrices(
-        image_tables={"Train": dev_image_df, "Holdout": holdout_image_df}
-    )
-    x_train_img = design_result["matrices"]["Train"]
-    x_holdout_img = design_result["matrices"]["Holdout"]
-
-    stage2_model = fit_ratio_models(RANDOM_STATE)[stage2_model_name]
-    stage2_model.fit(x_train_img, dev_image_df["true_ratio"].to_numpy(dtype=np.float64))
-
-    holdout_compare_df = pd.DataFrame()
-    if len(holdout_image_df) > 0:
-        holdout_image_df = holdout_image_df.copy()
-        holdout_image_df["pred_ratio"] = np.clip(stage2_model.predict(x_holdout_img), 0.0, 1.0)
-        holdout_folder_df = summarize_folder_ratio(holdout_image_df)
-        holdout_compare_df = compare_folder_ratio_to_reference(
-            folder_ratio_df=holdout_folder_df,
-            reference_map=BDL_RATIO_REFERENCE,
-            reference_col_name="bdl_true_ratio",
-        )
-
-    return {
-        "feature_pipeline": feature_pipeline,
-        "stage1_artifacts": stage1_artifacts,
+    artifacts = {
+        "config": asdict(config),
+        "stage1_model": stage1_model,
+        "stage1_feature_columns": list(x_train.columns),
         "stage2_model": stage2_model,
-        "design_feature_names": design_result["feature_names"],
-        "holdout_compare_df": holdout_compare_df,
-        "dev_image_df": dev_image_df,
+        "stage2_feature_columns": list(stage2_columns),
+        "train_cell_predictions": train_cell,
+        "valid_cell_predictions": valid_cell,
+        "test_cell_predictions": test_cell,
+        "train_image_predictions": train_image,
+        "valid_image_predictions": valid_image,
+        "test_image_predictions": test_image,
     }
+    return row, artifacts
 
 
-def build_source_folder_usage(dev_df: pd.DataFrame, holdout_df: pd.DataFrame) -> pd.DataFrame:
-    """建立正式訓練資料夾使用摘要。
+def prepare_training_data(args: argparse.Namespace) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    """讀取與切分新版訓練資料。"""
+    csv_files = find_cleaned_csv_files(
+        results_dir=args.results_dir,
+        excluded_source_folders=DEFAULT_EXCLUDED_SOURCE_FOLDERS,
+    )
+    dataset = load_ki67_dataset(csv_files, require_label=True)
+    if not args.keep_extreme_image_ratios:
+        dataset = filter_extreme_image_ratios(dataset)
+    splits = split_images_within_source_folder(dataset, random_state=RANDOM_STATE)
+    feature_columns = detect_numeric_feature_columns(dataset)
+    return splits, feature_columns
 
-    Args:
-        dev_df: 開發資料。
-        holdout_df: holdout 資料。
 
-    Returns:
-        source_folder 使用摘要。
-    """
-    rows: List[Dict[str, Any]] = []
-    for dataset_role, part_df in [("DevTrain", dev_df), ("HoldoutPredict", holdout_df)]:
-        if len(part_df) == 0:
+def run_training(args: argparse.Namespace) -> dict[str, Any]:
+    """執行完整新版訓練流程。"""
+    output_dir = args.output_dir
+    model_dir = output_dir / "model"
+    reset_directory(output_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    splits, feature_columns = prepare_training_data(args)
+    train_df = splits["train"]
+    valid_df = splits["valid"]
+    test_df = splits["test"]
+    if len(train_df) == 0 or len(valid_df) == 0 or len(test_df) == 0:
+        raise ValueError("Train / valid / test 任一切分為空，請檢查 source folder 設定。")
+
+    feature_groups = build_feature_groups(feature_columns)
+    feature_group_models, train_evidence = fit_feature_group_models(
+        train_df,
+        feature_groups,
+        BASE_FEATURE_GROUPS,
+        cv_splits=args.cv_splits,
+        random_state=RANDOM_STATE,
+        group_column="image_key",
+    )
+    valid_evidence = predict_feature_group_scores(valid_df, feature_group_models)
+    test_evidence = predict_feature_group_scores(test_df, feature_group_models)
+
+    selected_transformer = fit_selected_parameter_transformer(train_df, feature_columns, top_k=args.selected_top_k)
+    all_parameter_transformer = fit_table_transformer(train_df, feature_columns)
+
+    all_for_embedding = pd.concat([train_df, valid_df, test_df], ignore_index=True)
+    if args.skip_cnn:
+        image_embeddings = pd.DataFrame(index=[])
+        cnn_meta = {"status": "skipped"}
+    else:
+        image_embeddings, cnn_meta = extract_image_embeddings(
+            all_for_embedding,
+            pretrained=bool(args.cnn_pretrained),
+            random_state=RANDOM_STATE,
+        )
+    if image_embeddings.empty:
+        print("[警告] CNN embedding 為空；包含 CNN 的實驗會使用空矩陣並可能失敗。")
+
+    configs = default_experiment_configs()
+    metrics: list[dict[str, Any]] = []
+    artifact_by_key: dict[str, dict[str, Any]] = {}
+    for config in configs:
+        if config.include_cnn_embedding and image_embeddings.empty:
+            print(f"[略過] {config.display_name}: 沒有 CNN embedding。")
             continue
-        for source_folder, folder_df in part_df.groupby("source_folder", sort=True):
-            row = {
-                "dataset_role": dataset_role,
-                "source_folder": source_folder,
-                "image_count": int(folder_df["image_key"].nunique()),
-                "cell_count": int(len(folder_df)),
-                "positive_ratio": np.nan if dataset_role == "HoldoutPredict" else float(folder_df["ki67_label"].mean()),
-            }
-            rows.append(row)
-    return pd.DataFrame(rows)
+        row, artifacts = evaluate_config(
+            config,
+            train_df,
+            valid_df,
+            test_df,
+            train_evidence,
+            valid_evidence,
+            test_evidence,
+            image_embeddings,
+            selected_transformer,
+            all_parameter_transformer,
+            cv_splits=args.cv_splits,
+        )
+        metrics.append(row)
+        artifact_by_key[config.key] = artifacts
+
+    if not metrics:
+        raise RuntimeError("沒有任何實驗成功完成。")
+    metrics_df = pd.DataFrame(metrics).sort_values("test_image_mae").reset_index(drop=True)
+    formal_key = args.formal_config if args.formal_config in artifact_by_key else str(metrics_df.iloc[0]["config_key"])
+    best_artifacts = artifact_by_key[formal_key]
+    split_df = pd.DataFrame(
+        [
+            summarize_split(train_df, "train"),
+            summarize_split(valid_df, "valid"),
+            summarize_split(test_df, "test"),
+        ]
+    )
+
+    metrics_out = metrics_df.copy()
+    metrics_out.insert(0, "item", "experiment_metric")
+    split_out = split_df.copy()
+    split_out.insert(0, "item", "split_summary")
+    training_summary = pd.concat([metrics_out, split_out], ignore_index=True, sort=False)
+    training_summary.to_csv(output_dir / "ki67_training_summary.csv", index=False, encoding="utf-8-sig")
+
+    if args.save_prediction_table:
+        prediction_tables: list[pd.DataFrame] = []
+        for split_name in ("train", "valid", "test"):
+            cell_table = best_artifacts[f"{split_name}_cell_predictions"].copy()
+            cell_table.insert(0, "level", "cell")
+            cell_table.insert(0, "split", split_name)
+            image_table = best_artifacts[f"{split_name}_image_predictions"].copy()
+            image_table.insert(0, "level", "image")
+            image_table.insert(0, "split", split_name)
+            prediction_tables.extend([cell_table, image_table])
+        pd.concat(prediction_tables, ignore_index=True, sort=False).to_csv(
+            output_dir / "ki67_training_predictions.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+    model_bundle = {
+        "version": "feature_group_evidence_cnn_s1",
+        "formal_config_key": formal_key,
+        "random_state": RANDOM_STATE,
+        "feature_columns": list(feature_columns),
+        "feature_group_names": list(BASE_FEATURE_GROUPS),
+        "feature_groups": {name: list(cols) for name, cols in feature_groups.items()},
+        "feature_group_models": feature_group_models,
+        "selected_parameter_transformer": selected_transformer,
+        "all_parameter_transformer": all_parameter_transformer,
+        "stage1_model": best_artifacts["stage1_model"],
+        "stage1_feature_columns": best_artifacts["stage1_feature_columns"],
+        "stage2_model": best_artifacts["stage2_model"],
+        "stage2_feature_columns": best_artifacts["stage2_feature_columns"],
+        "config": best_artifacts["config"],
+        "cnn_meta": cnn_meta,
+        "cnn_pretrained": bool(args.cnn_pretrained),
+        "cell_threshold": 0.5,
+    }
+    save_model_bundle(model_dir / "ki67_model_bundle.joblib", model_bundle)
+    save_json(
+        model_dir / "training_meta.json",
+        {
+            "formal_config_key": formal_key,
+            "cnn_meta": cnn_meta,
+            "selected_top_k": int(args.selected_top_k),
+            "cv_splits": int(args.cv_splits),
+            "summary_html": str(args.summary_html),
+        },
+    )
+
+    render_summary_html(args.summary_html, metrics_df, split_df, formal_key)
+
+    best_row = metrics_df[metrics_df["config_key"] == formal_key].iloc[0]
+    print("===== Ki67 新版訓練完成 =====")
+    print(f"模型 bundle: {model_dir / 'ki67_model_bundle.joblib'}")
+    print(f"summary.html: {args.summary_html}")
+    print(
+        f"正式組合: {best_row['display_name']} | "
+        f"test image MAE={format_pp(best_row['test_image_mae'])} | "
+        f"test cell acc={format_percent(best_row['test_cell_accuracy'])}"
+    )
+    return {
+        "metrics": metrics_df,
+        "split_summary": split_df,
+        "model_bundle": model_bundle,
+        "output_dir": output_dir,
+    }
 
 
 def main() -> None:
-    """執行正式訓練。"""
-    ensure_clean_output_dirs()
-
-    csv_files = find_cleaned_csv_files(
-        results_dir=RESULTS_DIR,
-        pattern=DATA_PATTERN,
-        excluded_source_folders=EXCLUDED_SOURCE_FOLDERS,
-    )
-    dataset = load_ki67_dataset(
-        csv_files=csv_files,
-        label_candidates=LABEL_CANDIDATES,
-        passage_candidates=PASSAGE_CANDIDATES,
-        require_label=True,
-    )
-    dataset["image_key"] = dataset["source_folder"].astype(str) + "::" + dataset["Image"].astype(str)
-    feature_cols = detect_numeric_feature_columns(dataset)
-
-    split_result = split_dev_and_holdout(dataset, HOLDOUT_SOURCE_FOLDERS)
-    dev_df = split_result["dev_df"].copy().reset_index(drop=True)
-    holdout_df = split_result["holdout_df"].copy().reset_index(drop=True)
-
-    lfso_detail_df = run_leave_source_folder_out_cv(dev_df=dev_df, feature_cols=feature_cols)
-    config_summary_df = (
-        lfso_detail_df.groupby(["stage1_use_class_weight", "stage2_model"], as_index=False)
-        .agg(
-            lfso_image_mae=("image_mae", "mean"),
-            lfso_image_rmse=("image_rmse", "mean"),
-            lfso_folder_mae=("folder_mae", "mean"),
-            lfso_folder_within_0p05=("folder_within_0p05", "mean"),
-            lfso_folder_within_0p10=("folder_within_0p10", "mean"),
-        )
-        .sort_values(["lfso_folder_mae", "lfso_image_mae", "stage2_model"])
-        .reset_index(drop=True)
-    )
-    config_summary_df["config_name"] = config_summary_df.apply(
-        lambda row: f"cw_{str(bool(row['stage1_use_class_weight'])).lower()}__{row['stage2_model']}",
-        axis=1,
-    )
-
-    final_results: Dict[str, Dict[str, Any]] = {}
-    holdout_bdl_mae_list: List[float] = []
-    for _, row in config_summary_df.iterrows():
-        config_name = row["config_name"]
-        final_result = train_final_pipeline(
-            dev_df=dev_df,
-            holdout_df=holdout_df,
-            feature_cols=feature_cols,
-            use_class_weight=bool(row["stage1_use_class_weight"]),
-            stage2_model_name=str(row["stage2_model"]),
-        )
-        final_results[config_name] = final_result
-        compare_df = final_result["holdout_compare_df"]
-        holdout_bdl_mae = float(compare_df["abs_error"].mean()) if len(compare_df) > 0 else np.nan
-        holdout_bdl_mae_list.append(holdout_bdl_mae)
-
-    config_summary_df["holdout_bdl_mae"] = holdout_bdl_mae_list
-
-    auto_best_row = config_summary_df.sort_values(
-        ["lfso_folder_mae", "lfso_image_mae", "stage2_model"]
-    ).iloc[0]
-    auto_best_config_name = str(auto_best_row["config_name"])
-    formal_match_df = config_summary_df[config_summary_df["config_name"] == FORMAL_SELECTED_CONFIG_NAME].copy()
-    if len(formal_match_df) != 1:
-        raise ValueError(f"找不到正式指定組態: {FORMAL_SELECTED_CONFIG_NAME}")
-
-    best_row = formal_match_df.iloc[0]
-    best_config_name = str(best_row["config_name"])
-    best_final_result = final_results[best_config_name]
-    best_holdout_bdl_config_name = str(
-        config_summary_df.sort_values(["holdout_bdl_mae", "lfso_folder_mae"]).iloc[0]["config_name"]
-    )
-
-    joblib.dump(best_final_result["stage1_artifacts"]["stage1_model"], MODEL_DIR / "stage1_cell_model.joblib")
-    joblib.dump(best_final_result["stage1_artifacts"]["calibrator"], MODEL_DIR / "stage1_calibrator.joblib")
-    joblib.dump(best_final_result["stage2_model"], MODEL_DIR / "stage2_ratio_model.joblib")
-    joblib.dump(
-        {
-            "imputer": best_final_result["feature_pipeline"]["prep"]["imputer"],
-            "variance_selector": best_final_result["feature_pipeline"]["prep"]["variance_selector"],
-            "scaler": best_final_result["feature_pipeline"]["prep"]["scaler"],
-            "kept_features": best_final_result["feature_pipeline"]["prep"]["kept_features"],
-            "raw_feature_columns": feature_cols,
-            "selected_features": best_final_result["feature_pipeline"]["selected_features"],
-        },
-        MODEL_DIR / "preprocess_bundle.joblib",
-    )
-    save_json(
-        MODEL_DIR / "ratio_feature_columns.json",
-        {"feature_names": best_final_result["design_feature_names"]},
-    )
-    save_json(
-        MODEL_DIR / "training_meta.json",
-        {
-            "selected_config_name": best_config_name,
-            "selected_by": "manual_override",
-            "formal_selected_config_name": FORMAL_SELECTED_CONFIG_NAME,
-            "auto_best_config_name": auto_best_config_name,
-            "closest_bdl_config_name": best_holdout_bdl_config_name,
-            "stage1_model_name": "SGDClassifier(log_loss)",
-            "stage1_calibration_method": STAGE1_CALIBRATION_METHOD,
-            "stage1_use_class_weight": bool(best_row["stage1_use_class_weight"]),
-            "stage2_model_name": str(best_row["stage2_model"]),
-            "random_state": RANDOM_STATE,
-            "similarity_threshold": SIMILARITY_THRESHOLD,
-            "positive_corr_threshold": POSITIVE_CORR_THRESHOLD,
-            "excluded_source_folders": EXCLUDED_SOURCE_FOLDERS,
-            "holdout_source_folders": HOLDOUT_SOURCE_FOLDERS,
-            "selected_features": best_final_result["feature_pipeline"]["selected_features"],
-            "raw_feature_columns": feature_cols,
-        },
-    )
-
-    save_json(
-        REPORT_DIR / "training_summary.json",
-        {
-            "csv_file_count": len(csv_files),
-            "total_rows": int(len(dataset)),
-            "dev_rows": int(len(dev_df)),
-            "holdout_rows": int(len(holdout_df)),
-            "raw_feature_count": len(feature_cols),
-            "selected_feature_count": len(best_final_result["feature_pipeline"]["selected_features"]),
-            "selected_config_name": best_config_name,
-            "auto_best_config_name": auto_best_config_name,
-            "closest_bdl_config_name": best_holdout_bdl_config_name,
-            "selected_config_lfso_folder_mae": float(best_row["lfso_folder_mae"]),
-            "selected_config_holdout_bdl_mae": float(best_row["holdout_bdl_mae"]),
-            "stage1_group_cv_splits": int(best_final_result["stage1_artifacts"]["n_splits"]),
-        },
-    )
-
-    print("===== Ki67 正式訓練完成 =====")
-    print(f"輸出目錄: {OUTPUT_ROOT}")
-    print(f"正式選用組態: {best_config_name}")
-    print(f"自動最佳組態: {auto_best_config_name}")
-    print(f"最接近 BDL 的組態: {best_holdout_bdl_config_name}")
-    print("===== 正式選用組態指標 =====")
-    print(pd.DataFrame([best_row]).to_string(index=False))
+    """命令列入口。"""
+    run_training(parse_args())
 
 
 if __name__ == "__main__":

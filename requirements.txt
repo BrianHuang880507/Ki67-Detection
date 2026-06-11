@@ -2,13 +2,14 @@
 #   mamba create -n ki67 python=3.10 pyimagej openjdk=11 pip -c conda-forge -y
 # Then install the remaining pip dependencies:
 #   pip install -r requirements.txt
+# Supported Python range: 3.10-3.12. Cellpose 3.1.1.1 requires numpy<2.1.
 
 pyimagej
 scyjava
 jpype1
 cellpose==3.1.1.1
 pandas
-numpy
+numpy>=1.20,<2.1
 scipy
 mahotas
 scikit-learn

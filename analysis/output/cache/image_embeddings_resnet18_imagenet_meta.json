@@ -1,0 +1,9 @@
+{
+  "status": "computed",
+  "device": "cuda",
+  "images_total": 919,
+  "images_embedded": 919,
+  "images_missing": 0,
+  "missing_image_keys": [],
+  "weights": "ResNet18_Weights.DEFAULT"
+}
