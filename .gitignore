@@ -9,6 +9,7 @@ __pycache__/
 
 # Generated tables and figures
 *.csv
+*.xlsx
 *.png
 *.joblib
 

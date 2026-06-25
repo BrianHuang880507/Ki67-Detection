@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import textwrap
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -485,6 +486,135 @@ def save_embedding_mae_chart(summary: pd.DataFrame, output_path: Path, item: str
     plt.close(fig)
 
 
+def save_embedding_correct_rate_chart(summary: pd.DataFrame, output_path: Path, item: str, title: str) -> None:
+    """輸出加入/不加入 image embedding 的影像 Ki67 比例正確百分比圖。
+
+    Args:
+        summary: 實驗彙整表，需包含 feature_combo、with_image_embedding 與 test_image_mae。
+        output_path: 圖片輸出路徑。
+        item: 要繪製的實驗項目，例如 feature_combo。
+        title: 圖表標題。
+    """
+    plot_df = summary[summary["item"] == item].copy()
+    pivot = plot_df.pivot_table(index="feature_combo", columns="with_image_embedding", values="test_image_mae").dropna()
+    pivot = pivot.sort_values(False).head(16)
+    group_counts = (
+        plot_df.drop_duplicates("feature_combo")
+        .set_index("feature_combo")["feature_group_count"]
+        .apply(pd.to_numeric, errors="coerce")
+        .to_dict()
+    )
+    correct_rate = (1.0 - pivot) * 100.0
+    x = np.arange(len(correct_rate))
+    width = 0.36
+    fig_width = max(11.0, 0.78 * len(correct_rate) + 3.8)
+
+    def short_combo_name(value: str) -> str:
+        """將 feature group 名稱縮短，讓 x 軸與對照表更容易閱讀。"""
+        replacements = {
+            "Intensity distribution": "Intensity",
+            "Attachment / spreading": "Attachment",
+            "Halo / rounding": "Halo",
+            "Local crowding": "Crowding",
+            "Mitosis likelihood": "Mitosis",
+            "Nuclear morphology": "Nuclear",
+            "Debris / culture health": "Debris",
+            "Colony / FOV context": "FOV",
+        }
+        result = value
+        for source, target in replacements.items():
+            result = result.replace(source, target)
+        return result
+
+    x_labels: list[str] = []
+    code_rows: list[list[str]] = []
+    code_number = 1
+    for combo in correct_rate.index:
+        group_count = group_counts.get(combo, np.nan)
+        if pd.notna(group_count) and float(group_count) > 3:
+            code = f"C{code_number}"
+            x_labels.append(code)
+            code_rows.append([code, textwrap.fill(short_combo_name(combo), width=78)])
+            code_number += 1
+        else:
+            x_labels.append(short_combo_name(combo))
+
+    if code_rows:
+        fig, (ax, table_ax) = plt.subplots(
+            2,
+            1,
+            figsize=(fig_width, 8.2),
+            dpi=220,
+            gridspec_kw={"height_ratios": [5.5, 1.35]},
+        )
+    else:
+        fig, ax = plt.subplots(figsize=(fig_width, 7.0), dpi=220)
+        table_ax = None
+
+    bars_no = ax.bar(
+        x - width / 2,
+        correct_rate[False],
+        width,
+        color="#3182bd",
+        edgecolor="#334155",
+        label="不加入 image embedding",
+    )
+    bars_yes = ax.bar(
+        x + width / 2,
+        correct_rate[True],
+        width,
+        color="#f59e0b",
+        edgecolor="#334155",
+        label="加入 image embedding",
+    )
+    ax.set_title(title, fontsize=16)
+    ax.set_ylabel("影像 Ki67 比例正確百分比 (%)")
+    ax.set_ylim(max(0.0, float(np.nanmin(correct_rate.to_numpy())) - 3.0), 100.0)
+    ax.set_xticks(x)
+    ax.set_xticklabels(x_labels, rotation=25, ha="right", fontsize=8.5)
+    ax.grid(axis="y", color="#dbe3ec", linewidth=1, alpha=0.9)
+    ax.set_axisbelow(True)
+    for bars in (bars_no, bars_yes):
+        for bar in bars:
+            value = bar.get_height()
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                value + 0.18,
+                f"{value:.2f}%",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+    ax.legend(loc="upper left")
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+
+    if table_ax is not None:
+        table_ax.axis("off")
+        table = table_ax.table(
+            cellText=code_rows,
+            colLabels=["代碼", "Feature combo"],
+            cellLoc="left",
+            colLoc="left",
+            loc="center",
+            colWidths=[0.08, 0.92],
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(8)
+        table.scale(1.0, 1.45)
+        for (row, column), cell in table.get_celld().items():
+            cell.set_edgecolor("#cbd5e1")
+            if row == 0:
+                cell.set_facecolor("#e2e8f0")
+                cell.set_text_props(weight="bold")
+            elif column == 0:
+                cell.set_text_props(weight="bold", ha="center")
+
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+
+
 def save_formal_mae_chart(summary: pd.DataFrame, output_path: Path) -> None:
     """輸出正式候選模型的 image-level MAE 排序圖。"""
     plot_df = summary[summary["item"] == "formal"].copy()
@@ -650,6 +780,12 @@ def run_experiments(args: argparse.Namespace) -> pd.DataFrame:
     setup_font()
     save_relation_chart(summary, charts_dir / "feature_group_relation.png", None)
     save_embedding_mae_chart(summary, charts_dir / "feature_combo_embedding_mae.png", "feature_combo", "Image embedding 對 Feature combo Test MAE 的影響")
+    save_embedding_correct_rate_chart(
+        summary,
+        charts_dir / "feature_combo_embedding_correct_rate.png",
+        "feature_combo",
+        "Image embedding 對 Feature combo Test 正確百分比的影響",
+    )
     save_embedding_mae_chart(summary, charts_dir / "formal_embedding_mae.png", "formal", "Image embedding 對正式流程 Test MAE 的影響")
     save_formal_mae_chart(summary, charts_dir / "formal_combo_image_mae.png")
     formal_summary = summary[summary["item"] == "formal"].copy()

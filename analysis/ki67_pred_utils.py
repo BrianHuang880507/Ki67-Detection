@@ -179,6 +179,7 @@ class ExperimentConfig:
         include_cnn_embedding: 是否使用 ResNet18 image embedding。
         parameter_mode: 參數輸入模式，支援 ``none``、``selected``、``all``。
         stage2_mode: Stage 2 模式，支援 ``S0``、``S1``、``S3``、``S4``。
+        feature_score_groups: 使用哪些 feature-group evidence scores；``None`` 表示使用全部。
     """
 
     key: str
@@ -189,6 +190,7 @@ class ExperimentConfig:
     include_cnn_embedding: bool
     parameter_mode: str
     stage2_mode: str
+    feature_score_groups: tuple[str, ...] | None = None
 
 
 @dataclass
@@ -1256,7 +1258,7 @@ test cell accuracy = <strong>{format_percent(best['test_cell_accuracy'])}</stron
 <table><thead><tr><th>實驗組合</th><th>Stage 1 輸入</th><th>Stage 2 輸入</th><th>Train cell acc.</th><th>Valid cell acc.</th><th>Test cell acc.</th><th>Train image MAE</th><th>Valid image MAE</th><th>Test image MAE</th></tr></thead>
 <tbody>{''.join(rows)}</tbody></table>
 <h2>說明</h2>
-<p class="note">Feature 代表 feature-group Ki67 evidence scores；Texture、Intensity distribution 與 Halo / rounding 各自以 elastic-net logistic classifier 轉為 cell-level Ki67 evidence score。CNN embedding 由每張 PC 原圖經 ResNet18 轉為一維 image embedding，再回填到同影像內所有 cell。Stage 2 S1 使用 probability summary 預測每張影像 Ki67 positive rate。</p>
+<p class="note">Feature 代表指定 feature-group Ki67 evidence scores；各 feature group 會先以 elastic-net logistic classifier 轉為 cell-level Ki67 evidence score。若該組合啟用 CNN embedding，則由每張 PC 原圖經 ResNet18 轉為一維 image embedding，再回填到同影像內所有 cell。Stage 2 S1 使用 probability summary 預測每張影像 Ki67 positive rate。</p>
 </body>
 </html>
 """
@@ -1265,7 +1267,20 @@ test cell accuracy = <strong>{format_percent(best['test_cell_accuracy'])}</stron
 
 def default_experiment_configs() -> list[ExperimentConfig]:
     """回傳新版預設實驗組合。"""
+    standard_feature_groups = ("Texture", "Intensity distribution", "Halo / rounding")
+    report_feature_groups = ("Texture", "Attachment / spreading")
     return [
+        ExperimentConfig(
+            key="texture_attachment_s1",
+            display_name="Texture + Attachment / S1 no embedding",
+            stage1_input_name="Texture + Attachment feature-group evidence scores",
+            stage2_name="S1: probability summary",
+            include_feature_scores=True,
+            include_cnn_embedding=False,
+            parameter_mode="none",
+            stage2_mode="S1",
+            feature_score_groups=report_feature_groups,
+        ),
         ExperimentConfig(
             key="feature_cnn_s0",
             display_name="Feature + CNN embedding / S0 direct mean",
@@ -1275,6 +1290,7 @@ def default_experiment_configs() -> list[ExperimentConfig]:
             include_cnn_embedding=True,
             parameter_mode="none",
             stage2_mode="S0",
+            feature_score_groups=standard_feature_groups,
         ),
         ExperimentConfig(
             key="feature_cnn_s1",
@@ -1285,6 +1301,7 @@ def default_experiment_configs() -> list[ExperimentConfig]:
             include_cnn_embedding=True,
             parameter_mode="none",
             stage2_mode="S1",
+            feature_score_groups=standard_feature_groups,
         ),
         ExperimentConfig(
             key="feature_cnn_s3",
@@ -1295,6 +1312,7 @@ def default_experiment_configs() -> list[ExperimentConfig]:
             include_cnn_embedding=True,
             parameter_mode="none",
             stage2_mode="S3",
+            feature_score_groups=standard_feature_groups,
         ),
         ExperimentConfig(
             key="feature_cnn_selected_s1",
@@ -1305,6 +1323,7 @@ def default_experiment_configs() -> list[ExperimentConfig]:
             include_cnn_embedding=True,
             parameter_mode="selected",
             stage2_mode="S1",
+            feature_score_groups=standard_feature_groups,
         ),
         ExperimentConfig(
             key="feature_cnn_selected_s4",
@@ -1315,6 +1334,7 @@ def default_experiment_configs() -> list[ExperimentConfig]:
             include_cnn_embedding=True,
             parameter_mode="selected",
             stage2_mode="S4",
+            feature_score_groups=standard_feature_groups,
         ),
         ExperimentConfig(
             key="feature_only_s1",
@@ -1325,6 +1345,7 @@ def default_experiment_configs() -> list[ExperimentConfig]:
             include_cnn_embedding=False,
             parameter_mode="none",
             stage2_mode="S1",
+            feature_score_groups=standard_feature_groups,
         ),
         ExperimentConfig(
             key="cnn_only_s1",
