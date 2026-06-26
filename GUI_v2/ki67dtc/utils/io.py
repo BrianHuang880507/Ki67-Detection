@@ -1,0 +1,235 @@
+from pathlib import Path
+from natsort import natsorted
+from typing import Union
+import pandas as pd
+import os
+
+
+def extract_id(label):
+    parts = label.split(":")[1].split("-")  # NewCell-1-and2
+    img = label.split(":")[0]
+    return f"{img}_{parts[1]}"
+
+
+def extract_index(cell_id):
+    return int(cell_id.split("_")[-1])
+
+
+def list_files(folder: Path, exts: Union[str, tuple, list] = None) -> list[Path]:
+    """
+    掃描資料夾，依自然排序回傳符合副檔名的檔案路徑。
+    """
+    folder = Path(folder)
+    if exts is None:
+        return natsorted([f for f in folder.iterdir() if f.is_file()])
+
+    if isinstance(exts, str):
+        exts = (exts,)
+    else:
+        exts = tuple(exts)
+
+    return natsorted(
+        [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in exts]
+    )
+
+
+def output_dir(out_dir: Path, subfolder: str) -> Path:
+    """
+    根據 input_dir 自動建立對應的輸出資料夾
+    """
+    #output_root = Path(f"./data/output/{subfolder}")
+    #output_dir = output_root / input_dir.name 
+    output_dir = Path(f"{out_dir}/{subfolder}")
+    if not output_dir.exists():
+        output_dir.mkdir(parents=True, exist_ok=True)
+        #print("yes")
+    return output_dir
+
+
+def load_outlines(filepath):
+    """讀取 outlines txt 檔案內容，回傳字串列表"""
+    with open(filepath, "r") as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def remove_temp_files(folder: Path, keywords: list[str] = None, exts: list[str] = None):
+    """
+    刪除含有特定關鍵字與副檔名的暫存檔案。
+    """
+    if keywords is None:
+        keywords = [
+            "params",
+            "params_merged",
+            "fluorescence",
+            "fluor_flat",
+            "_cyto_seg_cp_outlines",
+            "_nuc_seg_cp_outlines",
+        ]
+
+    deleted_files = []
+    for f in folder.glob("*"):
+        if not f.is_file():
+            continue
+        if exts and f.suffix.lower() not in exts:
+            continue
+        if any(k in f.name for k in keywords):
+            try:
+                f.unlink()
+                deleted_files.append(f.name)
+            except Exception as e:
+                print(f"[WARN] 無法刪除 {f.name} → {e}")
+
+    print(f"[INFO] 刪除暫存檔案共 {len(deleted_files)} 個")
+
+
+# ===============================
+# Excel / CSV 資料處理工具
+# ===============================
+def merged_excel(input: Union[str, Path], output: Union[str, Path]):
+    """
+    合併兩個 CSV 檔案：
+    - 將核與質兩部分以 Cell_ID 合併
+    - 並移除重複出現的 Nuc_Cyto_Ratio 欄位
+    """
+    df = pd.read_csv(input)
+
+    df["ROI_Type"] = df["Cell_ID"].apply(lambda x: x.split("_")[-1])
+    df["Cell_ID"] = df["Cell_ID"].apply(lambda x: "_".join(x.split("_")[:-1]))
+
+    nucleus_df = df[df["ROI_Type"].str.lower() == "nuc"].copy()
+    cyto_df = df[df["ROI_Type"].str.lower() == "cyto"].copy()
+
+    nucleus_df = nucleus_df.drop(columns=["ROI_Type"]).set_index("Cell_ID")
+    cyto_df = cyto_df.drop(columns=["ROI_Type"]).set_index("Cell_ID")
+
+    nucleus_df = nucleus_df.drop(columns=["Karyoplasmic Ratio"], errors="ignore")
+
+    nucleus_df = nucleus_df.add_suffix("_nuc")
+    cyto_df = cyto_df.add_suffix("_cyto")
+
+    merged_df = pd.concat([nucleus_df, cyto_df], axis=1).reset_index()
+    if "Karyoplasmic Ratio_nuc" in merged_df.columns:
+        merged_df = merged_df.rename(
+            columns={"Karyoplasmic Ratio_nuc": "Nuc_Cyto_Ratio"}
+        )
+    merged_df.to_csv(output, index=False)
+
+
+def flatten_fluor_table(flour_csv: Union[str, Path], output: Union[str, Path]):
+    """
+    攤平成一列一個 Label 的螢光分析表：
+    - 從 Label 欄位提取 Cell_ID 與 ROI_ID
+    - 每列代表一個 Cell，每欄對應一個 ROI 的 IntDen / RawIntDen 值
+    - 輸出為寬表（wide format）至新 CSV
+    """
+    df = pd.read_csv(flour_csv)
+    df = df.drop(columns=[" "], errors="ignore")
+
+    df["Cell_ID"] = df["Label"].apply(extract_id)
+    df["ROI_ID"] = df["Label"].str.extract(r"-and(\d+)")[0]
+    df = df[df["ROI_ID"].notna()].copy()
+    df["ROI_ID"] = df["ROI_ID"].astype(int)
+
+    if df.empty:
+        print("[警告] 沒有 ROI_ID 可轉換，請檢查 Label 格式")
+        return pd.DataFrame()
+
+    df_wide = df.pivot(
+        index="Cell_ID", columns="ROI_ID", values=["IntDen", "RawIntDen"]
+    )
+    df_wide.columns = [f"{col[0]}-{col[1]}" for col in df_wide.columns]
+    df_wide = df_wide.reset_index()
+
+    df_wide["SortKey"] = df_wide["Cell_ID"].apply(extract_index)
+    df_wide = df_wide.sort_values("SortKey").drop(columns="SortKey")
+
+    df_wide.to_csv(output, index=False)
+
+
+def merge_with_flour(
+    df1_csv: Union[str, Path], df2_csv: Union[str, Path], output_csv: Union[str, Path]
+):
+    """
+    依照 Cell_ID 合併幾何與螢光分析結果：
+    - 以 index 對應方式合併兩份資料
+    - 輸出合併後的 CSV
+    """
+    df1 = pd.read_csv(df1_csv)
+    df2 = pd.read_csv(df2_csv)
+
+    df1["Cell_Index"] = df1["Cell_ID"].apply(extract_index)
+    df2["Cell_Index"] = df2["Cell_ID"].apply(extract_index)
+
+    merged = pd.merge(df1, df2.drop(columns=["Cell_ID"]), on="Cell_Index", how="left")
+    merged = merged.drop(columns=["Cell_Index"])
+    merged.to_csv(output_csv, index=False)
+
+
+def merge_all_final_csvs(result_dir: Union[str, Path]):
+    """
+    合併某資料夾內所有 *_final.csv 為一個 CSV 檔
+    - 會在每筆資料中加入 'Image' 欄位標記來自哪張圖
+    - 輸出為 {input_dir.name}_final.csv
+    """
+    final_files = sorted(result_dir.glob("*_final.csv"))
+
+    if not final_files:
+        print(f"[WARN] 找不到 *_final.csv 於 {result_dir}")
+        return
+
+    all_dfs = []
+    for file in final_files:
+        df = pd.read_csv(file)
+        df["Image"] = file.stem.replace("_final", "")
+        all_dfs.append(df)
+
+    merged_df = pd.concat(all_dfs, ignore_index=True)
+
+    #output_path = result_dir / f"{input_dir.name}.csv"
+    file_name = "ALL_para_combine.csv"
+    output_path = result_dir / file_name
+    merged_df.to_csv(output_path, index=False)
+    print(f"[INFO] 已合併 {len(final_files)} 個檔案 → {output_path}")
+    return file_name
+
+
+def generate_image_mapping(
+    pc_dir, df_dir, ki67_dir, output_csv="image_mapping.csv"
+) -> Path:
+    pc_dir = Path(pc_dir)
+    df_dir = Path(df_dir)
+    ki67_dir = Path(ki67_dir)
+
+    def get_images(folder):
+        return natsorted(
+            [
+                f.name
+                for f in folder.glob("*")
+                if f.suffix.lower() in [".jpg", ".png", ".tif", ".tiff"]
+            ]
+        )
+
+    pc_imgs = get_images(pc_dir)
+    df_imgs = get_images(df_dir)
+    ki67_imgs = get_images(ki67_dir)
+
+    max_len = max(len(pc_imgs), len(df_imgs), len(ki67_imgs))
+
+    def safe_get(lst, idx):
+        return lst[idx] if idx < len(lst) else ""
+
+    rows = []
+    for i in range(max_len):
+        rows.append(
+            {
+                "PC_Name": safe_get(pc_imgs, i),
+                "DF_Name": safe_get(df_imgs, i),
+                "KI67_Name": safe_get(ki67_imgs, i),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    out_path = pc_dir.parent / output_csv
+    df.to_csv(str(out_path), index=False)
+    print(f"[INFO] 產生 image_mapping.csv → {pc_dir.parent / output_csv}")
+    return out_path

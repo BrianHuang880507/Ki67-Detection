@@ -1,0 +1,24 @@
+# Install numpy and scipy FIRST via conda to avoid Windows DLL crashes:
+#   conda install -c conda-forge numpy=1.26.4 scipy=1.13.1
+# Then install the rest with pip:
+#   pip install -r requirements.txt
+
+PyQt5==5.15.11
+numpy==1.26.4
+scipy==1.13.1
+scikit-image==0.24.0
+opencv-python-headless==4.10.0.84
+pandas==2.2.3
+tqdm==4.67.1
+natsort==8.4.0
+shapely==2.0.6
+imageio==2.35.1
+cellpose==3.1.1.1
+Pillow==10.4.0
+matplotlib==3.9.2
+
+# PyTorch — CUDA 12.4 build (compatible with CUDA 12.6 drivers)
+# Install separately:
+#   pip install torch==2.4.1+cu124 torchvision==0.19.1+cu124 --index-url https://download.pytorch.org/whl/cu124
+torch==2.4.1+cu124
+torchvision==0.19.1+cu124

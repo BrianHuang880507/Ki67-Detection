@@ -1,0 +1,21 @@
+# PyInstaller build artifacts (regenerable, large)
+build/
+dist/
+*.spec.bak
+
+# Bundled redistributables (download separately)
+VC_redist.x64.exe
+
+# Example / generated data and outputs
+data2/
+
+# Byte-compiled python
+__pycache__/
+*.py[cod]
+
+# Tooling / brainstorm state
+.superpowers/
+
+# OS junk
+Thumbs.db
+.DS_Store
