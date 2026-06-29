@@ -140,6 +140,12 @@ class MainWindowLayoutContractTest(unittest.TestCase):
         self.assertIn("#1C2030", APP_QSS)
         self.assertIn("#1C2030", self.window.styleSheet())
 
+    def test_control_button_theme_uses_cyan_default_and_subdued_disabled(self) -> None:
+        self.assertIn("QToolButton", APP_QSS)
+        self.assertIn("background-color: #00AEEF", APP_QSS)
+        self.assertIn("QToolButton:disabled", APP_QSS)
+        self.assertIn("background-color: #2A3142", APP_QSS)
+
     def test_progress_updates_are_appended_to_terminal_output(self) -> None:
         self.window._on_progress_changed(1, 4, "正在分析影像")
 

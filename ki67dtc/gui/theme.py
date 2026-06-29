@@ -64,22 +64,30 @@ QTableWidget#featureParameterTable {
 }
 
 QToolButton {
-    background-color: #E8EDF5;
+    background-color: #00AEEF;
     color: #111827;
-    border: 1px solid #C6D0DF;
+    border: 1px solid #00AEEF;
     border-radius: 4px;
+    min-width: 30px;
+    min-height: 26px;
     padding: 6px;
 }
 
 QToolButton:hover {
-    background-color: #00AEEF;
+    background-color: #22C7FF;
     color: #071018;
-    border-color: #00AEEF;
+    border-color: #22C7FF;
 }
 
 QToolButton:pressed {
     background-color: #0089C0;
     border-color: #0089C0;
+}
+
+QToolButton:disabled {
+    background-color: #2A3142;
+    color: #6E7A90;
+    border-color: #344057;
 }
 
 QLabel#areaChartLabel {
