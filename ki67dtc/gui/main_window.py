@@ -144,6 +144,7 @@ class MainWindow(QMainWindow):
         self._show_ki67: bool = False
         self._overlay_alpha: float = 0.5
         self._current_data_folder: Path | None = None
+        self._area_chart_pixmap: QPixmap | None = None
         # 新增：目前選中的 Cell_ID（例如 "1_3"）
         self._selected_cell_id: str | None = None
         self._highlight_enabled: bool = False
@@ -560,10 +561,17 @@ class MainWindow(QMainWindow):
     def _on_reset_clicked(self) -> None:
         """重設 UI 狀態、影像清單、結果表與 overlay。"""
         self.progress_bar.setValue(0)
+        if hasattr(self, "terminal_output"):
+            self.terminal_output.clear()
+            self.terminal_output.append("[INFO] 等待開啟資料夾...")
         self.image_list.clear()
         self.results_table.clear()
         self.results_table.setRowCount(0)
         self.results_table.setColumnCount(0)
+        self.image_file_label.setText("Image File Name")
+        self.area_chart_label.clear()
+        self.area_chart_label.setText("")
+        self._area_chart_pixmap = None
         self._pipeline_result = None
         self._current_image_index = None
         self._current_image_array = None
@@ -579,11 +587,18 @@ class MainWindow(QMainWindow):
         self._set_running_state(False)
         self.statusBar().showMessage("已重設")
 
+    def _append_terminal_line(self, level: str, message: str) -> None:
+        """將訊息追加到終端輸出面板。"""
+        if hasattr(self, "terminal_output"):
+            self.terminal_output.append(f"[{level}] {message}")
+
     def _on_progress_changed(self, done: int, total: int, message: str) -> None:
         """更新進度條與狀態列文字。"""
         percent = int(done / total * 100) if total > 0 else 0
         self.progress_bar.setValue(percent)
         self.statusBar().showMessage(f"{message} ({done}/{total})")
+        suffix = f" ({done}/{total})" if total > 0 else ""
+        self._append_terminal_line("INFO", f"{message}{suffix}")
 
     def _on_pipeline_finished(self, result: PipelineResult) -> None:
         """處理 pipeline 成功結束後的影像清單與結果載入。"""
@@ -597,15 +612,22 @@ class MainWindow(QMainWindow):
 
         # pipeline 結束後載入 cleaned CSV
         self._load_cleaned_csv_for_dataset()
+        self._load_area_chart()
 
         self.statusBar().showMessage(
             f"Pipeline 完成，共處理 {len(result.image_files)} 張影像"
+        )
+
+        self._append_terminal_line(
+            "INFO", f"Pipeline 完成，載入 {len(result.image_files)} 張影像"
         )
 
     def _on_pipeline_failed(self, message: str) -> None:
         """處理 pipeline 失敗訊息並恢復 Run 按鈕。"""
         self._set_running_state(False)
         self.statusBar().showMessage(f"錯誤：{message}")
+
+        self._append_terminal_line("ERROR", message)
 
     def _on_image_selection_changed(self, row: int) -> None:
         """切換目前選取影像並更新 overlay 與結果表。"""
@@ -635,6 +657,7 @@ class MainWindow(QMainWindow):
             img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2BGR)
 
         self._current_image_array = img_bgr
+        self.image_file_label.setText(img_path.name)
 
         # 嘗試載入 outlines
         merged_path = find_merged_outline_for_image(img_path)
@@ -782,6 +805,69 @@ class MainWindow(QMainWindow):
         if self._scene.items():
             item = self._scene.items()[0]
             self.graphics_view.fitInView(item, Qt.AspectRatioMode.KeepAspectRatio)
+        if getattr(self, "_area_chart_pixmap", None) is not None:
+            self._scale_area_chart_pixmap()
+
+    def _scale_area_chart_pixmap(self) -> None:
+        """依照目前圖表區塊大小縮放細胞面積分析圖。"""
+        if self._area_chart_pixmap is None or self._area_chart_pixmap.isNull():
+            return
+        target_size = self.area_chart_label.size()
+        if target_size.width() <= 0 or target_size.height() <= 0:
+            return
+        self.area_chart_label.setPixmap(
+            self._area_chart_pixmap.scaled(
+                target_size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def _load_area_chart(self) -> None:
+        """載入細胞面積分析圖並顯示於右側圖表區塊。"""
+        candidates: list[Path] = []
+        if self._current_data_folder is not None:
+            candidates.append(
+                self._current_data_folder.parent.parent
+                / "output"
+                / "figure"
+                / "all_log_cell_area_distribution.png"
+            )
+        else:
+            candidates.extend(
+                [
+                    Path("data/output/figure/all_log_cell_area_distribution.png"),
+                    Path("data2/output/figure/all_log_cell_area_distribution.png"),
+                ]
+            )
+
+        seen: set[Path] = set()
+        chart_path: Path | None = None
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if candidate.exists():
+                chart_path = candidate
+                break
+
+        if chart_path is None:
+            self._area_chart_pixmap = None
+            self.area_chart_label.clear()
+            self.area_chart_label.setText("尚無細胞面積分析圖")
+            return
+
+        pixmap = QPixmap(str(chart_path))
+        if pixmap.isNull():
+            self._area_chart_pixmap = None
+            self.area_chart_label.clear()
+            self.area_chart_label.setText("尚無細胞面積分析圖")
+            return
+
+        self.area_chart_label.setText("")
+        self._area_chart_pixmap = pixmap
+        self._scale_area_chart_pixmap()
 
     def _on_overlay_controls_changed(self) -> None:
         """當 overlay checkbox / alpha / view mode 改變時刷新顯示。
@@ -819,9 +905,12 @@ class MainWindow(QMainWindow):
         )
 
         self._populate_image_list(image_files)
+        self._load_area_chart()
 
         if image_files:
             self.image_list.setCurrentRow(0)
+            self._append_terminal_line("INFO", f"載入資料夾：{data_folder}")
+            self._append_terminal_line("INFO", f"找到 {len(image_files)} 張影像")
             self.statusBar().showMessage(f"載入 {len(image_files)} 張影像")
         else:
             self._scene.clear()
@@ -834,6 +923,12 @@ class MainWindow(QMainWindow):
             self.image_list.addItem(p.name)
         if image_files:
             self.image_list.setCurrentRow(0)
+        else:
+            self._current_image_index = None
+            self._current_image_array = None
+            self._current_overlay_image = None
+            self.image_file_label.setText("Image File Name")
+            self._scene.clear()
 
     def _load_cleaned_csv_for_dataset(self) -> None:
         """嘗試載入 data/output/results/<dataset>/<dataset>_cleaned.csv 並填表"""
