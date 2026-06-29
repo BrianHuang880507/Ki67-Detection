@@ -175,6 +175,51 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(running)
         self.restart_button.setEnabled(not running)
 
+    def _selected_action_value(
+        self,
+        actions: list[QtGui.QAction],
+        default: str,
+    ) -> str:
+        """取得目前選取的 action 資料值。
+
+        Args:
+            actions: 同一選項群組中的 action 清單。
+            default: 沒有任何 action 被選取時使用的預設值。
+
+        Returns:
+            目前勾選 action 的 `data()` 字串，或預設值。
+        """
+        for action in actions:
+            if action.isChecked():
+                return str(action.data())
+        return default
+
+    def _add_exclusive_option_actions(
+        self,
+        menu: QtWidgets.QMenu,
+        options: list[tuple[str, str, bool]],
+    ) -> list[QtGui.QAction]:
+        """在 submenu 中加入互斥的選項 actions。
+
+        Args:
+            menu: 要放入選項的 submenu。
+            options: `(顯示文字, backend value, 是否預設勾選)` 清單。
+
+        Returns:
+            已建立的 actions。
+        """
+        group = QtGui.QActionGroup(menu)
+        group.setExclusive(True)
+        actions: list[QtGui.QAction] = []
+        for label, value, checked in options:
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(checked)
+            action.setData(value)
+            group.addAction(action)
+            actions.append(action)
+        return actions
+
     def _on_results_table_cell_clicked(self, row: int, col: int) -> None:
         """滑鼠點擊表格任一格：若點到同一列，切換高亮 on/off。"""
         self._toggle_highlight_by_row(row)
@@ -224,9 +269,36 @@ class MainWindow(QMainWindow):
         self.action_open_input.triggered.connect(self._on_browse_input)
 
         analysis_menu = self.menuBar().addMenu("分析選項")
-        self.action_nuc_source = analysis_menu.addAction("核來源")
-        self.action_ki67_backend = analysis_menu.addAction("Ki67 Backend")
-        self.action_feature_backend = analysis_menu.addAction("分析方法")
+        nuc_menu = analysis_menu.addMenu("核來源")
+        self.nuc_source_actions = self._add_exclusive_option_actions(
+            nuc_menu,
+            [
+                ("DAPI", "dapi", True),
+                ("PC", "pc", False),
+            ],
+        )
+        self.action_nuc_source = nuc_menu.menuAction()
+
+        ki67_backend_menu = analysis_menu.addMenu("Ki67 Backend")
+        self.ki67_backend_actions = self._add_exclusive_option_actions(
+            ki67_backend_menu,
+            [
+                ("PyImageJ", "pyimagej", True),
+                ("OpenCV", "opencv", False),
+            ],
+        )
+        self.action_ki67_backend = ki67_backend_menu.menuAction()
+
+        feature_backend_menu = analysis_menu.addMenu("分析方法")
+        self.feature_backend_actions = self._add_exclusive_option_actions(
+            feature_backend_menu,
+            [
+                ("PyImageJ", "pyimagej", True),
+                ("Python", "python", False),
+            ],
+        )
+        self.action_feature_backend = feature_backend_menu.menuAction()
+
         self.action_fluor_analy = analysis_menu.addAction("螢光分析")
         self.action_fluor_analy.setCheckable(True)
         self.action_fluor_analy.setChecked(True)
@@ -520,12 +592,14 @@ class MainWindow(QMainWindow):
 
         data_folder = Path(path_text)
 
-        nuc_source = str(self.nuc_source_combo.currentData() or "dapi")
-        feature_backend = str(
-            self.feature_backend_combo.currentData() or "pyimagej"
+        nuc_source = self._selected_action_value(self.nuc_source_actions, "dapi")
+        feature_backend = self._selected_action_value(
+            self.feature_backend_actions,
+            "pyimagej",
         )
-        ki67_backend = str(
-            self.ki67_backend_combo.currentData() or "pyimagej"
+        ki67_backend = self._selected_action_value(
+            self.ki67_backend_actions,
+            "pyimagej",
         )
         fluor_analy = self.action_fluor_analy.isChecked()
         ki67 = self.action_ki67_analy.isChecked()

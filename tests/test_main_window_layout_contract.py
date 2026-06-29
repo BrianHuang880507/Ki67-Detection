@@ -46,6 +46,61 @@ class MainWindowLayoutContractTest(unittest.TestCase):
 
         self.assertEqual(actual, expected)
 
+    def test_analysis_option_submenus_expose_backend_values(self) -> None:
+        option_groups = [
+            (
+                self.window.nuc_source_actions,
+                [("DAPI", "dapi", True), ("PC", "pc", False)],
+            ),
+            (
+                self.window.ki67_backend_actions,
+                [("PyImageJ", "pyimagej", True), ("OpenCV", "opencv", False)],
+            ),
+            (
+                self.window.feature_backend_actions,
+                [("PyImageJ", "pyimagej", True), ("Python", "python", False)],
+            ),
+        ]
+
+        for actions, expected in option_groups:
+            with self.subTest(actions=[action.text() for action in actions]):
+                actual = [
+                    (action.text(), action.data(), action.isChecked())
+                    for action in actions
+                ]
+
+                self.assertEqual(actual, expected)
+
+    def test_analysis_option_submenus_are_exclusive(self) -> None:
+        self.window.nuc_source_actions[1].setChecked(True)
+        self.window.ki67_backend_actions[1].setChecked(True)
+        self.window.feature_backend_actions[1].setChecked(True)
+
+        self.assertEqual(
+            self.window._selected_action_value(
+                self.window.nuc_source_actions,
+                "dapi",
+            ),
+            "pc",
+        )
+        self.assertEqual(
+            self.window._selected_action_value(
+                self.window.ki67_backend_actions,
+                "pyimagej",
+            ),
+            "opencv",
+        )
+        self.assertEqual(
+            self.window._selected_action_value(
+                self.window.feature_backend_actions,
+                "pyimagej",
+            ),
+            "python",
+        )
+        self.assertFalse(self.window.nuc_source_actions[0].isChecked())
+        self.assertFalse(self.window.ki67_backend_actions[0].isChecked())
+        self.assertFalse(self.window.feature_backend_actions[0].isChecked())
+
     def test_right_side_has_four_named_panels(self) -> None:
         expected_names = [
             "terminalPanel",
