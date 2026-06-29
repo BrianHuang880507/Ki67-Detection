@@ -202,7 +202,23 @@ python scripts/run_all_data_input.py --dry-run --fluor_analy --ki67
 python app.py
 ```
 
-圖形介面會呼叫 `ki67dtc.app_pipeline.run_pipeline()`，完成後讀取 `data/output/results/<資料集>/<資料集>_cleaned.csv` 並在介面中顯示結果。
+圖形介面會呼叫 `ki67dtc.app_pipeline.run_pipeline()`，完成後讀取
+`data/output/results/<資料集>/<資料集>_cleaned.csv` 並在介面中顯示結果。
+
+新版主畫面採用 SegmentationUI 風格，主要操作集中在上方選單：
+
+- `檔案 > 開啟`：選擇輸入資料夾，等同於原本的輸入資料夾功能。
+- `分析選項 > 核來源`：選擇 `DAPI` 或 `PC`。
+- `分析選項 > Ki67 Backend`：選擇 Ki67 二值化後端，目前提供 `PyImageJ` 與 `OpenCV`。
+- `分析選項 > 分析方法`：選擇特徵提取後端，目前提供 `PyImageJ` 與 `Python`。
+- `分析選項 > 螢光分析`：勾選或取消螢光強度分析。
+- `分析選項 > Ki67 分析`：勾選或取消 Ki67 陽性分析。
+- `分析選項 > 清理暫存檔案`：勾選或取消分析後清理中間檔。
+
+畫面左側約 2/3 為主要影像顯示區，可搭配下方 overlay 勾選項檢視細胞核、
+細胞質與 Ki67 顯示狀態。右側約 1/3 分成四個區塊，依序顯示輸出主控台與
+開始/中止/重新開始圖示按鈕、資料夾影像清單、分析後特徵參數表格，以及
+細胞面積分析圖表。
 
 ### Ki67 模型訓練與推論
 
