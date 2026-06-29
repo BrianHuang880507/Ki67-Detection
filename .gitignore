@@ -31,6 +31,9 @@ predictions.csv
 # Visual Studio / VS Code local settings
 .vs/
 
+# Local git worktrees
+.worktrees/
+
 # Predictions outputs
 predictions/
 
