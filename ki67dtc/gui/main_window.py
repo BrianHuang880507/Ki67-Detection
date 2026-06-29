@@ -36,6 +36,7 @@ from ..app_pipeline import (
     find_merged_outline_for_image,
     load_merged_outlines,
 )
+from .theme import APP_QSS
 
 
 class PipelineThread(QThread):
@@ -129,6 +130,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Ki67 細胞影像分析 GUI (Early Prototype)")
         # 預設視窗更大
         self.resize(1400, 900)
+        self.setStyleSheet(APP_QSS)
         self._pipeline_thread: PipelineThread | None = None
         self._pipeline_result: PipelineResult | None = None
         self._current_image_index: int | None = None

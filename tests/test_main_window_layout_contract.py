@@ -6,6 +6,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtWidgets import QApplication, QToolButton
 
 from ki67dtc.gui.main_window import MainWindow
+from ki67dtc.gui.theme import APP_QSS
 
 
 class MainWindowLayoutContractTest(unittest.TestCase):
@@ -75,6 +76,10 @@ class MainWindowLayoutContractTest(unittest.TestCase):
 
     def test_area_chart_panel_keeps_cell_area_analysis_label(self) -> None:
         self.assertEqual(self.window.area_chart_title.text(), "細胞面積分析")
+
+    def test_segmentation_theme_is_applied_to_main_window(self) -> None:
+        self.assertIn("#1C2030", APP_QSS)
+        self.assertIn("#1C2030", self.window.styleSheet())
 
 
 if __name__ == "__main__":
