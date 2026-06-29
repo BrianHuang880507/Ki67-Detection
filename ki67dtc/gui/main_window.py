@@ -9,7 +9,6 @@ from PyQt6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
-    QFormLayout,
     QLineEdit,
     QPushButton,
     QProgressBar,
@@ -244,26 +243,29 @@ class MainWindow(QMainWindow):
             self.action_clean_temp,
         ]
 
+    def _new_panel(self, object_name: str, title: str) -> QtWidgets.QFrame:
+        """建立右側等分 panel。"""
+        panel = QtWidgets.QFrame(self)
+        panel.setObjectName(object_name)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
+        label = QLabel(title, panel)
+        label.setObjectName(f"{object_name}Title")
+        layout.addWidget(label)
+        return panel
+
     def _build_ui(self) -> None:
         """建立主視窗所有輸入、控制、影像與結果表元件。"""
         central = QWidget(self)
         self.setCentralWidget(central)
 
-        root = QVBoxLayout(central)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(8, 8, 8, 8)
 
-        # ===== 最上方：工具列表 =====
-        top_panel = QWidget(self)
-        top_layout = QVBoxLayout(top_panel)
-
-        form = QFormLayout()
+        # 舊 handler 仍會讀取這些狀態元件；Task 6 會把它們接回正式控制列。
         self.input_dir_edit = QLineEdit(self)
-        btn_browse_input = QPushButton("選擇輸入資料夾", self)
-        btn_browse_input.clicked.connect(self._on_browse_input)
-
-        input_row = QHBoxLayout()
-        input_row.addWidget(self.input_dir_edit)
-        input_row.addWidget(btn_browse_input)
-        form.addRow("輸入資料夾", input_row)
+        self.input_dir_edit.hide()
 
         self.chk_fluor = QCheckBox("螢光分析", self)
         self.chk_fluor.setChecked(True)
@@ -277,75 +279,55 @@ class MainWindow(QMainWindow):
         self.action_ki67_analy.toggled.connect(self.chk_ki67.setChecked)
         self.chk_clean.toggled.connect(self.action_clean_temp.setChecked)
         self.action_clean_temp.toggled.connect(self.chk_clean.setChecked)
+        self.chk_fluor.hide()
+        self.chk_ki67.hide()
+        self.chk_clean.hide()
 
-        # 分析選項同一行
-        options_row = QHBoxLayout()
-        options_row.addWidget(QLabel("核來源", self))
         self.nuc_source_combo = QtWidgets.QComboBox(self)
         self.nuc_source_combo.addItem("DAPI", "dapi")
         self.nuc_source_combo.addItem("PC", "pc")
-        options_row.addWidget(self.nuc_source_combo)
+        self.nuc_source_combo.hide()
 
-        options_row.addSpacing(16)
-        options_row.addWidget(QLabel("特徵後端", self))
         self.feature_backend_combo = QtWidgets.QComboBox(self)
         self.feature_backend_combo.addItem("PyImageJ", "pyimagej")
         self.feature_backend_combo.addItem("Python", "python")
-        options_row.addWidget(self.feature_backend_combo)
+        self.feature_backend_combo.hide()
 
-        options_row.addSpacing(16)
-        options_row.addWidget(QLabel("Ki67 後端", self))
         self.ki67_backend_combo = QtWidgets.QComboBox(self)
         self.ki67_backend_combo.addItem("PyImageJ", "pyimagej")
         self.ki67_backend_combo.addItem("OpenCV", "opencv")
-        options_row.addWidget(self.ki67_backend_combo)
+        self.ki67_backend_combo.hide()
 
-        options_row.addSpacing(16)
-
-        options_row.addWidget(self.chk_fluor)
-        options_row.addWidget(self.chk_ki67)
-        options_row.addWidget(self.chk_clean)
-
-        options_row.addStretch(1)
-        form.addRow("分析選項", options_row)
-
-        top_layout.addLayout(form)
-
-        controls_layout = QHBoxLayout()
         self.btn_run = QPushButton("Run", self)
-        self.btn_stop = QPushButton("Stop", self)
-        self.btn_reset = QPushButton("Reset", self)
-
         self.btn_run.clicked.connect(self._on_run_clicked)
-        self.btn_stop.clicked.connect(self._on_stop_clicked)
-        self.btn_reset.clicked.connect(self._on_reset_clicked)
-
-        controls_layout.addWidget(self.btn_run)
-        controls_layout.addWidget(self.btn_stop)
-        controls_layout.addWidget(self.btn_reset)
-        top_layout.addLayout(controls_layout)
+        self.btn_run.hide()
 
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        top_layout.addWidget(self.progress_bar)
+        self.progress_bar.hide()
 
-        root.addWidget(top_panel, stretch=0)
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal, self)
 
-        # ===== 下方：用 splitter 嚴格控制 2/3 vs 1/3 以及右側上下比例 =====
-        bottom_splitter = QSplitter(Qt.Orientation.Horizontal, self)
-
-        # 左側 viewer（含 overlay 控制）
-        viewer_panel = QWidget(self)
-        viewer_layout = QVBoxLayout(viewer_panel)
+        self.image_panel = QWidget(self)
+        self.image_panel.setObjectName("imagePanel")
+        viewer_layout = QVBoxLayout(self.image_panel)
         viewer_layout.setContentsMargins(0, 0, 0, 0)
+        viewer_layout.setSpacing(6)
 
         self.graphics_view = ZoomableGraphicsView(self)
         self.graphics_view.setMinimumSize(400, 300)
         self.graphics_view.setStyleSheet("background-color: #202020;")
         self._scene = QGraphicsScene(self)
         self.graphics_view.setScene(self._scene)
+        self.image_view = self.graphics_view
+        self.image_scene = self._scene
         viewer_layout.addWidget(self.graphics_view, stretch=1)
+
+        self.image_file_label = QLabel("Image File Name", self.image_panel)
+        self.image_file_label.setObjectName("imageFileName")
+        self.file_label = self.image_file_label
+        viewer_layout.addWidget(self.image_file_label)
 
         overlay_controls = QtWidgets.QHBoxLayout()
         self.chk_show_nuc = QtWidgets.QCheckBox("顯示核輪廓")
@@ -371,14 +353,14 @@ class MainWindow(QMainWindow):
         overlay_controls.addStretch(1)
         viewer_layout.addLayout(overlay_controls)
 
-        bottom_splitter.addWidget(viewer_panel)
+        self.main_splitter.addWidget(self.image_panel)
 
-        # 右側：上下 splitter（上 image list / 下 results table）
-        right_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        self.right_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        self.right_splitter.setObjectName("rightPanelSplitter")
 
         self.image_list = QtWidgets.QListWidget()
         self.image_list.currentRowChanged.connect(self._on_image_selection_changed)
-        right_splitter.addWidget(self.image_list)
+        self.right_splitter.addWidget(self.image_list)
 
         self.results_table = QTableWidget()
         self.results_table.setEditTriggers(
@@ -388,19 +370,18 @@ class MainWindow(QMainWindow):
             QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
         )
         # 注意：不要再用 currentCellChanged 綁到 selection handler，避免重複觸發/行為不一致
-        right_splitter.addWidget(self.results_table)
+        self.right_splitter.addWidget(self.results_table)
 
-        # 右側上下各半（可再依 layout.png 微調）
-        right_splitter.setStretchFactor(0, 1)
-        right_splitter.setStretchFactor(1, 1)
+        self.right_splitter.setStretchFactor(0, 1)
+        self.right_splitter.setStretchFactor(1, 1)
 
-        bottom_splitter.addWidget(right_splitter)
+        self.main_splitter.addWidget(self.right_splitter)
 
-        # 左右 2/3 : 1/3
-        bottom_splitter.setStretchFactor(0, 2)
-        bottom_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setStretchFactor(0, 2)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setSizes([900, 450])
 
-        root.addWidget(bottom_splitter, stretch=1)
+        root.addWidget(self.main_splitter)
 
         # 狀態列
         status = QStatusBar(self)
@@ -546,7 +527,7 @@ class MainWindow(QMainWindow):
         if img_bgr is None:
             self.statusBar().showMessage(f"無法載入影像：{img_path}")
             self._current_image_array = None
-            self.image_label.setText("無法載入影像")
+            self.image_file_label.setText("無法載入影像")
             return
 
         if img_bgr.ndim == 2:  # 灰階 -> 轉成 BGR
