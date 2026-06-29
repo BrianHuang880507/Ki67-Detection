@@ -170,8 +170,9 @@ class MainWindow(QMainWindow):
                 tone,
             )
         )
+        self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
-        self.restart_button.setEnabled(True)
+        self.restart_button.setEnabled(not running)
 
     def _on_results_table_cell_clicked(self, row: int, col: int) -> None:
         """滑鼠點擊表格任一格：若點到同一列，切換高亮 on/off。"""
@@ -253,6 +254,114 @@ class MainWindow(QMainWindow):
         label = QLabel(title, panel)
         label.setObjectName(f"{object_name}Title")
         layout.addWidget(label)
+        return panel
+
+    def _build_terminal_panel(self) -> QtWidgets.QFrame:
+        """建立輸出主控台與置中的圖示控制按鈕列。"""
+        panel = self._new_panel("terminalPanel", "1. 輸出主控台")
+        layout = panel.layout()
+        assert layout is not None
+
+        self.terminal_output = QtWidgets.QTextEdit(panel)
+        self.terminal_output.setObjectName("terminalOutput")
+        self.terminal_output.setReadOnly(True)
+        self.terminal_output.setText("[INFO] 等待開啟資料夾...")
+        layout.addWidget(self.terminal_output, stretch=1)
+
+        control_container = QtWidgets.QWidget(panel)
+        control_container.setObjectName("controlButtonRow")
+        control_container.setProperty("alignmentRole", "centeredIconControls")
+        self.control_button_row = control_container
+
+        control_layout = QHBoxLayout(control_container)
+        control_layout.setContentsMargins(0, 0, 0, 0)
+        control_layout.addStretch(1)
+
+        self.start_button = QtWidgets.QToolButton(control_container)
+        self.start_button.setObjectName("startButton")
+        self.start_button.setText("")
+        self.start_button.clicked.connect(self._on_run_clicked)
+
+        self.stop_button = QtWidgets.QToolButton(control_container)
+        self.stop_button.setObjectName("stopButton")
+        self.stop_button.setText("")
+        self.stop_button.setProperty("iconTone", "black")
+        self.stop_button.setIcon(
+            standard_icon(
+                self,
+                QtWidgets.QStyle.StandardPixmap.SP_MediaStop,
+                "black",
+            )
+        )
+        self.stop_button.clicked.connect(self._on_stop_clicked)
+
+        self.restart_button = QtWidgets.QToolButton(control_container)
+        self.restart_button.setObjectName("restartButton")
+        self.restart_button.setText("")
+        self.restart_button.setProperty("iconTone", "black")
+        self.restart_button.setIcon(
+            standard_icon(
+                self,
+                QtWidgets.QStyle.StandardPixmap.SP_BrowserReload,
+                "black",
+            )
+        )
+        self.restart_button.clicked.connect(self._on_reset_clicked)
+
+        control_layout.addWidget(self.start_button)
+        control_layout.addWidget(self.stop_button)
+        control_layout.addWidget(self.restart_button)
+        control_layout.addStretch(1)
+
+        layout.addWidget(control_container)
+        self._set_running_state(False)
+        return panel
+
+    def _build_image_list_panel(self) -> QtWidgets.QFrame:
+        """建立影像清單 panel。"""
+        panel = self._new_panel("imageListPanel", "2. 影像清單")
+        layout = panel.layout()
+        assert layout is not None
+
+        self.image_list = QtWidgets.QListWidget(panel)
+        self.image_list.setObjectName("folderImageList")
+        self.image_list.currentRowChanged.connect(self._on_image_selection_changed)
+        layout.addWidget(self.image_list, stretch=1)
+        return panel
+
+    def _build_feature_table_panel(self) -> QtWidgets.QFrame:
+        """建立特徵參數分析結果表格 panel。"""
+        panel = self._new_panel("featureTablePanel", "3. 分析結果（特徵參數）")
+        layout = panel.layout()
+        assert layout is not None
+
+        self.results_table = QTableWidget(panel)
+        self.results_table.setObjectName("featureParameterTable")
+        self.results_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.results_table.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.results_table.setColumnCount(3)
+        self.results_table.setHorizontalHeaderLabels(["Cell_ID", "Area", "Mean"])
+        layout.addWidget(self.results_table, stretch=1)
+        return panel
+
+    def _build_area_chart_panel(self) -> QtWidgets.QFrame:
+        """建立細胞面積分析 panel。"""
+        panel = self._new_panel("areaChartPanel", "細胞面積分析")
+        self.area_chart_title = panel.findChild(QLabel, "areaChartPanelTitle")
+        if self.area_chart_title is not None:
+            self.area_chart_title.setText("細胞面積分析")
+
+        layout = panel.layout()
+        assert layout is not None
+        self.area_chart_label = QLabel(panel)
+        self.area_chart_label.setObjectName("areaChartLabel")
+        self.area_chart_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.area_chart_label.setText("")
+        layout.addWidget(self.area_chart_label, stretch=1)
         return panel
 
     def _build_ui(self) -> None:
@@ -358,23 +467,14 @@ class MainWindow(QMainWindow):
         self.right_splitter = QSplitter(Qt.Orientation.Vertical, self)
         self.right_splitter.setObjectName("rightPanelSplitter")
 
-        self.image_list = QtWidgets.QListWidget()
-        self.image_list.currentRowChanged.connect(self._on_image_selection_changed)
-        self.right_splitter.addWidget(self.image_list)
+        self.right_splitter.addWidget(self._build_terminal_panel())
+        self.right_splitter.addWidget(self._build_image_list_panel())
+        self.right_splitter.addWidget(self._build_feature_table_panel())
+        self.right_splitter.addWidget(self._build_area_chart_panel())
 
-        self.results_table = QTableWidget()
-        self.results_table.setEditTriggers(
-            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
-        )
-        self.results_table.setSelectionBehavior(
-            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
-        )
-        # 注意：不要再用 currentCellChanged 綁到 selection handler，避免重複觸發/行為不一致
-        self.right_splitter.addWidget(self.results_table)
-
-        self.right_splitter.setStretchFactor(0, 1)
-        self.right_splitter.setStretchFactor(1, 1)
-
+        for index in range(4):
+            self.right_splitter.setStretchFactor(index, 1)
+        self.right_splitter.setSizes([1, 1, 1, 1])
         self.main_splitter.addWidget(self.right_splitter)
 
         self.main_splitter.setStretchFactor(0, 2)
@@ -445,7 +545,7 @@ class MainWindow(QMainWindow):
         self._pipeline_thread.failed.connect(self._on_pipeline_failed)
         self._pipeline_thread.start()
 
-        self.btn_run.setEnabled(False)
+        self._set_running_state(True)
         self.statusBar().showMessage("Pipeline 執行中...")
 
     def _on_stop_clicked(self) -> None:
@@ -455,7 +555,7 @@ class MainWindow(QMainWindow):
             self._pipeline_thread.terminate()
             self._pipeline_thread.wait()
             self.statusBar().showMessage("Pipeline 已中止")
-            self.btn_run.setEnabled(True)
+            self._set_running_state(False)
 
     def _on_reset_clicked(self) -> None:
         """重設 UI 狀態、影像清單、結果表與 overlay。"""
@@ -476,6 +576,7 @@ class MainWindow(QMainWindow):
         self._cleaned_csv_rows = []
         self._cleaned_csv_header = None
         self._scene.clear()
+        self._set_running_state(False)
         self.statusBar().showMessage("已重設")
 
     def _on_progress_changed(self, done: int, total: int, message: str) -> None:
@@ -486,7 +587,7 @@ class MainWindow(QMainWindow):
 
     def _on_pipeline_finished(self, result: PipelineResult) -> None:
         """處理 pipeline 成功結束後的影像清單與結果載入。"""
-        self.btn_run.setEnabled(True)
+        self._set_running_state(False)
         self.progress_bar.setValue(100)
         self._pipeline_result = result
         # 記錄目前資料夾
@@ -503,7 +604,7 @@ class MainWindow(QMainWindow):
 
     def _on_pipeline_failed(self, message: str) -> None:
         """處理 pipeline 失敗訊息並恢復 Run 按鈕。"""
-        self.btn_run.setEnabled(True)
+        self._set_running_state(False)
         self.statusBar().showMessage(f"錯誤：{message}")
 
     def _on_image_selection_changed(self, row: int) -> None:
