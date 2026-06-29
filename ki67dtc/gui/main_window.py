@@ -152,6 +152,7 @@ class MainWindow(QMainWindow):
         self._last_selected_row: int | None = None
         self._cleaned_csv_rows: list[list[str]] = []
         self._cleaned_csv_header: list[str] | None = None
+        self._build_menu_bar()
         self._build_ui()
 
         # selection change 只會在 selection 真的改變時觸發；再點同一列不一定會觸發
@@ -215,6 +216,34 @@ class MainWindow(QMainWindow):
 
     # --- UI 組裝 ---
 
+    def _build_menu_bar(self) -> None:
+        """建立主視窗選單列與分析選項 actions。"""
+        file_menu = self.menuBar().addMenu("檔案")
+        self.action_open_input = file_menu.addAction("開啟")
+        self.action_open_input.triggered.connect(self._on_browse_input)
+
+        analysis_menu = self.menuBar().addMenu("分析選項")
+        self.action_nuc_source = analysis_menu.addAction("核來源")
+        self.action_ki67_backend = analysis_menu.addAction("Ki67 Backend")
+        self.action_feature_backend = analysis_menu.addAction("分析方法")
+        self.action_fluor_analy = analysis_menu.addAction("螢光分析")
+        self.action_fluor_analy.setCheckable(True)
+        self.action_fluor_analy.setChecked(True)
+        self.action_ki67_analy = analysis_menu.addAction("Ki67 分析")
+        self.action_ki67_analy.setCheckable(True)
+        self.action_ki67_analy.setChecked(True)
+        self.action_clean_temp = analysis_menu.addAction("清理暫存檔案")
+        self.action_clean_temp.setCheckable(True)
+        self.action_clean_temp.setChecked(True)
+        self.analysis_option_actions = [
+            self.action_nuc_source,
+            self.action_ki67_backend,
+            self.action_feature_backend,
+            self.action_fluor_analy,
+            self.action_ki67_analy,
+            self.action_clean_temp,
+        ]
+
     def _build_ui(self) -> None:
         """建立主視窗所有輸入、控制、影像與結果表元件。"""
         central = QWidget(self)
@@ -242,6 +271,12 @@ class MainWindow(QMainWindow):
         self.chk_ki67.setChecked(True)
         self.chk_clean = QCheckBox("清理暫存資料", self)
         self.chk_clean.setChecked(True)
+        self.chk_fluor.toggled.connect(self.action_fluor_analy.setChecked)
+        self.action_fluor_analy.toggled.connect(self.chk_fluor.setChecked)
+        self.chk_ki67.toggled.connect(self.action_ki67_analy.setChecked)
+        self.action_ki67_analy.toggled.connect(self.chk_ki67.setChecked)
+        self.chk_clean.toggled.connect(self.action_clean_temp.setChecked)
+        self.action_clean_temp.toggled.connect(self.chk_clean.setChecked)
 
         # 分析選項同一行
         options_row = QHBoxLayout()
@@ -410,9 +445,9 @@ class MainWindow(QMainWindow):
         ki67_backend = str(
             self.ki67_backend_combo.currentData() or "pyimagej"
         )
-        fluor_analy = self.chk_fluor.isChecked()
-        ki67 = self.chk_ki67.isChecked()
-        clean_temp = self.chk_clean.isChecked()
+        fluor_analy = self.action_fluor_analy.isChecked()
+        ki67 = self.action_ki67_analy.isChecked()
+        clean_temp = self.action_clean_temp.isChecked()
 
         self._pipeline_thread = PipelineThread(
             data_folder,
