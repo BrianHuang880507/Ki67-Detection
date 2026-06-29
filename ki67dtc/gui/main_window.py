@@ -36,6 +36,7 @@ from ..app_pipeline import (
     find_merged_outline_for_image,
     load_merged_outlines,
 )
+from .icons import standard_icon
 from .theme import APP_QSS
 
 
@@ -156,6 +157,21 @@ class MainWindow(QMainWindow):
         # selection change 只會在 selection 真的改變時觸發；再點同一列不一定會觸發
         # 因此用 clicked 事件確保每次點擊都能切換
         self.results_table.cellClicked.connect(self._on_results_table_cell_clicked)
+
+    def _set_running_state(self, running: bool) -> None:
+        """設定執行狀態與控制按鈕圖示。"""
+        self._is_running = running
+        tone = "white" if running else "black"
+        self.start_button.setProperty("iconTone", tone)
+        self.start_button.setIcon(
+            standard_icon(
+                self,
+                QtWidgets.QStyle.StandardPixmap.SP_MediaPlay,
+                tone,
+            )
+        )
+        self.stop_button.setEnabled(running)
+        self.restart_button.setEnabled(True)
 
     def _on_results_table_cell_clicked(self, row: int, col: int) -> None:
         """滑鼠點擊表格任一格：若點到同一列，切換高亮 on/off。"""
