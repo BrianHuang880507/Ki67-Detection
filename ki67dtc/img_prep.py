@@ -2,6 +2,7 @@
 import re
 from pathlib import Path
 import numpy as np
+import cv2
 from tqdm import trange
 from cellpose import models, io
 from shapely.geometry import Point, Polygon
@@ -13,7 +14,12 @@ from ki67dtc.utils.io import list_files, output_dir, load_outlines, remove_temp_
 
 # 預設 Cellpose 模型設定
 CYTO_MODEL_PATH = "model/model_BDL6_label_new"
-NUC_MODEL_PATH = "cyto3"
+DAPI_NUC_MODEL_PATH = "cyto3"
+PC_NUC_MODEL_PATH = "model/model_BDL3_label_dapi"
+# 保留舊常數名稱供既有 import 使用；目前代表 DAPI nucleus model。
+NUC_MODEL_PATH = DAPI_NUC_MODEL_PATH
+CYTO_MODEL_INPUT_SIZE = (1280, 1024)
+NUC_MODEL_INPUT_SIZE = (1280, 1024)
 
 
 # ===============================
@@ -30,30 +36,75 @@ def segment(
     cellprob_threshold: float = 0.0,
     flow_threshold: float = 0.4,
     invert: bool = False,
+    model_input_size: tuple[int, int] | None = None,
 ):
-    """
-    使用指定的 Cellpose 模型分割影像。
+    """使用指定的 Cellpose 模型分割影像。
 
     分割結果會先由 Cellpose 輸出為 *_seg.npy，再依照 suffix 與
     output_stems 移到目標資料夾，供後續 outline 轉換使用。
+
+    Args:
+        model_path: Cellpose 模型路徑或模型名稱。
+        img_files: 要分割的影像路徑清單。
+        output_dir: segmentation npy 輸出資料夾。
+        suffix: 輸出檔名後綴，例如 `cyto` 或 `nuc`。
+        output_stems: 自訂輸出 stem；用於 DAPI 影像對應回 PC 檔名。
+        channels: Cellpose 通道設定。
+        diameter: Cellpose diameter 參數。
+        cellprob_threshold: Cellpose cellprob threshold。
+        flow_threshold: Cellpose flow threshold。
+        invert: 是否反相後推論。
+        model_input_size: 若指定 `(width, height)`，先 resize 到模型訓練尺寸
+            推論，再將 mask/flow 還原回原圖尺寸。
+
+    Raises:
+        ValueError: 當 `output_stems` 長度不符，或 resize 尺寸不合法時拋出。
     """
     if output_stems is not None and len(output_stems) != len(img_files):
         raise ValueError("output_stems length must match img_files length.")
+    if model_input_size is not None:
+        target_w, target_h = model_input_size
+        if target_w <= 0 or target_h <= 0:
+            raise ValueError("model_input_size must contain positive width and height.")
 
     model = models.CellposeModel(gpu=True, pretrained_model=model_path)
     for i in trange(len(img_files), desc=f"Segmenting ({suffix})"):
         f = img_files[i]
         img = io.imread(f)
+        eval_img = img
+        eval_diameter = diameter
+        original_size: tuple[int, int] | None = None
+        if model_input_size is not None:
+            target_w, target_h = model_input_size
+            orig_h, orig_w = img.shape[:2]
+            original_size = (orig_w, orig_h)
+            eval_img = cv2.resize(
+                img, (target_w, target_h), interpolation=cv2.INTER_LINEAR
+            )
+            eval_diameter = None
+
         masks, flows, styles = model.eval(
-            img,
-            diameter=diameter,
+            eval_img,
+            diameter=eval_diameter,
             channels=list(channels),
             cellprob_threshold=cellprob_threshold,
             flow_threshold=flow_threshold,
             invert=invert,
         )
+        if original_size is not None:
+            masks = cv2.resize(
+                masks.astype(np.int32),
+                original_size,
+                interpolation=cv2.INTER_NEAREST,
+            )
+            if flows is not None and len(flows) > 0:
+                flows = list(flows)
+                flows[0] = cv2.resize(
+                    flows[0], original_size, interpolation=cv2.INTER_LINEAR
+                )
+
         io.masks_flows_to_seg(
-            img, masks, flows, f, channels=list(channels), diams=diameter
+            img, masks, flows, f, channels=list(channels), diams=eval_diameter
         )
         seg_file = f.with_name(f"{f.stem}_seg.npy")
         target_stem = output_stems[i] if output_stems is not None else f.stem
@@ -259,11 +310,25 @@ def remap_nuc_segments_to_cyto(
     return remapped
 
 
-def segment_all(input_dir: str, nuc_source: str = "dapi", dapi_dir_name: str = "DAPI"):
-    """
-    執行細胞質與細胞核分割。
+def segment_all(
+    input_dir: str,
+    nuc_source: str = "dapi",
+    dapi_dir_name: str = "DAPI",
+    cyto_model_input_size: tuple[int, int] | None = CYTO_MODEL_INPUT_SIZE,
+    nuc_model_input_size: tuple[int, int] | None = NUC_MODEL_INPUT_SIZE,
+):
+    """執行細胞質與細胞核分割。
+
     - 細胞質一律使用 PC 影像。
-    - 細胞核可選擇 PC 或 DAPI；若選 DAPI，通道使用 [3, 3]。
+    - 細胞核可選擇 PC 或 DAPI；若選 DAPI，模型使用 `cyto3` 且通道使用 [3, 3]。
+    - 若選 PC，或 DAPI 不存在而 fallback 到 PC，模型使用 GUI_v2 的 PC nucleus model。
+
+    Args:
+        input_dir: 資料集根目錄，預期包含 `PC` 與可選的 `DAPI` 資料夾。
+        nuc_source: 細胞核來源，支援 `pc` 或 `dapi`。
+        dapi_dir_name: DAPI 資料夾名稱。
+        cyto_model_input_size: 細胞質模型推論前的 resize 尺寸；`None` 表示不 resize。
+        nuc_model_input_size: 細胞核模型推論前的 resize 尺寸；`None` 表示不 resize。
     """
     root_dir = Path(input_dir)
     pc_dir = root_dir / "PC"
@@ -283,22 +348,50 @@ def segment_all(input_dir: str, nuc_source: str = "dapi", dapi_dir_name: str = "
         raise ValueError(f"Unsupported nuc_source: {nuc_source}")
 
     # 細胞質分割一律使用 PC 影像與灰階通道。
-    segment(CYTO_MODEL_PATH, img_files, seg_dir, "cyto", channels=(0, 0))
+    segment(
+        CYTO_MODEL_PATH,
+        img_files,
+        seg_dir,
+        "cyto",
+        channels=(0, 0),
+        model_input_size=cyto_model_input_size,
+    )
 
     if nuc_source == "pc":
-        segment(NUC_MODEL_PATH, img_files, seg_dir, "nuc", channels=(0, 0))
+        segment(
+            PC_NUC_MODEL_PATH,
+            img_files,
+            seg_dir,
+            "nuc",
+            channels=(0, 0),
+            model_input_size=nuc_model_input_size,
+        )
         return
 
     dapi_dir = root_dir / dapi_dir_name
     if not dapi_dir.exists() or not dapi_dir.is_dir():
         print(f"[WARN] 找不到 DAPI 資料夾 {dapi_dir}，細胞核改回使用 PC。")
-        segment(NUC_MODEL_PATH, img_files, seg_dir, "nuc", channels=(0, 0))
+        segment(
+            PC_NUC_MODEL_PATH,
+            img_files,
+            seg_dir,
+            "nuc",
+            channels=(0, 0),
+            model_input_size=nuc_model_input_size,
+        )
         return
 
     dapi_files = list_files(dapi_dir, [".png", ".jpg", ".jpeg", ".tif", ".tiff"])
     if not dapi_files:
         print(f"[WARN] DAPI 資料夾沒有可用影像 {dapi_dir}，細胞核改回使用 PC。")
-        segment(NUC_MODEL_PATH, img_files, seg_dir, "nuc", channels=(0, 0))
+        segment(
+            PC_NUC_MODEL_PATH,
+            img_files,
+            seg_dir,
+            "nuc",
+            channels=(0, 0),
+            model_input_size=nuc_model_input_size,
+        )
         return
 
     dapi_by_stem: dict[str, list[Path]] = {}
@@ -345,23 +438,25 @@ def segment_all(input_dir: str, nuc_source: str = "dapi", dapi_dir_name: str = "
 
     if dapi_nuc_img_files:
         segment(
-            NUC_MODEL_PATH,
+            DAPI_NUC_MODEL_PATH,
             dapi_nuc_img_files,
             seg_dir,
             "nuc",
             output_stems=dapi_output_stems,
             channels=(3, 3),
+            model_input_size=nuc_model_input_size,
         )
         remap_nuc_segments_to_cyto(seg_dir, dapi_output_stems, dapi_output_stems)
 
     if fallback_pc_nuc_img_files:
         segment(
-            NUC_MODEL_PATH,
+            PC_NUC_MODEL_PATH,
             fallback_pc_nuc_img_files,
             seg_dir,
             "nuc",
             output_stems=fallback_pc_output_stems,
             channels=(0, 0),
+            model_input_size=nuc_model_input_size,
         )
 
 

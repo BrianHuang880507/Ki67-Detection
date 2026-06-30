@@ -14,7 +14,6 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QLabel,
     QFileDialog,
-    QStatusBar,
     QCheckBox,
     QListWidget,
     QGraphicsView,
@@ -145,6 +144,7 @@ class MainWindow(QMainWindow):
         self._overlay_alpha: float = 0.5
         self._current_data_folder: Path | None = None
         self._area_chart_pixmap: QPixmap | None = None
+        self._last_status_message: str = ""
         # 新增：目前選中的 Cell_ID（例如 "1_3"）
         self._selected_cell_id: str | None = None
         self._highlight_enabled: bool = False
@@ -259,7 +259,6 @@ class MainWindow(QMainWindow):
         # 為了讓使用者「再點同一列」也能觸發 selection change（部分平台不會觸發）
         # 先保留顯示上的 row 選取，但不依賴 selection change。
         self._update_display_pixmap()
-
     # --- UI 組裝 ---
 
     def _build_menu_bar(self) -> None:
@@ -506,34 +505,45 @@ class MainWindow(QMainWindow):
         self.image_scene = self._scene
         viewer_layout.addWidget(self.graphics_view, stretch=1)
 
-        self.image_file_label = QLabel("Image File Name", self.image_panel)
+        self.image_header_widget = QWidget(self.image_panel)
+        self.image_header_widget.setObjectName("imageHeaderRow")
+        image_header_layout = QHBoxLayout(self.image_header_widget)
+        image_header_layout.setContentsMargins(0, 0, 0, 0)
+        image_header_layout.setSpacing(8)
+
+        self.image_file_label = QLabel("Image File Name", self.image_header_widget)
         self.image_file_label.setObjectName("imageFileName")
         self.file_label = self.image_file_label
-        viewer_layout.addWidget(self.image_file_label)
+        image_header_layout.addWidget(self.image_file_label, stretch=1)
 
         overlay_controls = QtWidgets.QHBoxLayout()
-        self.chk_show_nuc = QtWidgets.QCheckBox("顯示核輪廓")
+        overlay_controls.setContentsMargins(0, 0, 0, 0)
+        overlay_controls.setSpacing(6)
+        self.chk_show_nuc = QtWidgets.QCheckBox("顯示核輪廓", self.image_header_widget)
         self.chk_show_nuc.setChecked(True)
-        self.chk_show_cyto = QtWidgets.QCheckBox("顯示質輪廓")
+        self.chk_show_cyto = QtWidgets.QCheckBox("顯示質輪廓", self.image_header_widget)
         self.chk_show_cyto.setChecked(True)
-        self.chk_show_ki67 = QtWidgets.QCheckBox("顯示ki67")
+        self.chk_show_ki67 = QtWidgets.QCheckBox("顯示ki67", self.image_header_widget)
         self.chk_show_ki67.setChecked(False)
 
-        self.alpha_slider = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+        self.alpha_slider = QtWidgets.QSlider(
+            Qt.Orientation.Horizontal, self.image_header_widget
+        )
         self.alpha_slider.setMinimum(10)  # 0.1
         self.alpha_slider.setMaximum(100)  # 1.0
         self.alpha_slider.setValue(int(self._overlay_alpha * 100))
         self.alpha_slider.setTickInterval(10)
         self.alpha_slider.setTickPosition(QtWidgets.QSlider.TickPosition.NoTicks)
-        alpha_label = QtWidgets.QLabel("透明度")
+        self.alpha_slider.setFixedWidth(90)
+        alpha_label = QtWidgets.QLabel("透明度", self.image_header_widget)
 
         overlay_controls.addWidget(self.chk_show_nuc)
         overlay_controls.addWidget(self.chk_show_cyto)
         overlay_controls.addWidget(self.chk_show_ki67)
         overlay_controls.addWidget(alpha_label)
         overlay_controls.addWidget(self.alpha_slider)
-        overlay_controls.addStretch(1)
-        viewer_layout.addLayout(overlay_controls)
+        image_header_layout.addLayout(overlay_controls)
+        viewer_layout.addWidget(self.image_header_widget)
 
         self.main_splitter.addWidget(self.image_panel)
 
@@ -547,7 +557,7 @@ class MainWindow(QMainWindow):
 
         for index in range(4):
             self.right_splitter.setStretchFactor(index, 1)
-        self.right_splitter.setSizes([1, 1, 1, 1])
+        self.right_splitter.setSizes([190, 155, 245, 235])
         self.main_splitter.addWidget(self.right_splitter)
 
         self.main_splitter.setStretchFactor(0, 2)
@@ -556,10 +566,8 @@ class MainWindow(QMainWindow):
 
         root.addWidget(self.main_splitter)
 
-        # 狀態列
-        status = QStatusBar(self)
-        self.setStatusBar(status)
-        self.statusBar().showMessage("就緒")
+        # 保留最後狀態訊息，不建立底部 QStatusBar。
+        self._show_status_message("就緒")
 
         # 連接 overlay 控制訊號
         self.chk_show_nuc.toggled.connect(self._on_overlay_controls_changed)
@@ -568,6 +576,16 @@ class MainWindow(QMainWindow):
         self.alpha_slider.valueChanged.connect(self._on_overlay_controls_changed)
 
     # --- 事件處理 ---
+
+    def _show_status_message(self, message: str, timeout: int = 0) -> None:
+        """記錄短狀態訊息，不在底部建立 QStatusBar。
+
+        Args:
+            message: 要保留的狀態訊息。
+            timeout: 保留相容 Qt `showMessage` 呼叫的逾時參數。
+        """
+        _ = timeout
+        self._last_status_message = message
 
     def _on_browse_input(self) -> None:
         """開啟資料夾選擇器並載入影像與 cleaned CSV。"""
@@ -587,7 +605,7 @@ class MainWindow(QMainWindow):
 
         path_text = self.input_dir_edit.text().strip()
         if not path_text:
-            self.statusBar().showMessage("請先選擇輸入資料夾")
+            self._show_status_message("請先選擇輸入資料夾")
             return
 
         data_folder = Path(path_text)
@@ -621,7 +639,7 @@ class MainWindow(QMainWindow):
         self._pipeline_thread.start()
 
         self._set_running_state(True)
-        self.statusBar().showMessage("Pipeline 執行中...")
+        self._show_status_message("Pipeline 執行中...")
 
     def _on_stop_clicked(self) -> None:
         """停止目前背景 pipeline 執行緒。"""
@@ -629,7 +647,7 @@ class MainWindow(QMainWindow):
         if self._pipeline_thread is not None and self._pipeline_thread.isRunning():
             self._pipeline_thread.terminate()
             self._pipeline_thread.wait()
-            self.statusBar().showMessage("Pipeline 已中止")
+            self._show_status_message("Pipeline 已中止")
             self._set_running_state(False)
 
     def _on_reset_clicked(self) -> None:
@@ -659,7 +677,7 @@ class MainWindow(QMainWindow):
         self._cleaned_csv_header = None
         self._scene.clear()
         self._set_running_state(False)
-        self.statusBar().showMessage("已重設")
+        self._show_status_message("已重設")
 
     def _append_terminal_line(self, level: str, message: str) -> None:
         """將訊息追加到終端輸出面板。"""
@@ -670,7 +688,7 @@ class MainWindow(QMainWindow):
         """更新進度條與狀態列文字。"""
         percent = int(done / total * 100) if total > 0 else 0
         self.progress_bar.setValue(percent)
-        self.statusBar().showMessage(f"{message} ({done}/{total})")
+        self._show_status_message(f"{message} ({done}/{total})")
         suffix = f" ({done}/{total})" if total > 0 else ""
         self._append_terminal_line("INFO", f"{message}{suffix}")
 
@@ -688,7 +706,7 @@ class MainWindow(QMainWindow):
         self._load_cleaned_csv_for_dataset()
         self._load_area_chart()
 
-        self.statusBar().showMessage(
+        self._show_status_message(
             f"Pipeline 完成，共處理 {len(result.image_files)} 張影像"
         )
 
@@ -699,7 +717,7 @@ class MainWindow(QMainWindow):
     def _on_pipeline_failed(self, message: str) -> None:
         """處理 pipeline 失敗訊息並恢復 Run 按鈕。"""
         self._set_running_state(False)
-        self.statusBar().showMessage(f"錯誤：{message}")
+        self._show_status_message(f"錯誤：{message}")
 
         self._append_terminal_line("ERROR", message)
 
@@ -722,7 +740,7 @@ class MainWindow(QMainWindow):
         # 使用 OpenCV 讀圖，保留灰階或彩色
         img_bgr = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
         if img_bgr is None:
-            self.statusBar().showMessage(f"無法載入影像：{img_path}")
+            self._show_status_message(f"無法載入影像：{img_path}")
             self._current_image_array = None
             self.image_file_label.setText("無法載入影像")
             return
@@ -738,7 +756,7 @@ class MainWindow(QMainWindow):
         if merged_path is None:
             self._current_overlay_polygons.pop(img_path, None)
             self._current_overlay_image = None
-            self.statusBar().showMessage(f"沒有找到 outlines：{img_path.name}")
+            self._show_status_message(f"沒有找到 outlines：{img_path.name}")
             return
 
         polygons = load_merged_outlines(merged_path)
@@ -959,7 +977,7 @@ class MainWindow(QMainWindow):
         try:
             data_folder = _resolve_data_folder(raw_folder)
         except FileNotFoundError as e:
-            self.statusBar().showMessage(str(e))
+            self._show_status_message(str(e))
             return
 
         # 記錄目前資料夾，供載入 cleaned CSV 使用
@@ -985,10 +1003,10 @@ class MainWindow(QMainWindow):
             self.image_list.setCurrentRow(0)
             self._append_terminal_line("INFO", f"載入資料夾：{data_folder}")
             self._append_terminal_line("INFO", f"找到 {len(image_files)} 張影像")
-            self.statusBar().showMessage(f"載入 {len(image_files)} 張影像")
+            self._show_status_message(f"載入 {len(image_files)} 張影像")
         else:
             self._scene.clear()
-            self.statusBar().showMessage("找不到可顯示的影像檔")
+            self._show_status_message("找不到可顯示的影像檔")
 
     def _populate_image_list(self, image_files: list[Path]) -> None:
         """根據給定檔案列表更新右側 QListWidget。"""
@@ -1017,7 +1035,7 @@ class MainWindow(QMainWindow):
             / f"{dataset_name}_cleaned.csv"
         )
         if not csv_path.exists():
-            self.statusBar().showMessage(f"找不到 cleaned CSV: {csv_path}", 5000)
+            self._show_status_message(f"找不到 cleaned CSV: {csv_path}", 5000)
             self._cleaned_csv_rows = []
             self._cleaned_csv_header = None
             self.results_table.clear()
@@ -1029,12 +1047,12 @@ class MainWindow(QMainWindow):
         try:
             text = csv_path.read_text(encoding="utf-8-sig")
         except Exception as e:  # noqa: BLE001
-            self.statusBar().showMessage(f"讀取 cleaned CSV 失敗: {e}", 5000)
+            self._show_status_message(f"讀取 cleaned CSV 失敗: {e}", 5000)
             return
 
         lines = [ln for ln in text.splitlines() if ln.strip()]
         if not lines:
-            self.statusBar().showMessage("cleaned CSV 為空", 3000)
+            self._show_status_message("cleaned CSV 為空", 3000)
             self._cleaned_csv_rows = []
             self._cleaned_csv_header = None
             self.results_table.clear()
@@ -1064,7 +1082,7 @@ class MainWindow(QMainWindow):
 
         self._refresh_results_table_for_current_image()
         self._update_display_pixmap()
-        self.statusBar().showMessage(f"載入 cleaned CSV: {csv_path}", 3000)
+        self._show_status_message(f"載入 cleaned CSV: {csv_path}", 3000)
 
     def _column_index(self, column_name: str) -> int | None:
         """在 cleaned CSV header 中尋找欄位索引。"""

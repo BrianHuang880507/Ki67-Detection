@@ -6,7 +6,7 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtGui import QImage
-from PyQt6.QtWidgets import QApplication, QToolButton
+from PyQt6.QtWidgets import QApplication, QStatusBar, QToolButton
 
 from ki67dtc.app_pipeline import PipelineResult
 from ki67dtc.gui.main_window import MainWindow
@@ -112,6 +112,30 @@ class MainWindowLayoutContractTest(unittest.TestCase):
         for object_name in expected_names:
             with self.subTest(object_name=object_name):
                 self.assertIsNotNone(self.window.findChild(object, object_name))
+
+    def test_right_panel_initial_sizes_prioritize_results_and_chart(self) -> None:
+        self.window.resize(1400, 900)
+        self.window.show()
+        QApplication.processEvents()
+
+        sizes = self.window.right_splitter.sizes()
+
+        self.assertEqual(len(sizes), 4)
+        self.assertGreater(sizes[2], sizes[0])
+        self.assertGreater(sizes[2], sizes[1])
+        self.assertGreater(sizes[3], sizes[0])
+        self.assertGreater(sizes[3], sizes[1])
+
+    def test_status_bar_is_not_part_of_main_window_layout(self) -> None:
+        self.assertEqual(self.window.findChildren(QStatusBar), [])
+
+    def test_overlay_controls_share_image_file_header_row(self) -> None:
+        self.assertEqual(self.window.image_header_widget.objectName(), "imageHeaderRow")
+        self.assertIs(self.window.image_file_label.parent(), self.window.image_header_widget)
+        self.assertIs(self.window.chk_show_nuc.parent(), self.window.image_header_widget)
+        self.assertIs(self.window.chk_show_cyto.parent(), self.window.image_header_widget)
+        self.assertIs(self.window.chk_show_ki67.parent(), self.window.image_header_widget)
+        self.assertIs(self.window.alpha_slider.parent(), self.window.image_header_widget)
 
     def test_control_buttons_are_icon_only_and_centered_contract(self) -> None:
         buttons = self.window.control_button_row.findChildren(QToolButton)
