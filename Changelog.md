@@ -1,4 +1,16 @@
 # Changelog
+
+## 2026.06.30
+
+  * 對齊 SegmentationUI 主畫面風格，加入深色主題、選單列入口與右側四區資訊面板。
+  * 將輸入資料夾與分析選項移到選單列，支援核來源、Ki67 backend、分析方法與清理暫存檔案等選項。
+  * 調整主畫面版面配置：左側保留主要影像顯示區，右側分為終端輸出、影像清單、特徵參數與細胞面積分析圖。
+  * 將開始、中止與重新開始改為置中的圖示按鈕，並補上執行中與停用狀態的視覺回饋。
+  * 將影像 overlay 控制列移到 `Image File Name` 同列右側，並移除底部狀態列顯示。
+  * 在 Cellpose 分割前加入固定模型輸入尺寸 resize，推論後將 mask 與 flow 還原到原圖尺寸。
+  * 依細胞核來源選用對應模型：DAPI 使用 `cyto3`，PC 或 DAPI fallback 使用 `model/model_BDL3_label_dapi`。
+  * 補上 UI layout contract 與分割 resize/model 選擇測試，降低後續介面與 pipeline 行為回歸風險。
+
 ## 2026.06.06
 
   * 新增 `feature_backend=pyimagej|python`，支援以 NumPy、SciPy、scikit-image 與 OpenCV 提取既有特徵欄位
