@@ -5,11 +5,17 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pandas as pd
+from skimage.feature import graycomatrix, graycoprops
+from skimage.measure import regionprops
+from skimage.morphology import convex_hull_image
 
 from ki67dtc.cell_anal import (
     _advanced_texture_feature_values_python,
+    _geometry_from_measurements,
     _measure_roi_with_python,
     _nucleolus_feature_values,
+    _polygon_to_mask,
+    _texture_feature_parameter_values_python,
     flour_anal,
     merged_excel,
     param_anal,
@@ -17,21 +23,128 @@ from ki67dtc.cell_anal import (
 
 
 class PythonFeatureBackendTest(unittest.TestCase):
-    def test_circle_uses_standard_circularity_formula(self) -> None:
+    def test_python_measurement_uses_skimage_morphology(self) -> None:
+        signal = np.ones((80, 80), dtype=np.float32)
+        mask = np.zeros((80, 80), dtype=np.uint8)
+        cv2.ellipse(mask, (40, 40), (18, 8), 20, 0, 360, 1, -1)
+        mask_bool = mask.astype(bool)
+
+        measurement = _measure_roi_with_python(signal, mask_bool)
+        geometry = _geometry_from_measurements(measurement)
+        props = regionprops(mask.astype(int), intensity_image=signal)[0]
+        hull_props = regionprops(convex_hull_image(mask_bool).astype(int))[0]
+        y_coords, x_coords = np.nonzero(mask_bool)
+        expected_compactness = float(
+            np.mean(
+                (y_coords.astype(float) - props.centroid[0]) ** 2
+                + (x_coords.astype(float) - props.centroid[1]) ** 2
+            )
+            / props.area
+        )
+
+        self.assertEqual(measurement["area"], float(props.area))
+        self.assertAlmostEqual(measurement["perimeter"], props.perimeter, places=5)
+        self.assertAlmostEqual(measurement["major"], props.major_axis_length)
+        self.assertAlmostEqual(measurement["minor"], props.minor_axis_length)
+        self.assertAlmostEqual(measurement["feret"], props.feret_diameter_max)
+        self.assertAlmostEqual(measurement["minferet"], props.minor_axis_length)
+        self.assertAlmostEqual(measurement["eccentricity"], props.eccentricity)
+        self.assertAlmostEqual(
+            measurement["convex_perimeter"], hull_props.perimeter, places=5
+        )
+        self.assertAlmostEqual(geometry["compactness"], expected_compactness)
+        self.assertAlmostEqual(
+            geometry["circularity"],
+            2.0 * np.sqrt(np.pi * props.area) / props.perimeter**2,
+        )
+        self.assertAlmostEqual(
+            geometry["sphericity"],
+            4.0 * np.pi * props.area / props.perimeter**2,
+        )
+
+    def test_python_glcm_uses_skimage_graycomatrix(self) -> None:
+        signal = np.array(
+            [
+                [0, 24, 64, 90, 120],
+                [8, 32, 70, 96, 128],
+                [12, 36, 75, 104, 136],
+                [16, 40, 80, 112, 144],
+                [20, 44, 84, 116, 152],
+            ],
+            dtype=np.float32,
+        ) / 255.0
+        mask = np.array(
+            [
+                [0, 1, 1, 1, 0],
+                [1, 1, 1, 1, 1],
+                [1, 1, 1, 1, 1],
+                [1, 1, 1, 1, 1],
+                [0, 1, 1, 1, 0],
+            ],
+            dtype=bool,
+        )
+        roi_img = np.clip(np.rint(signal * 255.0), 0, 255).astype(np.uint8)
+        roi_img[~mask] = 0
+        glcm = graycomatrix(
+            roi_img,
+            distances=[1],
+            angles=[0, np.pi / 4, np.pi / 2, 3 * np.pi / 4],
+            levels=256,
+            symmetric=True,
+            normed=True,
+        )
+        diff_indices = np.abs(
+            np.arange(256)[:, None] - np.arange(256)[None, :]
+        )
+        diff_variances = []
+        for distance_index in range(glcm.shape[2]):
+            for angle_index in range(glcm.shape[3]):
+                matrix = glcm[:, :, distance_index, angle_index]
+                probabilities = np.bincount(
+                    diff_indices.ravel(),
+                    weights=matrix.ravel(),
+                    minlength=256,
+                ).astype(np.float64)
+                index = np.arange(256, dtype=np.float64)
+                mean = float(np.sum(index * probabilities))
+                diff_variances.append(
+                    float(np.sum(((index - mean) ** 2) * probabilities))
+                )
+        expected = [
+            float(graycoprops(glcm, "ASM").mean()),
+            float(graycoprops(glcm, "contrast").mean()),
+            float(graycoprops(glcm, "correlation").mean()),
+            float(np.mean(diff_variances)),
+            float((-glcm[glcm > 0] * np.log(glcm[glcm > 0])).sum() / 4.0),
+            float(graycoprops(glcm, "homogeneity").mean()),
+        ]
+
+        values = _texture_feature_parameter_values_python(
+            signal,
+            mask,
+            erode_px=2,
+        )
+
+        np.testing.assert_allclose(values[:6], expected, rtol=1e-10, atol=1e-10)
+
+    def test_circle_uses_table_circularity_and_sphericity_formula(self) -> None:
         signal = np.ones((64, 64), dtype=np.float32)
         mask = np.zeros((64, 64), dtype=np.uint8)
         cv2.circle(mask, (32, 32), 12, 1, -1)
 
         measurement = _measure_roi_with_python(signal, mask.astype(bool))
-        expected = (
-            4.0
-            * np.pi
-            * measurement["area"]
+        expected_circularity = (
+            2.0
+            * np.sqrt(np.pi * measurement["area"])
             / measurement["perimeter"] ** 2
         )
+        expected_sphericity = (
+            4.0 * np.pi * measurement["area"] / measurement["perimeter"] ** 2
+        )
 
-        self.assertAlmostEqual(measurement["circ"], expected)
-        self.assertGreater(measurement["circ"], 0.8)
+        self.assertAlmostEqual(measurement["circ"], expected_circularity)
+        self.assertAlmostEqual(measurement["sphericity"], expected_sphericity)
+        self.assertGreater(measurement["sphericity"], 0.8)
 
     def test_advanced_texture_features_are_finite_and_normalized(self) -> None:
         y_grid, x_grid = np.indices((96, 96))
@@ -126,6 +239,7 @@ class PythonFeatureBackendTest(unittest.TestCase):
             for column in [
                 "Mean",
                 "GLCM Contrast",
+                "Compactness",
                 "LBP Entropy",
                 "LBP Uniform R3 Hist Bin 09",
                 "Tamura Coarseness",
@@ -146,6 +260,24 @@ class PythonFeatureBackendTest(unittest.TestCase):
             ]:
                 self.assertIn(column, result.columns)
             cyto_rows = result[result["Cell_ID"].str.endswith("_cyto")]
+            first_cyto = result[result["Cell_ID"] == "sample_1_cyto"].iloc[0]
+            nuc_mask = _polygon_to_mask(
+                np.array([[31, 53], [53, 53], [53, 75], [31, 75]]),
+                image.shape,
+            )
+            cell_mask = _polygon_to_mask(
+                np.array([[16, 38], [68, 38], [68, 90], [16, 90]]),
+                image.shape,
+            )
+            expected_cell_area = float(np.count_nonzero(cell_mask))
+            expected_cytoplasm_area = expected_cell_area - float(
+                np.count_nonzero(nuc_mask)
+            )
+            self.assertEqual(first_cyto["Area"], expected_cell_area)
+            self.assertAlmostEqual(
+                first_cyto["Karyoplasmic Ratio"],
+                float(np.count_nonzero(nuc_mask)) / expected_cytoplasm_area,
+            )
             for column in [
                 "Whole Cell Mean",
                 "Whole Cell GLCM Entropy",

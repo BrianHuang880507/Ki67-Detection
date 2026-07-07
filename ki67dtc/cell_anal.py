@@ -11,6 +11,9 @@ from pathlib import Path
 from tqdm import trange
 from typing import Any, Optional, Union
 from skimage.draw import polygon, polygon2mask
+from skimage.feature import graycomatrix, graycoprops
+from skimage.measure import regionprops
+from skimage.morphology import convex_hull_image
 from shapely.affinity import scale
 from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
 from shutil import copyfile
@@ -681,6 +684,9 @@ DEFAULT_DEBRIS_CONFIG: dict[str, Any] = {
 TEXTURE_GLCM_GRAY_LEVELS = 64
 TEXTURE_GLCM_DISTANCES = (1, 3, 5)
 TEXTURE_GLCM_DISTANCE = TEXTURE_GLCM_DISTANCES[0]
+SKIMAGE_GLCM_GRAY_LEVELS = 256
+SKIMAGE_GLCM_DISTANCES = (1,)
+SKIMAGE_GLCM_ANGLES = (0.0, math.pi / 4.0, math.pi / 2.0, 3.0 * math.pi / 4.0)
 TEXTURE_LBP_RADII = (1, 2, 3)
 ZERNIKE_DEGREE = 8
 ZERNIKE_FEATURE_COUNT = 25
@@ -843,7 +849,7 @@ def _histogram_entropy(values: np.ndarray, bins: int = 256) -> float:
 def _measure_roi_with_python(
     signal: np.ndarray, roi_mask: np.ndarray | None
 ) -> dict[str, float]:
-    """Measure one ROI with NumPy, SciPy, scikit-image, and OpenCV."""
+    """Measure one ROI with NumPy and skimage definitions."""
     from scipy.stats import kurtosis, skew
 
     out = _empty_imagej_measurements()
@@ -888,46 +894,36 @@ def _measure_roi_with_python(
         out["skewness"] = float(skew(values, bias=True))
         out["kurtosis"] = float(kurtosis(values, fisher=True, bias=True))
 
-    y_coords, x_coords = np.nonzero(mask)
-    x_centroid = float(np.mean(x_coords))
-    y_centroid = float(np.mean(y_coords))
-
-    contours, _ = cv2.findContours(
-        (mask.astype(np.uint8) * 255),
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_NONE,
-    )
+    props = regionprops(mask.astype(np.uint8), intensity_image=signal)[0]
+    y_centroid, x_centroid = props.centroid
     perimeter = np.nan
     convex_perimeter = np.nan
     feret = np.nan
     min_feret = np.nan
     major = np.nan
     minor = np.nan
-    if contours:
-        contour = max(contours, key=cv2.contourArea)
-        perimeter = float(cv2.arcLength(contour, True))
-        hull = cv2.convexHull(contour)
-        convex_perimeter = float(cv2.arcLength(hull, True))
+    eccentricity = np.nan
 
-        hull_points = hull[:, 0, :].astype(np.float64)
-        if len(hull_points) >= 2:
-            differences = hull_points[:, None, :] - hull_points[None, :, :]
-            feret = float(np.sqrt(np.sum(differences**2, axis=2)).max())
+    perimeter = float(props.perimeter)
+    feret = float(props.feret_diameter_max)
+    major = float(props.major_axis_length)
+    minor = float(props.minor_axis_length)
+    min_feret = minor
+    eccentricity = float(props.eccentricity)
 
-        rect_width, rect_height = cv2.minAreaRect(contour)[1]
-        valid_sides = [side for side in (rect_width, rect_height) if side > 0]
-        if valid_sides:
-            min_feret = float(min(valid_sides))
-        if len(contour) >= 5:
-            _, ellipse_axes, _ = cv2.fitEllipse(contour)
-            major = float(max(ellipse_axes))
-            minor = float(min(ellipse_axes))
-        elif valid_sides:
-            major = float(max(valid_sides))
-            minor = float(min(valid_sides))
+    hull_mask = convex_hull_image(mask)
+    if np.any(hull_mask):
+        convex_perimeter = float(
+            regionprops(hull_mask.astype(np.uint8))[0].perimeter
+        )
 
     aspect_ratio = _safe_divide(major, minor)
     circularity = (
+        float(2.0 * math.sqrt(math.pi * area) / (perimeter**2))
+        if np.isfinite(perimeter) and perimeter > 0
+        else np.nan
+    )
+    sphericity = (
         float(4.0 * math.pi * area / (perimeter**2))
         if np.isfinite(perimeter) and perimeter > 0
         else np.nan
@@ -937,11 +933,23 @@ def _measure_roi_with_python(
         if np.isfinite(major) and major > 0
         else np.nan
     )
-    eccentricity = (
-        float(np.sqrt(max(0.0, 1.0 - (minor / major) ** 2)))
-        if np.isfinite(major)
-        and np.isfinite(minor)
-        and major > 0
+    roughness = (
+        float(1.0 - (convex_perimeter / perimeter))
+        if np.isfinite(convex_perimeter)
+        and np.isfinite(perimeter)
+        and perimeter > 0
+        else np.nan
+    )
+    y_coords, x_coords = np.nonzero(mask)
+    compactness = (
+        float(
+            np.mean(
+                (y_coords.astype(np.float64) - y_centroid) ** 2
+                + (x_coords.astype(np.float64) - x_centroid) ** 2
+            )
+            / area
+        )
+        if area > 0
         else np.nan
     )
 
@@ -958,6 +966,9 @@ def _measure_roi_with_python(
             "ar": aspect_ratio,
             "round": roundness,
             "circ": circularity,
+            "sphericity": sphericity,
+            "roughness": roughness,
+            "compactness": compactness,
             "convex_perimeter": convex_perimeter,
         }
     )
@@ -1390,62 +1401,118 @@ def _glcm_properties(matrix: np.ndarray) -> tuple[float, float, float, float]:
     return asm, contrast, correlation, homogeneity
 
 
+def _texture_uint8_for_skimage(signal: np.ndarray) -> np.ndarray:
+    """將影像強度轉成 skimage GLCM 需要的 uint8 灰階影像。
+
+    Args:
+        signal: 2D 影像強度，可為 0 到 1 浮點值或 0 到 255 灰階值。
+
+    Returns:
+        uint8 灰階影像。
+    """
+    values = np.asarray(signal, dtype=np.float64)
+    if values.size == 0:
+        return np.zeros(values.shape, dtype=np.uint8)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return np.zeros(values.shape, dtype=np.uint8)
+
+    low = float(finite.min())
+    high = float(finite.max())
+    if low >= 0.0 and high <= 1.0:
+        scaled = values * 255.0
+    elif low >= 0.0 and high <= 255.0:
+        scaled = values
+    elif high > low:
+        scaled = (values - low) / (high - low) * 255.0
+    else:
+        scaled = np.zeros(values.shape, dtype=np.float64)
+    return np.clip(np.rint(scaled), 0, 255).astype(np.uint8)
+
+
 def _texture_feature_parameter_values_python(
     signal: np.ndarray,
     roi_mask: np.ndarray,
     erode_px: int,
-    gray_levels: int = TEXTURE_GLCM_GRAY_LEVELS,
-    distances: tuple[int, ...] = TEXTURE_GLCM_DISTANCES,
+    gray_levels: int = SKIMAGE_GLCM_GRAY_LEVELS,
+    distances: tuple[int, ...] = SKIMAGE_GLCM_DISTANCES,
 ) -> list[float]:
-    """Extract mask-aware GLCM features over four angles and three scales."""
+    """以 skimage GLCM 量測 Python backend 的 texture 特徵。
+
+    Args:
+        signal: 2D 影像強度。
+        roi_mask: ROI 布林遮罩。
+        erode_px: 保留舊 API，相容呼叫端；skimage 定義不使用 erosion。
+        gray_levels: GLCM 灰階層數。
+        distances: GLCM pixel distances。
+
+    Returns:
+        依既有欄位順序輸出 ASM、Contrast、Correlation、
+        Difference Variance、Entropy、Homogeneity。
+    """
     valid_distances = tuple(int(distance) for distance in distances if distance > 0)
     if not valid_distances:
         return _empty_glcm_feature_values()
-    prepared = _prepare_texture_crop(
-        signal, roi_mask, erode_px, max(valid_distances)
-    )
-    if prepared is None:
+    if roi_mask is None or not np.any(roi_mask):
         return _empty_glcm_feature_values()
-    crop, crop_mask = prepared
-    quantized = _quantize_to_levels(crop, gray_levels)
-    angle_values: list[list[float]] = []
-    for distance in valid_distances:
-        offsets = [
-            (0, distance),
-            (-distance, distance),
-            (-distance, 0),
-            (-distance, -distance),
-        ]
-        for row_offset, col_offset in offsets:
-            matrix = _masked_glcm(
-                quantized,
-                crop_mask,
-                gray_levels,
-                row_offset,
-                col_offset,
-            )
-            if matrix is None:
-                continue
-            asm, contrast, correlation, homogeneity = _glcm_properties(matrix)
-            entropy_value = float(
-                -np.sum(matrix[matrix > 0] * np.log(matrix[matrix > 0]))
-            )
-            angle_values.append(
-                [
-                    asm,
-                    contrast,
-                    correlation,
-                    _glcm_difference_variance(matrix),
-                    entropy_value,
-                    homogeneity,
-                ]
-            )
 
-    if not angle_values:
+    mask = np.asarray(roi_mask, dtype=bool)
+    rows = np.any(mask, axis=1)
+    cols = np.any(mask, axis=0)
+    if not rows.any() or not cols.any():
         return _empty_glcm_feature_values()
-    with np.errstate(all="ignore"):
-        means = np.nanmean(np.asarray(angle_values, dtype=np.float64), axis=0)
-    return [float(value) if np.isfinite(value) else np.nan for value in means]
+
+    row_indices = np.where(rows)[0]
+    col_indices = np.where(cols)[0]
+    r0, r1 = int(row_indices[0]), int(row_indices[-1])
+    c0, c1 = int(col_indices[0]), int(col_indices[-1])
+
+    image_uint8 = _texture_uint8_for_skimage(signal)
+    roi_img = image_uint8[r0 : r1 + 1, c0 : c1 + 1].copy()
+    roi_mask = mask[r0 : r1 + 1, c0 : c1 + 1]
+    roi_img[~roi_mask] = 0
+
+    if gray_levels != 256:
+        roi_img = np.floor(
+            roi_img.astype(np.float64) / 256.0 * gray_levels
+        ).astype(np.uint8)
+
+    glcm = graycomatrix(
+        roi_img,
+        distances=valid_distances,
+        angles=SKIMAGE_GLCM_ANGLES,
+        levels=int(gray_levels),
+        symmetric=True,
+        normed=True,
+    )
+
+    asm = float(graycoprops(glcm, "ASM").mean())
+    contrast = float(graycoprops(glcm, "contrast").mean())
+    correlation = float(graycoprops(glcm, "correlation").mean())
+    homogeneity = float(graycoprops(glcm, "homogeneity").mean())
+
+    diff_variance_values: list[float] = []
+    entropy_values: list[float] = []
+    for distance_index in range(glcm.shape[2]):
+        for angle_index in range(glcm.shape[3]):
+            matrix = glcm[:, :, distance_index, angle_index]
+            diff_variance_values.append(_glcm_difference_variance(matrix))
+            probabilities = matrix[matrix > 0]
+            entropy_values.append(float(-np.sum(probabilities * np.log(probabilities))))
+
+    difference_variance = (
+        float(np.mean(diff_variance_values)) if diff_variance_values else np.nan
+    )
+    entropy_value = float(np.mean(entropy_values)) if entropy_values else np.nan
+    values = [
+        asm,
+        contrast,
+        correlation,
+        difference_variance,
+        entropy_value,
+        homogeneity,
+    ]
+    return [float(value) if np.isfinite(value) else np.nan for value in values]
 
 
 def _lbp_feature_parameter_values_python(
@@ -2474,17 +2541,9 @@ def _geometry_from_measurements(m: dict[str, float]) -> dict[str, float]:
     circular_diameter = (
         2 * np.sqrt(area / np.pi) if not np.isnan(area) and area > 0 else np.nan
     )
-    sphericity = m["circ"]
-    if np.isnan(sphericity):
-        sphericity = (
-            (4 * np.pi * area) / (perimeter**2)
-            if not np.isnan(area) and not np.isnan(perimeter) and perimeter > 0
-            else np.nan
-        )
-
-    roughness = (
-        (convex_perimeter / perimeter)
-        if not np.isnan(convex_perimeter) and not np.isnan(perimeter) and perimeter > 0
+    sphericity = (
+        (4 * np.pi * area) / (perimeter**2)
+        if not np.isnan(area) and not np.isnan(perimeter) and perimeter > 0
         else np.nan
     )
 
@@ -2492,6 +2551,8 @@ def _geometry_from_measurements(m: dict[str, float]) -> dict[str, float]:
     roundness = m["round"]
     circularity = np.nan
     eccentricity = m.get("eccentricity", np.nan)
+    roughness = m.get("roughness", np.nan)
+    compactness = m.get("compactness", np.nan)
 
     if (
         np.isnan(aspect_ratio)
@@ -2513,7 +2574,19 @@ def _geometry_from_measurements(m: dict[str, float]) -> dict[str, float]:
         eccentricity = float(np.sqrt(max(0.0, 1.0 - (minor / major) ** 2)))
 
     if not np.isnan(area) and not np.isnan(perimeter) and perimeter > 0:
-        circularity = (4 * np.pi * area) / (perimeter**2)
+        circularity = (2 * np.sqrt(np.pi * area)) / (perimeter**2)
+
+    if np.isnan(roughness):
+        roughness = (
+            (convex_perimeter / perimeter)
+            if not np.isnan(convex_perimeter)
+            and not np.isnan(perimeter)
+            and perimeter > 0
+            else np.nan
+        )
+
+    if np.isnan(compactness) and not np.isnan(circularity) and circularity > 0:
+        compactness = 1.0 / circularity
 
     return {
         "area": area,
@@ -2528,6 +2601,7 @@ def _geometry_from_measurements(m: dict[str, float]) -> dict[str, float]:
         "circularity": circularity,
         "sphericity": sphericity,
         "roughness": roughness,
+        "compactness": compactness,
         "x_centroid": m["x_centroid"],
         "y_centroid": m["y_centroid"],
     }
@@ -3114,11 +3188,7 @@ def param_anal(
             has_nuc = bool(np.any(nuc_mask))
             has_cyto = bool(np.any(cell_mask))
             if has_cyto:
-                cyto_mask = (
-                    np.logical_and(cell_mask, np.logical_not(nuc_mask))
-                    if has_nuc
-                    else cell_mask.copy()
-                )
+                cyto_mask = cell_mask.copy()
 
             if not has_nuc and not has_cyto:
                 continue
@@ -3357,11 +3427,12 @@ def param_anal(
             if (
                 not np.isnan(cyto_g["area"])
                 and not np.isnan(nuc_g["area"])
-                and cyto_g["area"] > 0
+                and (cyto_g["area"] - nuc_g["area"]) > 0
             ):
-                # Use nucleus area / cytoplasm area so the value matches the intended
-                # biological interpretation of a nucleocytoplasmic ratio.
-                karyoplasmic_ratio = float(nuc_g["area"] / cyto_g["area"])
+                # Area_cyto is the whole-cell area; subtract the nucleus for cytoplasm.
+                karyoplasmic_ratio = float(
+                    nuc_g["area"] / (cyto_g["area"] - nuc_g["area"])
+                )
 
             cell_records.append(
                 {
@@ -3562,6 +3633,7 @@ def param_anal(
                         nuc_g["circularity"],
                         nuc_g["sphericity"],
                         nuc_g["roughness"],
+                        nuc_g["compactness"],
                         np.nan,
                         *record["nuc_intensity_features"],
                         *record["nuc_texture_features"],
@@ -3584,6 +3656,7 @@ def param_anal(
                         cyto_g["circularity"],
                         cyto_g["sphericity"],
                         cyto_g["roughness"],
+                        cyto_g["compactness"],
                         record["karyoplasmic_ratio"],
                         *record["cyto_intensity_features"],
                         *record["cyto_texture_features"],
@@ -3607,6 +3680,7 @@ def param_anal(
             "Circularity",
             "Sphericity",
             "Roughness",
+            "Compactness",
             "Karyoplasmic Ratio",
             *INTENSITY_FEATURE_PARAMETER_COLUMNS,
             *TEXTURE_FEATURE_PARAMETER_COLUMNS,

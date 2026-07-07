@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QRectF
@@ -37,6 +37,25 @@ from ..app_pipeline import (
 from .icons import standard_icon
 from .theme import APP_QSS
 
+_SEGMENTATION_PALETTE_RGB = [
+    (255, 0, 0),
+    (0, 255, 0),
+    (0, 0, 255),
+    (255, 255, 0),
+    (255, 0, 255),
+    (0, 255, 255),
+    (255, 128, 0),
+    (128, 0, 255),
+    (0, 128, 255),
+    (128, 255, 0),
+]
+
+
+def _rgb_to_bgr(color: tuple[int, int, int]) -> tuple[int, int, int]:
+    """將 RGB 色碼轉成 OpenCV BGR 色碼。"""
+    red, green, blue = color
+    return blue, green, red
+
 
 class PipelineThread(QThread):
     """背景執行 pipeline 的 QThread。
@@ -57,6 +76,8 @@ class PipelineThread(QThread):
         ki67_backend: str,
         feature_backend: str,
         clean_temp: bool,
+        width_um_per_px: float,
+        height_um_per_px: float,
         parent: Optional[QWidget] = None,
     ) -> None:
         """初始化背景 pipeline 執行緒。"""
@@ -68,6 +89,8 @@ class PipelineThread(QThread):
         self._ki67_backend = ki67_backend
         self._feature_backend = feature_backend
         self._clean_temp = clean_temp
+        self._width_um_per_px = width_um_per_px
+        self._height_um_per_px = height_um_per_px
 
     def _progress_callback(self, done: int, total: int, message: str) -> None:
         """將 pipeline 進度轉送為 Qt signal。"""
@@ -84,6 +107,8 @@ class PipelineThread(QThread):
                 ki67_backend=self._ki67_backend,
                 feature_backend=self._feature_backend,
                 clean_temp=self._clean_temp,
+                width_um_per_px=self._width_um_per_px,
+                height_um_per_px=self._height_um_per_px,
                 progress_callback=self._progress_callback,
             )
             self.finished_ok.emit(result)
@@ -126,7 +151,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         """初始化主視窗狀態並建立 UI。"""
         super().__init__()
-        self.setWindowTitle("Ki67 細胞影像分析 GUI (Early Prototype)")
+        self._apply_window_branding()
         # 預設視窗更大
         self.resize(1400, 900)
         self.setStyleSheet(APP_QSS)
@@ -137,14 +162,27 @@ class MainWindow(QMainWindow):
         self._current_overlay_polygons: dict[
             Path, tuple[list[np.ndarray], list[np.ndarray]]
         ] = {}
+        self._current_overlay_masks: dict[
+            Path, tuple[np.ndarray | None, np.ndarray | None]
+        ] = {}
         self._current_overlay_image: QPixmap | None = None
+        self._current_overlay_image_array: np.ndarray | None = None
         self._show_nuc: bool = True
         self._show_cyto: bool = True
         self._show_ki67: bool = False
         self._overlay_alpha: float = 0.5
         self._current_data_folder: Path | None = None
-        self._area_chart_pixmap: QPixmap | None = None
+        self._area_scatter_pixmap: QPixmap | None = None
+        self._area_histogram_pixmap: QPixmap | None = None
         self._last_status_message: str = ""
+        self._nuc_source: str = "dapi"
+        self._ki67_backend: str = "pyimagej"
+        self._feature_backend: str = "pyimagej"
+        self._fluor_analy: bool = True
+        self._ki67: bool = True
+        self._clean_temp: bool = True
+        self._width_um_per_px: float = 1.5896
+        self._height_um_per_px: float = 1.5876
         # 新增：目前選中的 Cell_ID（例如 "1_3"）
         self._selected_cell_id: str | None = None
         self._highlight_enabled: bool = False
@@ -158,6 +196,13 @@ class MainWindow(QMainWindow):
         # selection change 只會在 selection 真的改變時觸發；再點同一列不一定會觸發
         # 因此用 clicked 事件確保每次點擊都能切換
         self.results_table.cellClicked.connect(self._on_results_table_cell_clicked)
+
+    def _apply_window_branding(self) -> None:
+        """套用與 SegmentationUI 一致的視窗標題與 icon。"""
+        self.setWindowTitle("ITRI CytoScope")
+        icon_path = Path(__file__).with_name("assets") / "itri_EL_C.png"
+        if icon_path.exists():
+            self.setWindowIcon(QtGui.QIcon(str(icon_path)))
 
     def _set_running_state(self, running: bool) -> None:
         """設定執行狀態與控制按鈕圖示。"""
@@ -267,54 +312,145 @@ class MainWindow(QMainWindow):
         self.action_open_input = file_menu.addAction("開啟")
         self.action_open_input.triggered.connect(self._on_browse_input)
 
-        analysis_menu = self.menuBar().addMenu("分析選項")
-        nuc_menu = analysis_menu.addMenu("核來源")
-        self.nuc_source_actions = self._add_exclusive_option_actions(
-            nuc_menu,
-            [
-                ("DAPI", "dapi", True),
-                ("PC", "pc", False),
-            ],
-        )
-        self.action_nuc_source = nuc_menu.menuAction()
+        self.action_analysis_options = self.menuBar().addAction("分析選項")
+        self.action_analysis_options.triggered.connect(self._open_analysis_options_dialog)
 
-        ki67_backend_menu = analysis_menu.addMenu("Ki67 Backend")
-        self.ki67_backend_actions = self._add_exclusive_option_actions(
-            ki67_backend_menu,
-            [
-                ("PyImageJ", "pyimagej", True),
-                ("OpenCV", "opencv", False),
-            ],
-        )
-        self.action_ki67_backend = ki67_backend_menu.menuAction()
+    def _new_option_combo(
+        self,
+        parent: QWidget,
+        object_name: str,
+        options: list[tuple[str, str]],
+        current_value: str,
+    ) -> QtWidgets.QComboBox:
+        """建立分析選項子視窗使用的下拉選單。"""
+        combo = QtWidgets.QComboBox(parent)
+        combo.setObjectName(object_name)
+        for label, value in options:
+            combo.addItem(label, value)
+        index = combo.findData(current_value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        return combo
 
-        feature_backend_menu = analysis_menu.addMenu("分析方法")
-        self.feature_backend_actions = self._add_exclusive_option_actions(
-            feature_backend_menu,
-            [
-                ("PyImageJ", "pyimagej", True),
-                ("Python", "python", False),
-            ],
-        )
-        self.action_feature_backend = feature_backend_menu.menuAction()
+    def _build_analysis_options_dialog(self) -> QtWidgets.QDialog:
+        """建立分析選項子視窗。"""
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("分析選項")
+        dialog.setObjectName("analysisOptionsDialog")
+        dialog.setModal(True)
 
-        self.action_fluor_analy = analysis_menu.addAction("螢光分析")
-        self.action_fluor_analy.setCheckable(True)
-        self.action_fluor_analy.setChecked(True)
-        self.action_ki67_analy = analysis_menu.addAction("Ki67 分析")
-        self.action_ki67_analy.setCheckable(True)
-        self.action_ki67_analy.setChecked(True)
-        self.action_clean_temp = analysis_menu.addAction("清理暫存檔案")
-        self.action_clean_temp.setCheckable(True)
-        self.action_clean_temp.setChecked(True)
-        self.analysis_option_actions = [
-            self.action_nuc_source,
-            self.action_ki67_backend,
-            self.action_feature_backend,
-            self.action_fluor_analy,
-            self.action_ki67_analy,
-            self.action_clean_temp,
-        ]
+        root = QVBoxLayout(dialog)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
+
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        root.addLayout(form)
+
+        form.addRow(
+            "核來源",
+            self._new_option_combo(
+                dialog,
+                "nucSourceCombo",
+                [("DAPI", "dapi"), ("PC", "pc")],
+                self._nuc_source,
+            ),
+        )
+        form.addRow(
+            "Ki67 Backend",
+            self._new_option_combo(
+                dialog,
+                "ki67BackendCombo",
+                [("PyImageJ", "pyimagej"), ("OpenCV", "opencv")],
+                self._ki67_backend,
+            ),
+        )
+        form.addRow(
+            "分析方法",
+            self._new_option_combo(
+                dialog,
+                "featureBackendCombo",
+                [("PyImageJ", "pyimagej"), ("Python", "python")],
+                self._feature_backend,
+            ),
+        )
+
+        fluor_check = QtWidgets.QCheckBox("螢光分析", dialog)
+        fluor_check.setObjectName("fluorAnalysisCheck")
+        fluor_check.setChecked(self._fluor_analy)
+        form.addRow("", fluor_check)
+
+        ki67_check = QtWidgets.QCheckBox("Ki67 分析", dialog)
+        ki67_check.setObjectName("ki67AnalysisCheck")
+        ki67_check.setChecked(self._ki67)
+        form.addRow("", ki67_check)
+
+        clean_check = QtWidgets.QCheckBox("清理暫存檔案", dialog)
+        clean_check.setObjectName("cleanTempCheck")
+        clean_check.setChecked(self._clean_temp)
+        form.addRow("", clean_check)
+
+        width_spin = QtWidgets.QDoubleSpinBox(dialog)
+        width_spin.setObjectName("widthPixelScaleSpin")
+        width_spin.setDecimals(4)
+        width_spin.setRange(0.0001, 1000.0)
+        width_spin.setValue(self._width_um_per_px)
+        width_spin.setSuffix(" µm/pixel")
+        form.addRow("WIDTH", width_spin)
+
+        height_spin = QtWidgets.QDoubleSpinBox(dialog)
+        height_spin.setObjectName("heightPixelScaleSpin")
+        height_spin.setDecimals(4)
+        height_spin.setRange(0.0001, 1000.0)
+        height_spin.setValue(self._height_um_per_px)
+        height_spin.setSuffix(" µm/pixel")
+        form.addRow("HEIGHT", height_spin)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        confirm_button = QPushButton("確認", dialog)
+        confirm_button.clicked.connect(dialog.accept)
+        cancel_button = QPushButton("取消", dialog)
+        cancel_button.clicked.connect(dialog.reject)
+        button_row.addWidget(confirm_button)
+        button_row.addWidget(cancel_button)
+        root.addLayout(button_row)
+
+        return dialog
+
+    def _apply_analysis_options_dialog(self, dialog: QtWidgets.QDialog) -> None:
+        """套用分析選項子視窗目前值。"""
+        nuc_combo = dialog.findChild(QtWidgets.QComboBox, "nucSourceCombo")
+        ki67_backend_combo = dialog.findChild(QtWidgets.QComboBox, "ki67BackendCombo")
+        feature_backend_combo = dialog.findChild(QtWidgets.QComboBox, "featureBackendCombo")
+        fluor_check = dialog.findChild(QtWidgets.QCheckBox, "fluorAnalysisCheck")
+        ki67_check = dialog.findChild(QtWidgets.QCheckBox, "ki67AnalysisCheck")
+        clean_check = dialog.findChild(QtWidgets.QCheckBox, "cleanTempCheck")
+        width_spin = dialog.findChild(QtWidgets.QDoubleSpinBox, "widthPixelScaleSpin")
+        height_spin = dialog.findChild(QtWidgets.QDoubleSpinBox, "heightPixelScaleSpin")
+
+        if nuc_combo is not None:
+            self._nuc_source = str(nuc_combo.currentData())
+        if ki67_backend_combo is not None:
+            self._ki67_backend = str(ki67_backend_combo.currentData())
+        if feature_backend_combo is not None:
+            self._feature_backend = str(feature_backend_combo.currentData())
+        if fluor_check is not None:
+            self._fluor_analy = fluor_check.isChecked()
+        if ki67_check is not None:
+            self._ki67 = ki67_check.isChecked()
+        if clean_check is not None:
+            self._clean_temp = clean_check.isChecked()
+        if width_spin is not None:
+            self._width_um_per_px = float(width_spin.value())
+        if height_spin is not None:
+            self._height_um_per_px = float(height_spin.value())
+
+    def _open_analysis_options_dialog(self) -> None:
+        """開啟分析選項子視窗並套用確認後的設定。"""
+        dialog = self._build_analysis_options_dialog()
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self._apply_analysis_options_dialog(dialog)
 
     def _new_panel(self, object_name: str, title: str) -> QtWidgets.QFrame:
         """建立右側等分 panel。"""
@@ -401,13 +537,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.image_list, stretch=1)
         return panel
 
-    def _build_feature_table_panel(self) -> QtWidgets.QFrame:
-        """建立特徵參數分析結果表格 panel。"""
-        panel = self._new_panel("featureTablePanel", "3. 分析結果（特徵參數）")
-        layout = panel.layout()
-        assert layout is not None
-
-        self.results_table = QTableWidget(panel)
+    def _create_hidden_results_table(self) -> None:
+        """保留 cleaned CSV 與 cell highlight 邏輯使用的隱藏表格。"""
+        self.results_table = QTableWidget(self)
         self.results_table.setObjectName("featureParameterTable")
         self.results_table.setEditTriggers(
             QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
@@ -417,23 +549,32 @@ class MainWindow(QMainWindow):
         )
         self.results_table.setColumnCount(3)
         self.results_table.setHorizontalHeaderLabels(["Cell_ID", "Area", "Mean"])
-        layout.addWidget(self.results_table, stretch=1)
-        return panel
+        self.results_table.hide()
 
-    def _build_area_chart_panel(self) -> QtWidgets.QFrame:
-        """建立細胞面積分析 panel。"""
-        panel = self._new_panel("areaChartPanel", "細胞面積分析")
-        self.area_chart_title = panel.findChild(QLabel, "areaChartPanelTitle")
-        if self.area_chart_title is not None:
-            self.area_chart_title.setText("細胞面積分析")
-
+    def _build_area_scatter_panel(self) -> QtWidgets.QFrame:
+        """建立細胞面積點狀分布圖 panel。"""
+        panel = self._new_panel("areaScatterPanel", "3. 細胞面積點狀分布圖")
+        self.area_scatter_title = panel.findChild(QLabel, "areaScatterPanelTitle")
         layout = panel.layout()
         assert layout is not None
-        self.area_chart_label = QLabel(panel)
-        self.area_chart_label.setObjectName("areaChartLabel")
-        self.area_chart_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.area_chart_label.setText("")
-        layout.addWidget(self.area_chart_label, stretch=1)
+        self.area_scatter_label = QLabel(panel)
+        self.area_scatter_label.setObjectName("areaScatterLabel")
+        self.area_scatter_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.area_scatter_label.setText("")
+        layout.addWidget(self.area_scatter_label, stretch=1)
+        return panel
+
+    def _build_area_histogram_panel(self) -> QtWidgets.QFrame:
+        """建立細胞面積長條圖 panel。"""
+        panel = self._new_panel("areaHistogramPanel", "4. 細胞面積長條圖")
+        self.area_histogram_title = panel.findChild(QLabel, "areaHistogramPanelTitle")
+        layout = panel.layout()
+        assert layout is not None
+        self.area_histogram_label = QLabel(panel)
+        self.area_histogram_label.setObjectName("areaHistogramLabel")
+        self.area_histogram_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.area_histogram_label.setText("")
+        layout.addWidget(self.area_histogram_label, stretch=1)
         return panel
 
     def _build_ui(self) -> None:
@@ -444,40 +585,9 @@ class MainWindow(QMainWindow):
         root = QHBoxLayout(central)
         root.setContentsMargins(8, 8, 8, 8)
 
-        # 舊 handler 仍會讀取這些狀態元件；Task 6 會把它們接回正式控制列。
         self.input_dir_edit = QLineEdit(self)
         self.input_dir_edit.hide()
-
-        self.chk_fluor = QCheckBox("螢光分析", self)
-        self.chk_fluor.setChecked(True)
-        self.chk_ki67 = QCheckBox("Ki67 分析", self)
-        self.chk_ki67.setChecked(True)
-        self.chk_clean = QCheckBox("清理暫存資料", self)
-        self.chk_clean.setChecked(True)
-        self.chk_fluor.toggled.connect(self.action_fluor_analy.setChecked)
-        self.action_fluor_analy.toggled.connect(self.chk_fluor.setChecked)
-        self.chk_ki67.toggled.connect(self.action_ki67_analy.setChecked)
-        self.action_ki67_analy.toggled.connect(self.chk_ki67.setChecked)
-        self.chk_clean.toggled.connect(self.action_clean_temp.setChecked)
-        self.action_clean_temp.toggled.connect(self.chk_clean.setChecked)
-        self.chk_fluor.hide()
-        self.chk_ki67.hide()
-        self.chk_clean.hide()
-
-        self.nuc_source_combo = QtWidgets.QComboBox(self)
-        self.nuc_source_combo.addItem("DAPI", "dapi")
-        self.nuc_source_combo.addItem("PC", "pc")
-        self.nuc_source_combo.hide()
-
-        self.feature_backend_combo = QtWidgets.QComboBox(self)
-        self.feature_backend_combo.addItem("PyImageJ", "pyimagej")
-        self.feature_backend_combo.addItem("Python", "python")
-        self.feature_backend_combo.hide()
-
-        self.ki67_backend_combo = QtWidgets.QComboBox(self)
-        self.ki67_backend_combo.addItem("PyImageJ", "pyimagej")
-        self.ki67_backend_combo.addItem("OpenCV", "opencv")
-        self.ki67_backend_combo.hide()
+        self._create_hidden_results_table()
 
         self.btn_run = QPushButton("Run", self)
         self.btn_run.clicked.connect(self._on_run_clicked)
@@ -552,8 +662,8 @@ class MainWindow(QMainWindow):
 
         self.right_splitter.addWidget(self._build_terminal_panel())
         self.right_splitter.addWidget(self._build_image_list_panel())
-        self.right_splitter.addWidget(self._build_feature_table_panel())
-        self.right_splitter.addWidget(self._build_area_chart_panel())
+        self.right_splitter.addWidget(self._build_area_scatter_panel())
+        self.right_splitter.addWidget(self._build_area_histogram_panel())
 
         for index in range(4):
             self.right_splitter.setStretchFactor(index, 1)
@@ -587,6 +697,38 @@ class MainWindow(QMainWindow):
         _ = timeout
         self._last_status_message = message
 
+    def _build_analysis_complete_dialog(self) -> QtWidgets.QDialog:
+        """建立分析完成提示子視窗。"""
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("警告")
+        dialog.setObjectName("analysisCompleteDialog")
+        dialog.setModal(True)
+
+        root = QVBoxLayout(dialog)
+        root.setContentsMargins(18, 16, 18, 14)
+        root.setSpacing(14)
+
+        message = QLabel("分析完畢!!!", dialog)
+        message.setObjectName("analysisCompleteMessage")
+        message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(message)
+
+        button_row = QtWidgets.QWidget(dialog)
+        button_row.setObjectName("analysisCompleteButtonRow")
+        button_layout = QHBoxLayout(button_row)
+        button_layout.setContentsMargins(0, 0, 0, 0)
+        confirm_button = QPushButton("確認", button_row)
+        confirm_button.setObjectName("analysisCompleteConfirmButton")
+        confirm_button.clicked.connect(dialog.accept)
+        button_layout.addWidget(confirm_button, alignment=Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(button_row)
+
+        return dialog
+
+    def _show_analysis_complete_dialog(self) -> None:
+        """顯示分析完成提示子視窗。"""
+        self._build_analysis_complete_dialog().exec()
+
     def _on_browse_input(self) -> None:
         """開啟資料夾選擇器並載入影像與 cleaned CSV。"""
         base = Path.cwd() / "data" / "input"
@@ -610,27 +752,16 @@ class MainWindow(QMainWindow):
 
         data_folder = Path(path_text)
 
-        nuc_source = self._selected_action_value(self.nuc_source_actions, "dapi")
-        feature_backend = self._selected_action_value(
-            self.feature_backend_actions,
-            "pyimagej",
-        )
-        ki67_backend = self._selected_action_value(
-            self.ki67_backend_actions,
-            "pyimagej",
-        )
-        fluor_analy = self.action_fluor_analy.isChecked()
-        ki67 = self.action_ki67_analy.isChecked()
-        clean_temp = self.action_clean_temp.isChecked()
-
         self._pipeline_thread = PipelineThread(
             data_folder,
-            nuc_source=nuc_source,
-            fluor_analy=fluor_analy,
-            ki67=ki67,
-            ki67_backend=ki67_backend,
-            feature_backend=feature_backend,
-            clean_temp=clean_temp,
+            nuc_source=self._nuc_source,
+            fluor_analy=self._fluor_analy,
+            ki67=self._ki67,
+            ki67_backend=self._ki67_backend,
+            feature_backend=self._feature_backend,
+            clean_temp=self._clean_temp,
+            width_um_per_px=self._width_um_per_px,
+            height_um_per_px=self._height_um_per_px,
             parent=self,
         )
         self._pipeline_thread.progress_changed.connect(self._on_progress_changed)
@@ -661,14 +792,19 @@ class MainWindow(QMainWindow):
         self.results_table.setRowCount(0)
         self.results_table.setColumnCount(0)
         self.image_file_label.setText("Image File Name")
-        self.area_chart_label.clear()
-        self.area_chart_label.setText("")
-        self._area_chart_pixmap = None
+        self.area_scatter_label.clear()
+        self.area_scatter_label.setText("")
+        self.area_histogram_label.clear()
+        self.area_histogram_label.setText("")
+        self._area_scatter_pixmap = None
+        self._area_histogram_pixmap = None
         self._pipeline_result = None
         self._current_image_index = None
         self._current_image_array = None
         self._current_overlay_polygons.clear()
+        self._current_overlay_masks.clear()
         self._current_overlay_image = None
+        self._current_overlay_image_array = None
         self._current_data_folder = None
         self._selected_cell_id = None
         self._highlight_enabled = False
@@ -704,7 +840,7 @@ class MainWindow(QMainWindow):
 
         # pipeline 結束後載入 cleaned CSV
         self._load_cleaned_csv_for_dataset()
-        self._load_area_chart()
+        self._load_area_charts()
 
         self._show_status_message(
             f"Pipeline 完成，共處理 {len(result.image_files)} 張影像"
@@ -713,6 +849,7 @@ class MainWindow(QMainWindow):
         self._append_terminal_line(
             "INFO", f"Pipeline 完成，載入 {len(result.image_files)} 張影像"
         )
+        self._show_analysis_complete_dialog()
 
     def _on_pipeline_failed(self, message: str) -> None:
         """處理 pipeline 失敗訊息並恢復 Run 按鈕。"""
@@ -736,12 +873,13 @@ class MainWindow(QMainWindow):
         self._update_display_pixmap()
 
     def _load_image_and_overlays(self, img_path: Path) -> None:
-        """載入原圖為 numpy 陣列，並嘗試載入對應的 merged outlines。"""
+        """載入原圖、segmentation masks 與 merged outlines。"""
         # 使用 OpenCV 讀圖，保留灰階或彩色
         img_bgr = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
         if img_bgr is None:
             self._show_status_message(f"無法載入影像：{img_path}")
             self._current_image_array = None
+            self._current_overlay_image_array = None
             self.image_file_label.setText("無法載入影像")
             return
 
@@ -751,23 +889,201 @@ class MainWindow(QMainWindow):
         self._current_image_array = img_bgr
         self.image_file_label.setText(img_path.name)
 
+        nuc_mask, cyto_mask = self._load_segmentation_masks_for_image(
+            img_path, img_bgr.shape[:2]
+        )
+        if nuc_mask is not None or cyto_mask is not None:
+            self._current_overlay_masks[img_path] = (nuc_mask, cyto_mask)
+        else:
+            self._current_overlay_masks.pop(img_path, None)
+
         # 嘗試載入 outlines
         merged_path = find_merged_outline_for_image(img_path)
+        nuc_polys: list[np.ndarray] = []
+        cyto_polys: list[np.ndarray] = []
         if merged_path is None:
             self._current_overlay_polygons.pop(img_path, None)
-            self._current_overlay_image = None
-            self._show_status_message(f"沒有找到 outlines：{img_path.name}")
+            if nuc_mask is None and cyto_mask is None:
+                self._current_overlay_image = None
+                self._current_overlay_image_array = None
+                self._show_status_message(f"沒有找到 outlines：{img_path.name}")
+                return
+        else:
+            polygons = load_merged_outlines(merged_path)
+            nuc_polys = polygons.nuc_polygons
+            cyto_polys = polygons.cyto_polygons
+            self._current_overlay_polygons[img_path] = (nuc_polys, cyto_polys)
+
+        overlay_bgr = self._create_overlay_bgr(
+            img_bgr,
+            nuc_polys,
+            cyto_polys,
+            nuc_mask=nuc_mask,
+            cyto_mask=cyto_mask,
+        )
+        self._current_overlay_image_array = overlay_bgr
+        self._current_overlay_image = self._pixmap_from_bgr(overlay_bgr)
+
+    def _segment_output_dir_for_image(self, image_path: Path) -> Path:
+        """推導指定影像對應的 segmentation 輸出資料夾。
+
+        Args:
+            image_path: 目前 GUI 顯示的原始影像路徑。
+
+        Returns:
+            `data/output/segment/<folder_name>` 類型的資料夾路徑。
+        """
+        if self._pipeline_result is not None:
+            data_folder = Path(self._pipeline_result.data_folder)
+            return data_folder.parent.parent / "output" / "segment" / data_folder.name
+        if self._current_data_folder is not None:
+            data_folder = Path(self._current_data_folder)
+            return data_folder.parent.parent / "output" / "segment" / data_folder.name
+
+        image_path = image_path.resolve()
+        dataset_dir = (
+            image_path.parent.parent
+            if image_path.parent.name.lower() == "pc"
+            else image_path.parent
+        )
+        if dataset_dir.parent.name.lower() == "input":
+            return dataset_dir.parent.parent / "output" / "segment" / dataset_dir.name
+        return Path("data") / "output" / "segment" / dataset_dir.name
+
+    def _load_segmentation_mask_for_image(
+        self,
+        image_path: Path,
+        suffix: str,
+        image_shape: tuple[int, int],
+    ) -> np.ndarray | None:
+        """讀取 Cellpose segmentation label mask。
+
+        Args:
+            image_path: 原始影像路徑。
+            suffix: `cyto` 或 `nuc`。
+            image_shape: 原始影像的 `(height, width)`，用於必要時 resize。
+
+        Returns:
+            讀取成功時回傳 label mask；找不到或格式不符時回傳 `None`。
+        """
+        mask_path = (
+            self._segment_output_dir_for_image(image_path)
+            / f"{image_path.stem}_{suffix}_seg.npy"
+        )
+        if not mask_path.exists():
+            return None
+        try:
+            data = np.load(mask_path, allow_pickle=True).item()
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(data, dict) or "masks" not in data:
+            return None
+
+        mask = np.asarray(data["masks"])
+        height, width = image_shape
+        if mask.shape != (height, width):
+            mask = cv2.resize(
+                mask.astype(np.float32),
+                (width, height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        return mask.astype(np.int32, copy=False)
+
+    def _load_segmentation_masks_for_image(
+        self,
+        image_path: Path,
+        image_shape: tuple[int, int],
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """讀取目前影像的 nucleus 與 cytoplasm segmentation masks。"""
+        nuc_mask = self._load_segmentation_mask_for_image(
+            image_path, "nuc", image_shape
+        )
+        cyto_mask = self._load_segmentation_mask_for_image(
+            image_path, "cyto", image_shape
+        )
+        return nuc_mask, cyto_mask
+
+    def _blend_label_regions(
+        self,
+        overlay: np.ndarray,
+        label_mask: np.ndarray,
+        color_for_label: Callable[[int], tuple[int, int, int]],
+    ) -> None:
+        """將 label mask 的每個物件以半透明顏色填入 overlay。"""
+        labels = np.unique(label_mask)
+        labels = labels[labels != 0]
+        if labels.size == 0:
             return
 
-        polygons = load_merged_outlines(merged_path)
-        self._current_overlay_polygons[img_path] = (
-            polygons.nuc_polygons,
-            polygons.cyto_polygons,
-        )
-        # 先產生一張預設 overlay（兩者皆顯示）
-        self._current_overlay_image = self._create_overlay_pixmap(
-            img_bgr, polygons.nuc_polygons, polygons.cyto_polygons
-        )
+        color_layer = np.zeros_like(overlay)
+        paint_mask = np.zeros(overlay.shape[:2], dtype=bool)
+        for label in labels:
+            region = label_mask == label
+            color_layer[region] = color_for_label(int(label))
+            paint_mask |= region
+
+        alpha = self._overlay_alpha
+        overlay[paint_mask] = (
+            alpha * color_layer[paint_mask] + (1 - alpha) * overlay[paint_mask]
+        ).astype(np.uint8)
+
+    def _draw_label_contours(
+        self,
+        overlay: np.ndarray,
+        label_mask: np.ndarray,
+        color: tuple[int, int, int],
+    ) -> None:
+        """依 label mask 邊界繪製物件輪廓。"""
+        labels = np.unique(label_mask)
+        labels = labels[labels != 0]
+        for label in labels:
+            binary = (label_mask == label).astype(np.uint8)
+            contours, _ = cv2.findContours(
+                binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            cv2.drawContours(overlay, contours, -1, color, 1)
+
+    def _apply_segmentation_mask_overlay(
+        self,
+        base_bgr: np.ndarray,
+        nuc_mask: np.ndarray | None,
+        cyto_mask: np.ndarray | None,
+    ) -> np.ndarray | None:
+        """依 SegmentationUI 風格產生彩色 segmentation mask 疊圖。
+
+        Args:
+            base_bgr: OpenCV BGR 原圖。
+            nuc_mask: nucleus label mask。
+            cyto_mask: cytoplasm label mask。
+
+        Returns:
+            若至少套用一種 mask，回傳疊圖；否則回傳 `None`。
+        """
+        if nuc_mask is None and cyto_mask is None:
+            return None
+
+        overlay = base_bgr.copy()
+        applied = False
+        if cyto_mask is not None and self._show_cyto:
+            palette_bgr = [_rgb_to_bgr(color) for color in _SEGMENTATION_PALETTE_RGB]
+            self._blend_label_regions(
+                overlay,
+                cyto_mask,
+                lambda label: palette_bgr[(label - 1) % len(palette_bgr)],
+            )
+            self._draw_label_contours(overlay, cyto_mask, _rgb_to_bgr((0, 190, 255)))
+            applied = True
+
+        if nuc_mask is not None and self._show_nuc:
+            self._blend_label_regions(
+                overlay,
+                nuc_mask,
+                lambda _label: _rgb_to_bgr((0, 0, 240)),
+            )
+            self._draw_label_contours(overlay, nuc_mask, _rgb_to_bgr((255, 0, 0)))
+            applied = True
+
+        return overlay if applied else None
 
     def _pixmap_from_bgr(self, bgr: np.ndarray) -> QPixmap:
         """將 OpenCV BGR 影像轉為 Qt QPixmap。"""
@@ -782,8 +1098,42 @@ class MainWindow(QMainWindow):
         base_bgr: np.ndarray,
         nuc_polys: list[np.ndarray] | None,
         cyto_polys: list[np.ndarray] | None,
+        nuc_mask: np.ndarray | None = None,
+        cyto_mask: np.ndarray | None = None,
     ) -> np.ndarray:
-        """根據目前設定，在 base 影像上畫出輪廓，回傳 BGR 影像。"""
+        """根據目前設定，在 base 影像上畫出 mask 或輪廓，回傳 BGR 影像。"""
+        mask_overlay = self._apply_segmentation_mask_overlay(
+            base_bgr, nuc_mask=nuc_mask, cyto_mask=cyto_mask
+        )
+        if mask_overlay is not None:
+            blended = mask_overlay
+        else:
+            blended = self._create_outline_overlay_bgr(
+                base_bgr, nuc_polys=nuc_polys, cyto_polys=cyto_polys
+            )
+
+        if self._show_ki67:
+            ki67_color = (203, 0, 255)  # 粉色
+            for idx in self._ki67_positive_indices_for_current_image():
+                if cyto_polys and 0 <= idx < len(cyto_polys):
+                    pts = cyto_polys[idx].reshape(-1, 1, 2)
+                elif nuc_polys and 0 <= idx < len(nuc_polys):
+                    pts = nuc_polys[idx].reshape(-1, 1, 2)
+                else:
+                    continue
+                cv2.polylines(
+                    blended, [pts], isClosed=True, color=ki67_color, thickness=3
+                )
+
+        return blended
+
+    def _create_outline_overlay_bgr(
+        self,
+        base_bgr: np.ndarray,
+        nuc_polys: list[np.ndarray] | None,
+        cyto_polys: list[np.ndarray] | None,
+    ) -> np.ndarray:
+        """使用原本 outline polygon 方式產生 fallback 疊圖。"""
         overlay = base_bgr.copy()
 
         # 顏色：BGR
@@ -806,32 +1156,25 @@ class MainWindow(QMainWindow):
                 )
 
         alpha = self._overlay_alpha
-        blended = cv2.addWeighted(overlay, alpha, base_bgr, 1 - alpha, 0)
-
-        if self._show_ki67:
-            ki67_color = (203, 0, 255)  # 粉色
-            for idx in self._ki67_positive_indices_for_current_image():
-                if cyto_polys and 0 <= idx < len(cyto_polys):
-                    pts = cyto_polys[idx].reshape(-1, 1, 2)
-                elif nuc_polys and 0 <= idx < len(nuc_polys):
-                    pts = nuc_polys[idx].reshape(-1, 1, 2)
-                else:
-                    continue
-                cv2.polylines(
-                    blended, [pts], isClosed=True, color=ki67_color, thickness=3
-                )
-
-        return blended
+        return cv2.addWeighted(overlay, alpha, base_bgr, 1 - alpha, 0)
 
     def _create_overlay_pixmap(
         self,
         base_bgr: np.ndarray,
         nuc_polys: list[np.ndarray] | None,
         cyto_polys: list[np.ndarray] | None,
+        nuc_mask: np.ndarray | None = None,
+        cyto_mask: np.ndarray | None = None,
     ) -> QPixmap:
-        """根據目前設定，在 base 影像上畫出輪廓，回傳 QPixmap。"""
+        """根據目前設定，在 base 影像上畫出疊圖，回傳 QPixmap。"""
         return self._pixmap_from_bgr(
-            self._create_overlay_bgr(base_bgr, nuc_polys, cyto_polys)
+            self._create_overlay_bgr(
+                base_bgr,
+                nuc_polys,
+                cyto_polys,
+                nuc_mask=nuc_mask,
+                cyto_mask=cyto_mask,
+            )
         )
 
     def _update_display_pixmap(self) -> None:
@@ -845,13 +1188,19 @@ class MainWindow(QMainWindow):
             return
 
         polys = self._current_overlay_polygons.get(img_path)
-        if polys is None:
+        masks = self._current_overlay_masks.get(img_path)
+        if polys is None and masks is None:
             self._set_pixmap_in_view(self._pixmap_from_bgr(self._current_image_array))
             return
 
-        nuc_polys, cyto_polys = polys
+        nuc_polys, cyto_polys = polys if polys is not None else ([], [])
+        nuc_mask, cyto_mask = masks if masks is not None else (None, None)
         display_bgr = self._create_overlay_bgr(
-            self._current_image_array, nuc_polys, cyto_polys
+            self._current_image_array,
+            nuc_polys,
+            cyto_polys,
+            nuc_mask=nuc_mask,
+            cyto_mask=cyto_mask,
         )
 
         if self._highlight_enabled and self._selected_cell_id is not None:
@@ -876,6 +1225,7 @@ class MainWindow(QMainWindow):
                         thickness=3,
                     )
 
+        self._current_overlay_image_array = display_bgr
         self._set_pixmap_in_view(self._pixmap_from_bgr(display_bgr))
 
     def _set_pixmap_in_view(self, pixmap: QPixmap) -> None:
@@ -897,69 +1247,110 @@ class MainWindow(QMainWindow):
         if self._scene.items():
             item = self._scene.items()[0]
             self.graphics_view.fitInView(item, Qt.AspectRatioMode.KeepAspectRatio)
-        if getattr(self, "_area_chart_pixmap", None) is not None:
-            self._scale_area_chart_pixmap()
+        self._scale_area_chart_pixmaps()
 
-    def _scale_area_chart_pixmap(self) -> None:
-        """依照目前圖表區塊大小縮放細胞面積分析圖。"""
-        if self._area_chart_pixmap is None or self._area_chart_pixmap.isNull():
+    def _scale_chart_pixmap(self, pixmap: QPixmap | None, label: QLabel) -> None:
+        """依照目前 label 大小縮放圖表。"""
+        if pixmap is None or pixmap.isNull():
             return
-        target_size = self.area_chart_label.size()
+        target_size = label.size()
         if target_size.width() <= 0 or target_size.height() <= 0:
             return
-        self.area_chart_label.setPixmap(
-            self._area_chart_pixmap.scaled(
+        label.setPixmap(
+            pixmap.scaled(
                 target_size,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
 
-    def _load_area_chart(self) -> None:
-        """載入細胞面積分析圖並顯示於右側圖表區塊。"""
-        candidates: list[Path] = []
-        if self._current_data_folder is not None:
-            candidates.append(
-                self._current_data_folder.parent.parent
-                / "output"
-                / "figure"
-                / "all_log_cell_area_distribution.png"
-            )
-        else:
-            candidates.extend(
-                [
-                    Path("data/output/figure/all_log_cell_area_distribution.png"),
-                    Path("data2/output/figure/all_log_cell_area_distribution.png"),
-                ]
-            )
+    def _scale_area_chart_pixmaps(self) -> None:
+        """縮放右側兩張細胞面積分析圖。"""
+        self._scale_chart_pixmap(self._area_scatter_pixmap, self.area_scatter_label)
+        self._scale_chart_pixmap(
+            self._area_histogram_pixmap,
+            self.area_histogram_label,
+        )
 
+    def _first_existing_path(self, candidates: list[Path]) -> Path | None:
+        """回傳候選路徑中第一個存在的檔案。"""
         seen: set[Path] = set()
-        chart_path: Path | None = None
         for candidate in candidates:
             resolved = candidate.resolve()
             if resolved in seen:
                 continue
             seen.add(resolved)
             if candidate.exists():
-                chart_path = candidate
-                break
+                return candidate
+        return None
 
+    def _load_one_area_chart(
+        self,
+        chart_path: Path | None,
+        label: QLabel,
+        empty_text: str,
+    ) -> QPixmap | None:
+        """載入單張圖表並更新對應 QLabel。"""
         if chart_path is None:
-            self._area_chart_pixmap = None
-            self.area_chart_label.clear()
-            self.area_chart_label.setText("尚無細胞面積分析圖")
+            label.clear()
+            label.setText(empty_text)
             return
-
         pixmap = QPixmap(str(chart_path))
         if pixmap.isNull():
-            self._area_chart_pixmap = None
-            self.area_chart_label.clear()
-            self.area_chart_label.setText("尚無細胞面積分析圖")
-            return
+            label.clear()
+            label.setText(empty_text)
+            return None
+        label.setText("")
+        self._scale_chart_pixmap(pixmap, label)
+        return pixmap
 
-        self.area_chart_label.setText("")
-        self._area_chart_pixmap = pixmap
-        self._scale_area_chart_pixmap()
+    def _area_chart_candidates(self, filename: str) -> list[Path]:
+        """建立指定圖檔名稱的候選路徑。"""
+        candidates: list[Path] = []
+        if self._pipeline_result is not None:
+            result_path = getattr(
+                self._pipeline_result,
+                "area_scatter_plot"
+                if filename == "all_cell_nucleus_area.png"
+                else "area_histogram_plot",
+                None,
+            )
+            if result_path is not None:
+                candidates.append(Path(result_path))
+        if self._current_data_folder is not None:
+            dataset_name = self._current_data_folder.name
+            candidates.append(
+                self._current_data_folder.parent.parent
+                / "output"
+                / "results"
+                / dataset_name
+                / filename
+            )
+        return candidates
+
+    def _load_area_charts(self) -> None:
+        """載入細胞面積散點圖與長條圖。"""
+        scatter_path = self._first_existing_path(
+            self._area_chart_candidates("all_cell_nucleus_area.png")
+        )
+        histogram_path = self._first_existing_path(
+            self._area_chart_candidates("all_log_cell_area_distribution.png")
+        )
+
+        self._area_scatter_pixmap = self._load_one_area_chart(
+            scatter_path,
+            self.area_scatter_label,
+            "尚無細胞面積點狀分布圖",
+        )
+        self._area_histogram_pixmap = self._load_one_area_chart(
+            histogram_path,
+            self.area_histogram_label,
+            "尚無細胞面積長條圖",
+        )
+
+    def _load_area_chart(self) -> None:
+        """相容舊呼叫；改為載入兩張細胞面積圖。"""
+        self._load_area_charts()
 
     def _on_overlay_controls_changed(self) -> None:
         """當 overlay checkbox / alpha / view mode 改變時刷新顯示。
@@ -992,12 +1383,19 @@ class MainWindow(QMainWindow):
             if p.is_file() and p.suffix.lower() in exts:
                 image_files.append(p)
 
+        result_dir = data_folder.parent.parent / "output" / "results" / data_folder.name
+        scatter_path = result_dir / "all_cell_nucleus_area.png"
+        histogram_path = result_dir / "all_log_cell_area_distribution.png"
         self._pipeline_result = PipelineResult(
-            data_folder=data_folder, image_files=image_files
+            data_folder=data_folder,
+            image_files=image_files,
+            results_dir=result_dir,
+            area_scatter_plot=scatter_path if scatter_path.exists() else None,
+            area_histogram_plot=histogram_path if histogram_path.exists() else None,
         )
 
         self._populate_image_list(image_files)
-        self._load_area_chart()
+        self._load_area_charts()
 
         if image_files:
             self.image_list.setCurrentRow(0)
@@ -1018,7 +1416,10 @@ class MainWindow(QMainWindow):
         else:
             self._current_image_index = None
             self._current_image_array = None
+            self._current_overlay_polygons.clear()
+            self._current_overlay_masks.clear()
             self._current_overlay_image = None
+            self._current_overlay_image_array = None
             self.image_file_label.setText("Image File Name")
             self._scene.clear()
 

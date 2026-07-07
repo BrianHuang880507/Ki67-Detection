@@ -39,7 +39,9 @@ QMenu::item {
 QFrame#terminalPanel,
 QFrame#imageListPanel,
 QFrame#featureTablePanel,
-QFrame#areaChartPanel {
+QFrame#areaChartPanel,
+QFrame#areaScatterPanel,
+QFrame#areaHistogramPanel {
     background-color: #242B3D;
     border: 1px solid #344057;
     border-radius: 6px;
@@ -90,8 +92,13 @@ QToolButton:disabled {
     border-color: #344057;
 }
 
-QLabel#areaChartLabel {
-    color: #E8EDF5;
+QLabel#areaChartLabel,
+QLabel#areaScatterLabel,
+QLabel#areaHistogramLabel {
+    background-color: #FFFFFF;
+    color: #1A2030;
+    border: 1px solid #2E3548;
+    border-radius: 3px;
     font-size: 12pt;
     font-weight: 600;
 }

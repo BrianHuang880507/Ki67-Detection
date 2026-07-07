@@ -11,6 +11,7 @@ __pycache__/
 *.csv
 *.xlsx
 *.png
+!ki67dtc/gui/assets/itri_EL_C.png
 *.joblib
 
 # OS junk

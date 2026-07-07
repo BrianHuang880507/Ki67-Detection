@@ -6,6 +6,8 @@ import numpy as np
 
 from .img_prep import segment_all, mask2txt_all, combined
 from .cell_anal import run_all
+from .cell_anal_plot import plot_global_area_analysis
+from .utils.io import output_dir
 
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -17,6 +19,9 @@ class PipelineResult:
 
     data_folder: Path
     image_files: Sequence[Path]
+    results_dir: Path | None = None
+    area_scatter_plot: Path | None = None
+    area_histogram_plot: Path | None = None
 
 
 @dataclass
@@ -73,6 +78,8 @@ def run_pipeline(
     ki67_backend: str = "pyimagej",
     feature_backend: str = "pyimagej",
     clean_temp: bool = True,
+    width_um_per_px: float = 1.5896,
+    height_um_per_px: float = 1.5876,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> PipelineResult:
     """高階 pipeline 入口，給 GUI 或其他程式呼叫使用。
@@ -124,6 +131,19 @@ def run_pipeline(
     )
     current_step += 1
 
+    results_dir = output_dir(data_folder, "results")
+    cleaned_csv = results_dir / f"{data_folder.name}_cleaned.csv"
+    area_scatter_plot: Path | None = None
+    area_histogram_plot: Path | None = None
+    if cleaned_csv.exists():
+        area_scatter_plot, area_histogram_plot = plot_global_area_analysis(
+            cleaned_csv,
+            results_dir,
+            thres=6.0,
+            width_um_per_px=width_um_per_px,
+            height_um_per_px=height_um_per_px,
+        )
+
     if progress_callback:
         progress_callback(current_step, total_steps, "Pipeline 完成")
 
@@ -139,7 +159,13 @@ def run_pipeline(
         if p.is_file() and p.suffix.lower() in exts:
             image_files.append(p)
 
-    return PipelineResult(data_folder=data_folder, image_files=image_files)
+    return PipelineResult(
+        data_folder=data_folder,
+        image_files=image_files,
+        results_dir=results_dir,
+        area_scatter_plot=area_scatter_plot,
+        area_histogram_plot=area_histogram_plot,
+    )
 
 
 def find_merged_outline_for_image(image_path: Path) -> Path | None:

@@ -5,6 +5,9 @@ import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import cv2
+import numpy as np
+from PyQt6 import QtCore, QtWidgets
 from PyQt6.QtGui import QImage
 from PyQt6.QtWidgets import QApplication, QStatusBar, QToolButton
 
@@ -33,80 +36,91 @@ class MainWindowLayoutContractTest(unittest.TestCase):
     def test_file_menu_exposes_open_action(self) -> None:
         self.assertEqual(self.window.action_open_input.text(), "開啟")
 
-    def test_analysis_menu_exposes_expected_options(self) -> None:
-        expected = [
-            "核來源",
-            "Ki67 Backend",
-            "分析方法",
-            "螢光分析",
-            "Ki67 分析",
-            "清理暫存檔案",
-        ]
-        actual = [action.text() for action in self.window.analysis_option_actions]
+    def test_window_title_and_icon_match_segmentation_ui_branding(self) -> None:
+        self.assertEqual(self.window.windowTitle(), "ITRI CytoScope")
+        self.assertFalse(self.window.windowIcon().isNull())
 
-        self.assertEqual(actual, expected)
+    def test_analysis_options_dialog_exposes_expected_controls(self) -> None:
+        dialog = self.window._build_analysis_options_dialog()
 
-    def test_analysis_option_submenus_expose_backend_values(self) -> None:
-        option_groups = [
-            (
-                self.window.nuc_source_actions,
-                [("DAPI", "dapi", True), ("PC", "pc", False)],
-            ),
-            (
-                self.window.ki67_backend_actions,
-                [("PyImageJ", "pyimagej", True), ("OpenCV", "opencv", False)],
-            ),
-            (
-                self.window.feature_backend_actions,
-                [("PyImageJ", "pyimagej", True), ("Python", "python", False)],
-            ),
-        ]
+        self.assertEqual(dialog.windowTitle(), "分析選項")
+        for widget_type, object_name in [
+            (QtWidgets.QComboBox, "nucSourceCombo"),
+            (QtWidgets.QComboBox, "ki67BackendCombo"),
+            (QtWidgets.QComboBox, "featureBackendCombo"),
+            (QtWidgets.QCheckBox, "fluorAnalysisCheck"),
+            (QtWidgets.QCheckBox, "ki67AnalysisCheck"),
+            (QtWidgets.QCheckBox, "cleanTempCheck"),
+            (QtWidgets.QDoubleSpinBox, "widthPixelScaleSpin"),
+            (QtWidgets.QDoubleSpinBox, "heightPixelScaleSpin"),
+        ]:
+            with self.subTest(object_name=object_name):
+                self.assertIsNotNone(dialog.findChild(widget_type, object_name))
 
-        for actions, expected in option_groups:
-            with self.subTest(actions=[action.text() for action in actions]):
-                actual = [
-                    (action.text(), action.data(), action.isChecked())
-                    for action in actions
-                ]
+    def test_analysis_options_dialog_exposes_backend_values(self) -> None:
+        dialog = self.window._build_analysis_options_dialog()
+        option_groups = {
+            "nucSourceCombo": [("DAPI", "dapi"), ("PC", "pc")],
+            "ki67BackendCombo": [("PyImageJ", "pyimagej"), ("OpenCV", "opencv")],
+            "featureBackendCombo": [("PyImageJ", "pyimagej"), ("Python", "python")],
+        }
 
-                self.assertEqual(actual, expected)
+        for object_name, expected in option_groups.items():
+            combo = dialog.findChild(QtWidgets.QComboBox, object_name)
+            self.assertIsNotNone(combo)
+            assert combo is not None
+            actual = [
+                (combo.itemText(index), combo.itemData(index))
+                for index in range(combo.count())
+            ]
 
-    def test_analysis_option_submenus_are_exclusive(self) -> None:
-        self.window.nuc_source_actions[1].setChecked(True)
-        self.window.ki67_backend_actions[1].setChecked(True)
-        self.window.feature_backend_actions[1].setChecked(True)
+            self.assertEqual(actual, expected)
 
-        self.assertEqual(
-            self.window._selected_action_value(
-                self.window.nuc_source_actions,
-                "dapi",
-            ),
-            "pc",
-        )
-        self.assertEqual(
-            self.window._selected_action_value(
-                self.window.ki67_backend_actions,
-                "pyimagej",
-            ),
-            "opencv",
-        )
-        self.assertEqual(
-            self.window._selected_action_value(
-                self.window.feature_backend_actions,
-                "pyimagej",
-            ),
-            "python",
-        )
-        self.assertFalse(self.window.nuc_source_actions[0].isChecked())
-        self.assertFalse(self.window.ki67_backend_actions[0].isChecked())
-        self.assertFalse(self.window.feature_backend_actions[0].isChecked())
+    def test_analysis_options_dialog_applies_pipeline_values(self) -> None:
+        dialog = self.window._build_analysis_options_dialog()
+        for object_name, value in [
+            ("nucSourceCombo", "pc"),
+            ("ki67BackendCombo", "opencv"),
+            ("featureBackendCombo", "python"),
+        ]:
+            combo = dialog.findChild(QtWidgets.QComboBox, object_name)
+            self.assertIsNotNone(combo)
+            assert combo is not None
+            combo.setCurrentIndex(combo.findData(value))
+
+        fluor_check = dialog.findChild(QtWidgets.QCheckBox, "fluorAnalysisCheck")
+        ki67_check = dialog.findChild(QtWidgets.QCheckBox, "ki67AnalysisCheck")
+        clean_check = dialog.findChild(QtWidgets.QCheckBox, "cleanTempCheck")
+        width_spin = dialog.findChild(QtWidgets.QDoubleSpinBox, "widthPixelScaleSpin")
+        height_spin = dialog.findChild(QtWidgets.QDoubleSpinBox, "heightPixelScaleSpin")
+        assert fluor_check is not None
+        assert ki67_check is not None
+        assert clean_check is not None
+        assert width_spin is not None
+        assert height_spin is not None
+        fluor_check.setChecked(False)
+        ki67_check.setChecked(False)
+        clean_check.setChecked(False)
+        width_spin.setValue(2.5)
+        height_spin.setValue(3.5)
+
+        self.window._apply_analysis_options_dialog(dialog)
+
+        self.assertEqual(self.window._nuc_source, "pc")
+        self.assertEqual(self.window._ki67_backend, "opencv")
+        self.assertEqual(self.window._feature_backend, "python")
+        self.assertFalse(self.window._fluor_analy)
+        self.assertFalse(self.window._ki67)
+        self.assertFalse(self.window._clean_temp)
+        self.assertEqual(self.window._width_um_per_px, 2.5)
+        self.assertEqual(self.window._height_um_per_px, 3.5)
 
     def test_right_side_has_four_named_panels(self) -> None:
         expected_names = [
             "terminalPanel",
             "imageListPanel",
-            "featureTablePanel",
-            "areaChartPanel",
+            "areaScatterPanel",
+            "areaHistogramPanel",
         ]
 
         for object_name in expected_names:
@@ -157,8 +171,9 @@ class MainWindowLayoutContractTest(unittest.TestCase):
         self.window._set_running_state(True)
         self.assertEqual(self.window.start_button.property("iconTone"), "white")
 
-    def test_area_chart_panel_keeps_cell_area_analysis_label(self) -> None:
-        self.assertEqual(self.window.area_chart_title.text(), "細胞面積分析")
+    def test_area_chart_panels_have_scatter_and_histogram_labels(self) -> None:
+        self.assertEqual(self.window.area_scatter_title.text(), "3. 細胞面積點狀分布圖")
+        self.assertEqual(self.window.area_histogram_title.text(), "4. 細胞面積長條圖")
 
     def test_segmentation_theme_is_applied_to_main_window(self) -> None:
         self.assertIn("#1C2030", APP_QSS)
@@ -169,6 +184,11 @@ class MainWindowLayoutContractTest(unittest.TestCase):
         self.assertIn("background-color: #00AEEF", APP_QSS)
         self.assertIn("QToolButton:disabled", APP_QSS)
         self.assertIn("background-color: #2A3142", APP_QSS)
+
+    def test_area_chart_labels_use_white_background(self) -> None:
+        self.assertIn("QLabel#areaScatterLabel", APP_QSS)
+        self.assertIn("QLabel#areaHistogramLabel", APP_QSS)
+        self.assertIn("background-color: #FFFFFF", APP_QSS)
 
     def test_progress_updates_are_appended_to_terminal_output(self) -> None:
         self.window._on_progress_changed(1, 4, "正在分析影像")
@@ -199,16 +219,18 @@ class MainWindowLayoutContractTest(unittest.TestCase):
             self.assertEqual(self.window.image_file_label.text(), image_path.name)
             self.assertGreater(len(self.window.image_scene.items()), 0)
 
-    def test_load_area_chart_without_existing_file_clears_label(self) -> None:
+    def test_load_area_charts_without_existing_files_clears_labels(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             self.window._current_data_folder = Path(tmp_dir) / "data" / "input" / "demo"
 
-            self.window._load_area_chart()
+            self.window._load_area_charts()
 
-            self.assertIsNone(getattr(self.window, "_area_chart_pixmap", None))
-            self.assertEqual(self.window.area_chart_label.text(), "尚無細胞面積分析圖")
+            self.assertIsNone(getattr(self.window, "_area_scatter_pixmap", None))
+            self.assertIsNone(getattr(self.window, "_area_histogram_pixmap", None))
+            self.assertEqual(self.window.area_scatter_label.text(), "尚無細胞面積點狀分布圖")
+            self.assertEqual(self.window.area_histogram_label.text(), "尚無細胞面積長條圖")
 
-    def test_load_area_chart_ignores_fallback_when_current_dataset_is_set(self) -> None:
+    def test_load_area_charts_ignores_fallback_when_current_dataset_is_set(self) -> None:
         original_cwd = os.getcwd()
         with TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -230,12 +252,93 @@ class MainWindowLayoutContractTest(unittest.TestCase):
                     tmp_path / "other_root" / "input" / "selected_dataset"
                 )
 
-                self.window._load_area_chart()
+                self.window._load_area_charts()
             finally:
                 os.chdir(original_cwd)
 
-            self.assertIsNone(getattr(self.window, "_area_chart_pixmap", None))
-            self.assertEqual(self.window.area_chart_label.text(), "尚無細胞面積分析圖")
+            self.assertIsNone(getattr(self.window, "_area_histogram_pixmap", None))
+            self.assertEqual(self.window.area_histogram_label.text(), "尚無細胞面積長條圖")
+
+    def test_load_area_charts_uses_pipeline_result_paths(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            scatter_path = tmp_path / "all_cell_nucleus_area.png"
+            histogram_path = tmp_path / "all_log_cell_area_distribution.png"
+            image = QImage(4, 4, QImage.Format.Format_RGB888)
+            image.fill(0x669933)
+            self.assertTrue(image.save(str(scatter_path)))
+            self.assertTrue(image.save(str(histogram_path)))
+
+            self.window._pipeline_result = PipelineResult(
+                data_folder=tmp_path,
+                image_files=[],
+                area_scatter_plot=scatter_path,
+                area_histogram_plot=histogram_path,
+            )
+
+            self.window._load_area_charts()
+
+            self.assertIsNotNone(getattr(self.window, "_area_scatter_pixmap", None))
+            self.assertIsNotNone(getattr(self.window, "_area_histogram_pixmap", None))
+            self.assertEqual(self.window.area_scatter_label.text(), "")
+            self.assertEqual(self.window.area_histogram_label.text(), "")
+
+    def test_analysis_complete_dialog_warns_and_centers_confirm_button(self) -> None:
+        dialog = self.window._build_analysis_complete_dialog()
+        button = dialog.findChild(QtWidgets.QPushButton, "analysisCompleteConfirmButton")
+        button_row = dialog.findChild(QtWidgets.QWidget, "analysisCompleteButtonRow")
+
+        self.assertEqual(dialog.windowTitle(), "警告")
+        self.assertEqual(dialog.findChild(QtWidgets.QLabel, "analysisCompleteMessage").text(), "分析完畢!!!")
+        self.assertIsNotNone(button)
+        self.assertIsNotNone(button_row)
+        assert button is not None
+        assert button_row is not None
+        self.assertEqual(button.text(), "確認")
+        self.assertEqual(
+            button_row.layout().itemAt(0).alignment(),
+            QtCore.Qt.AlignmentFlag.AlignCenter,
+        )
+
+    def test_segmentation_masks_are_loaded_and_rendered_as_colored_overlay(self) -> None:
+        original_cwd = os.getcwd()
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            image_dir = tmp_path / "data" / "input" / "demo" / "PC"
+            segment_dir = tmp_path / "data" / "output" / "segment" / "demo"
+            image_dir.mkdir(parents=True)
+            segment_dir.mkdir(parents=True)
+            image_path = image_dir / "sample.png"
+            base = np.full((8, 8, 3), 128, dtype=np.uint8)
+            self.assertTrue(cv2.imwrite(str(image_path), base))
+
+            cyto_mask = np.zeros((8, 8), dtype=np.int32)
+            cyto_mask[1:7, 1:7] = 1
+            nuc_mask = np.zeros((8, 8), dtype=np.int32)
+            nuc_mask[3:5, 3:5] = 1
+            np.save(segment_dir / "sample_cyto_seg.npy", {"masks": cyto_mask})
+            np.save(segment_dir / "sample_nuc_seg.npy", {"masks": nuc_mask})
+
+            try:
+                os.chdir(tmp_path)
+                self.window._pipeline_result = PipelineResult(
+                    data_folder=tmp_path / "data" / "input" / "demo",
+                    image_files=[image_path],
+                )
+                self.window._current_image_index = 0
+
+                self.window._load_image_and_overlays(image_path)
+                self.window._update_display_pixmap()
+            finally:
+                os.chdir(original_cwd)
+
+            masks = self.window._current_overlay_masks.get(image_path)
+            self.assertIsNotNone(masks)
+            assert masks is not None
+            nuc_loaded, cyto_loaded = masks
+            self.assertIsNotNone(nuc_loaded)
+            self.assertIsNotNone(cyto_loaded)
+            self.assertFalse(np.array_equal(self.window._current_overlay_image_array, base))
 
 
 if __name__ == "__main__":
