@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026.07.10
+
+  * 將 Python feature backend 的 ROI 幾何量測改為 OpenCV，並將 GLCM 灰階層數由 256 降為 64；同批合成 ROI 實測幾何由 10.907 降至 0.140 ms/cell（77.8×），材質由 23.641 降至 1.442 ms/cell（16.4×）。
+  * 在缺少 `*_seg.npy` 時的 outline fallback 疊圖加入核與細胞質 polygon 半透明填色，沿用既有配色、顯示切換與透明度設定。
+  * GUI pipeline 完成後會將每張影像的 fill-overlay 自動存到結果資料夾，並提供不需 Qt event loop 的 headless 批次 render/save 函式。
+  * 在 Cellpose mask 定案後加入依標籤面積中位數計算的動態小物件過濾，並由 `segment_all()` 透傳 `cellprob_threshold`、`min_area_ratio` 與 `min_area_floor`。
+
 ## 2026.06.30
 
   * 對齊 SegmentationUI 主畫面風格，加入深色主題、選單列入口與右側四區資訊面板。
