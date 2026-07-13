@@ -12,8 +12,6 @@ from tqdm import trange
 from typing import Any, Optional, Union
 from skimage.draw import polygon, polygon2mask
 from skimage.feature import graycomatrix, graycoprops
-from skimage.measure import regionprops
-from skimage.morphology import convex_hull_image
 from shapely.affinity import scale
 from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
 from shutil import copyfile
@@ -684,7 +682,7 @@ DEFAULT_DEBRIS_CONFIG: dict[str, Any] = {
 TEXTURE_GLCM_GRAY_LEVELS = 64
 TEXTURE_GLCM_DISTANCES = (1, 3, 5)
 TEXTURE_GLCM_DISTANCE = TEXTURE_GLCM_DISTANCES[0]
-SKIMAGE_GLCM_GRAY_LEVELS = 256
+SKIMAGE_GLCM_GRAY_LEVELS = 64
 SKIMAGE_GLCM_DISTANCES = (1,)
 SKIMAGE_GLCM_ANGLES = (0.0, math.pi / 4.0, math.pi / 2.0, 3.0 * math.pi / 4.0)
 TEXTURE_LBP_RADII = (1, 2, 3)
@@ -849,7 +847,15 @@ def _histogram_entropy(values: np.ndarray, bins: int = 256) -> float:
 def _measure_roi_with_python(
     signal: np.ndarray, roi_mask: np.ndarray | None
 ) -> dict[str, float]:
-    """Measure one ROI with NumPy and skimage definitions."""
+    """使用 NumPy、SciPy 與 OpenCV 量測單一 ROI。
+
+    Args:
+        signal: 二維影像強度。
+        roi_mask: ROI 布林遮罩；若為空則回傳全缺值量測。
+
+    Returns:
+        依既有 ImageJ 相容欄位輸出的量測結果。
+    """
     from scipy.stats import kurtosis, skew
 
     out = _empty_imagej_measurements()
@@ -894,8 +900,9 @@ def _measure_roi_with_python(
         out["skewness"] = float(skew(values, bias=True))
         out["kurtosis"] = float(kurtosis(values, fisher=True, bias=True))
 
-    props = regionprops(mask.astype(np.uint8), intensity_image=signal)[0]
-    y_centroid, x_centroid = props.centroid
+    y_coords, x_coords = np.nonzero(mask)
+    x_centroid = float(np.mean(x_coords))
+    y_centroid = float(np.mean(y_coords))
     perimeter = np.nan
     convex_perimeter = np.nan
     feret = np.nan
@@ -904,18 +911,34 @@ def _measure_roi_with_python(
     minor = np.nan
     eccentricity = np.nan
 
-    perimeter = float(props.perimeter)
-    feret = float(props.feret_diameter_max)
-    major = float(props.major_axis_length)
-    minor = float(props.minor_axis_length)
-    min_feret = minor
-    eccentricity = float(props.eccentricity)
+    contours, _ = cv2.findContours(
+        (mask.astype(np.uint8) * 255),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_NONE,
+    )
+    if contours:
+        contour = max(contours, key=cv2.contourArea)
+        perimeter = float(cv2.arcLength(contour, True))
+        hull = cv2.convexHull(contour)
+        convex_perimeter = float(cv2.arcLength(hull, True))
 
-    hull_mask = convex_hull_image(mask)
-    if np.any(hull_mask):
-        convex_perimeter = float(
-            regionprops(hull_mask.astype(np.uint8))[0].perimeter
-        )
+        hull_points = hull[:, 0, :].astype(np.float64)
+        if len(hull_points) >= 2:
+            differences = hull_points[:, None, :] - hull_points[None, :, :]
+            feret = float(np.sqrt(np.sum(differences**2, axis=2)).max())
+
+        rect_sides = cv2.minAreaRect(contour)[1]
+        valid_sides = [side for side in rect_sides if side > 0]
+        if len(contour) >= 5:
+            _, ellipse_axes, _ = cv2.fitEllipse(contour)
+            major = float(max(ellipse_axes))
+            minor = float(min(ellipse_axes))
+        elif valid_sides:
+            major = float(max(valid_sides))
+            minor = float(min(valid_sides))
+        min_feret = minor  # 保留既有定義（原本 = props.minor_axis_length）
+        if np.isfinite(major) and np.isfinite(minor) and major > 0:
+            eccentricity = float(np.sqrt(max(0.0, 1.0 - (minor / major) ** 2)))
 
     aspect_ratio = _safe_divide(major, minor)
     circularity = (
@@ -940,7 +963,6 @@ def _measure_roi_with_python(
         and perimeter > 0
         else np.nan
     )
-    y_coords, x_coords = np.nonzero(mask)
     compactness = (
         float(
             np.mean(

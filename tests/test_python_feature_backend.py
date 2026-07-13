@@ -6,8 +6,6 @@ import cv2
 import numpy as np
 import pandas as pd
 from skimage.feature import graycomatrix, graycoprops
-from skimage.measure import regionprops
-from skimage.morphology import convex_hull_image
 
 from ki67dtc.cell_anal import (
     _advanced_texture_feature_values_python,
@@ -23,7 +21,7 @@ from ki67dtc.cell_anal import (
 
 
 class PythonFeatureBackendTest(unittest.TestCase):
-    def test_python_measurement_uses_skimage_morphology(self) -> None:
+    def test_python_measurement_uses_opencv_geometry(self) -> None:
         signal = np.ones((80, 80), dtype=np.float32)
         mask = np.zeros((80, 80), dtype=np.uint8)
         cv2.ellipse(mask, (40, 40), (18, 8), 20, 0, 360, 1, -1)
@@ -31,38 +29,59 @@ class PythonFeatureBackendTest(unittest.TestCase):
 
         measurement = _measure_roi_with_python(signal, mask_bool)
         geometry = _geometry_from_measurements(measurement)
-        props = regionprops(mask.astype(int), intensity_image=signal)[0]
-        hull_props = regionprops(convex_hull_image(mask_bool).astype(int))[0]
         y_coords, x_coords = np.nonzero(mask_bool)
+        area = float(np.count_nonzero(mask_bool))
+        x_centroid = float(np.mean(x_coords))
+        y_centroid = float(np.mean(y_coords))
+        contours, _ = cv2.findContours(
+            mask * 255,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_NONE,
+        )
+        contour = max(contours, key=cv2.contourArea)
+        perimeter = float(cv2.arcLength(contour, True))
+        hull = cv2.convexHull(contour)
+        convex_perimeter = float(cv2.arcLength(hull, True))
+        hull_points = hull[:, 0, :].astype(np.float64)
+        differences = hull_points[:, None, :] - hull_points[None, :, :]
+        feret = float(np.sqrt(np.sum(differences**2, axis=2)).max())
+        _, ellipse_axes, _ = cv2.fitEllipse(contour)
+        major = float(max(ellipse_axes))
+        minor = float(min(ellipse_axes))
+        eccentricity = float(np.sqrt(max(0.0, 1.0 - (minor / major) ** 2)))
         expected_compactness = float(
             np.mean(
-                (y_coords.astype(float) - props.centroid[0]) ** 2
-                + (x_coords.astype(float) - props.centroid[1]) ** 2
+                (y_coords.astype(float) - y_centroid) ** 2
+                + (x_coords.astype(float) - x_centroid) ** 2
             )
-            / props.area
+            / area
         )
 
-        self.assertEqual(measurement["area"], float(props.area))
-        self.assertAlmostEqual(measurement["perimeter"], props.perimeter, places=5)
-        self.assertAlmostEqual(measurement["major"], props.major_axis_length)
-        self.assertAlmostEqual(measurement["minor"], props.minor_axis_length)
-        self.assertAlmostEqual(measurement["feret"], props.feret_diameter_max)
-        self.assertAlmostEqual(measurement["minferet"], props.minor_axis_length)
-        self.assertAlmostEqual(measurement["eccentricity"], props.eccentricity)
-        self.assertAlmostEqual(
-            measurement["convex_perimeter"], hull_props.perimeter, places=5
-        )
+        self.assertEqual(measurement["area"], area)
+        self.assertAlmostEqual(measurement["x_centroid"], x_centroid)
+        self.assertAlmostEqual(measurement["y_centroid"], y_centroid)
+        self.assertAlmostEqual(measurement["perimeter"], perimeter)
+        self.assertAlmostEqual(measurement["convex_perimeter"], convex_perimeter)
+        self.assertAlmostEqual(measurement["major"], major)
+        self.assertAlmostEqual(measurement["minor"], minor)
+        self.assertAlmostEqual(measurement["feret"], feret)
+        self.assertAlmostEqual(measurement["minferet"], minor)
+        self.assertAlmostEqual(measurement["eccentricity"], eccentricity)
         self.assertAlmostEqual(geometry["compactness"], expected_compactness)
         self.assertAlmostEqual(
             geometry["circularity"],
-            2.0 * np.sqrt(np.pi * props.area) / props.perimeter**2,
+            2.0 * np.sqrt(np.pi * area) / perimeter**2,
         )
         self.assertAlmostEqual(
             geometry["sphericity"],
-            4.0 * np.pi * props.area / props.perimeter**2,
+            4.0 * np.pi * area / perimeter**2,
+        )
+        self.assertAlmostEqual(
+            geometry["roughness"],
+            1.0 - convex_perimeter / perimeter,
         )
 
-    def test_python_glcm_uses_skimage_graycomatrix(self) -> None:
+    def test_python_glcm_quantizes_to_64_gray_levels(self) -> None:
         signal = np.array(
             [
                 [0, 24, 64, 90, 120],
@@ -83,18 +102,22 @@ class PythonFeatureBackendTest(unittest.TestCase):
             ],
             dtype=bool,
         )
+        gray_levels = 64
         roi_img = np.clip(np.rint(signal * 255.0), 0, 255).astype(np.uint8)
         roi_img[~mask] = 0
+        roi_img = np.floor(
+            roi_img.astype(np.float64) / 256.0 * gray_levels
+        ).astype(np.uint8)
         glcm = graycomatrix(
             roi_img,
             distances=[1],
             angles=[0, np.pi / 4, np.pi / 2, 3 * np.pi / 4],
-            levels=256,
+            levels=gray_levels,
             symmetric=True,
             normed=True,
         )
         diff_indices = np.abs(
-            np.arange(256)[:, None] - np.arange(256)[None, :]
+            np.arange(gray_levels)[:, None] - np.arange(gray_levels)[None, :]
         )
         diff_variances = []
         for distance_index in range(glcm.shape[2]):
@@ -103,9 +126,9 @@ class PythonFeatureBackendTest(unittest.TestCase):
                 probabilities = np.bincount(
                     diff_indices.ravel(),
                     weights=matrix.ravel(),
-                    minlength=256,
+                    minlength=gray_levels,
                 ).astype(np.float64)
-                index = np.arange(256, dtype=np.float64)
+                index = np.arange(gray_levels, dtype=np.float64)
                 mean = float(np.sum(index * probabilities))
                 diff_variances.append(
                     float(np.sum(((index - mean) ** 2) * probabilities))
