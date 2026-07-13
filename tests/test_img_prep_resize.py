@@ -66,6 +66,25 @@ class SegmentResizeTest(unittest.TestCase):
         self.assertEqual(saved_shapes["channels"], (0, 0))
         self.assertIsNone(saved_shapes["diams"])
 
+    def test_filter_small_labels_removes_fragments_and_relabels_contiguously(
+        self,
+    ) -> None:
+        masks = np.zeros((20, 30), dtype=np.int32)
+        masks[0:10, 0:10] = 5
+        masks[0:10, 12:22] = 9
+        masks[15:17, 0:5] = 42
+
+        filtered = img_prep._filter_small_labels(
+            masks,
+            min_area_ratio=0.15,
+            min_area_floor=30,
+        )
+
+        np.testing.assert_array_equal(np.unique(filtered), np.array([0, 1, 2]))
+        self.assertEqual(np.count_nonzero(filtered == 1), 100)
+        self.assertEqual(np.count_nonzero(filtered == 2), 100)
+        self.assertTrue(np.all(filtered[15:17, 0:5] == 0))
+
     def test_segment_all_passes_default_resize_sizes_to_cyto_and_pc_nuc(
         self,
     ) -> None:
@@ -99,6 +118,9 @@ class SegmentResizeTest(unittest.TestCase):
                     "cyto",
                     channels=(0, 0),
                     model_input_size=img_prep.CYTO_MODEL_INPUT_SIZE,
+                    cellprob_threshold=0.0,
+                    min_area_ratio=0.15,
+                    min_area_floor=30,
                 ),
                 call(
                     EXPECTED_PC_NUC_MODEL_PATH,
@@ -107,6 +129,9 @@ class SegmentResizeTest(unittest.TestCase):
                     "nuc",
                     channels=(0, 0),
                     model_input_size=img_prep.NUC_MODEL_INPUT_SIZE,
+                    cellprob_threshold=0.0,
+                    min_area_ratio=0.15,
+                    min_area_floor=30,
                 ),
             ],
         )
@@ -157,6 +182,9 @@ class SegmentResizeTest(unittest.TestCase):
                     "cyto",
                     channels=(0, 0),
                     model_input_size=img_prep.CYTO_MODEL_INPUT_SIZE,
+                    cellprob_threshold=0.0,
+                    min_area_ratio=0.15,
+                    min_area_floor=30,
                 ),
                 call(
                     EXPECTED_DAPI_NUC_MODEL_PATH,
@@ -166,6 +194,9 @@ class SegmentResizeTest(unittest.TestCase):
                     output_stems=[pc_image.stem],
                     channels=(3, 3),
                     model_input_size=img_prep.NUC_MODEL_INPUT_SIZE,
+                    cellprob_threshold=0.0,
+                    min_area_ratio=0.15,
+                    min_area_floor=30,
                 ),
             ],
         )
@@ -203,6 +234,9 @@ class SegmentResizeTest(unittest.TestCase):
                     "cyto",
                     channels=(0, 0),
                     model_input_size=img_prep.CYTO_MODEL_INPUT_SIZE,
+                    cellprob_threshold=0.0,
+                    min_area_ratio=0.15,
+                    min_area_floor=30,
                 ),
                 call(
                     EXPECTED_PC_NUC_MODEL_PATH,
@@ -211,6 +245,9 @@ class SegmentResizeTest(unittest.TestCase):
                     "nuc",
                     channels=(0, 0),
                     model_input_size=img_prep.NUC_MODEL_INPUT_SIZE,
+                    cellprob_threshold=0.0,
+                    min_area_ratio=0.15,
+                    min_area_floor=30,
                 ),
             ],
         )

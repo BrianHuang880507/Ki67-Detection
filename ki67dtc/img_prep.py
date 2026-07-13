@@ -25,6 +25,45 @@ NUC_MODEL_INPUT_SIZE = (1280, 1024)
 # ===============================
 # 影像分割
 # ===============================
+def _filter_small_labels(
+    masks: np.ndarray,
+    min_area_ratio: float,
+    min_area_floor: int,
+) -> np.ndarray:
+    """依標籤面積中位數移除過小物件，並重新連續編號。
+
+    Args:
+        masks: Cellpose 輸出的二維標籤 mask，背景值為 0。
+        min_area_ratio: 相對於非零標籤面積中位數的最小面積比例。
+        min_area_floor: 最小面積的絕對像素下限。
+
+    Returns:
+        過濾並重新連續編號的標籤 mask；沒有標籤或中位數無效時原樣回傳。
+    """
+    mask_array = np.asarray(masks)
+    nonzero_values = mask_array[mask_array != 0]
+    if nonzero_values.size == 0:
+        return masks
+
+    labels, areas = np.unique(nonzero_values, return_counts=True)
+    median_area = float(np.median(areas))
+    if not np.isfinite(median_area):
+        return masks
+
+    threshold = max(float(min_area_floor), float(min_area_ratio) * median_area)
+    kept_labels = labels[areas >= threshold]
+
+    unique_labels, inverse = np.unique(mask_array, return_inverse=True)
+    remapped_labels = np.zeros(unique_labels.shape, dtype=mask_array.dtype)
+    kept_positions = np.flatnonzero(np.isin(unique_labels, kept_labels))
+    remapped_labels[kept_positions] = np.arange(
+        1,
+        kept_positions.size + 1,
+        dtype=mask_array.dtype,
+    )
+    return remapped_labels[inverse].reshape(mask_array.shape)
+
+
 def segment(
     model_path: str,
     img_files: list[Path],
@@ -37,6 +76,9 @@ def segment(
     flow_threshold: float = 0.4,
     invert: bool = False,
     model_input_size: tuple[int, int] | None = None,
+    *,
+    min_area_ratio: float = 0.15,
+    min_area_floor: int = 30,
 ):
     """使用指定的 Cellpose 模型分割影像。
 
@@ -56,6 +98,8 @@ def segment(
         invert: 是否反相後推論。
         model_input_size: 若指定 `(width, height)`，先 resize 到模型訓練尺寸
             推論，再將 mask/flow 還原回原圖尺寸。
+        min_area_ratio: 相對於標籤面積中位數的最小面積比例。
+        min_area_floor: 最小標籤面積的絕對像素下限。
 
     Raises:
         ValueError: 當 `output_stems` 長度不符，或 resize 尺寸不合法時拋出。
@@ -103,6 +147,7 @@ def segment(
                     flows[0], original_size, interpolation=cv2.INTER_LINEAR
                 )
 
+        masks = _filter_small_labels(masks, min_area_ratio, min_area_floor)
         io.masks_flows_to_seg(
             img, masks, flows, f, channels=list(channels), diams=eval_diameter
         )
@@ -316,6 +361,10 @@ def segment_all(
     dapi_dir_name: str = "DAPI",
     cyto_model_input_size: tuple[int, int] | None = CYTO_MODEL_INPUT_SIZE,
     nuc_model_input_size: tuple[int, int] | None = NUC_MODEL_INPUT_SIZE,
+    *,
+    cellprob_threshold: float = 0.0,
+    min_area_ratio: float = 0.15,
+    min_area_floor: int = 30,
 ):
     """執行細胞質與細胞核分割。
 
@@ -329,6 +378,9 @@ def segment_all(
         dapi_dir_name: DAPI 資料夾名稱。
         cyto_model_input_size: 細胞質模型推論前的 resize 尺寸；`None` 表示不 resize。
         nuc_model_input_size: 細胞核模型推論前的 resize 尺寸；`None` 表示不 resize。
+        cellprob_threshold: Cellpose cellprob threshold。
+        min_area_ratio: 相對於標籤面積中位數的最小面積比例。
+        min_area_floor: 最小標籤面積的絕對像素下限。
     """
     root_dir = Path(input_dir)
     pc_dir = root_dir / "PC"
@@ -355,6 +407,9 @@ def segment_all(
         "cyto",
         channels=(0, 0),
         model_input_size=cyto_model_input_size,
+        cellprob_threshold=cellprob_threshold,
+        min_area_ratio=min_area_ratio,
+        min_area_floor=min_area_floor,
     )
 
     if nuc_source == "pc":
@@ -365,6 +420,9 @@ def segment_all(
             "nuc",
             channels=(0, 0),
             model_input_size=nuc_model_input_size,
+            cellprob_threshold=cellprob_threshold,
+            min_area_ratio=min_area_ratio,
+            min_area_floor=min_area_floor,
         )
         return
 
@@ -378,6 +436,9 @@ def segment_all(
             "nuc",
             channels=(0, 0),
             model_input_size=nuc_model_input_size,
+            cellprob_threshold=cellprob_threshold,
+            min_area_ratio=min_area_ratio,
+            min_area_floor=min_area_floor,
         )
         return
 
@@ -391,6 +452,9 @@ def segment_all(
             "nuc",
             channels=(0, 0),
             model_input_size=nuc_model_input_size,
+            cellprob_threshold=cellprob_threshold,
+            min_area_ratio=min_area_ratio,
+            min_area_floor=min_area_floor,
         )
         return
 
@@ -445,6 +509,9 @@ def segment_all(
             output_stems=dapi_output_stems,
             channels=(3, 3),
             model_input_size=nuc_model_input_size,
+            cellprob_threshold=cellprob_threshold,
+            min_area_ratio=min_area_ratio,
+            min_area_floor=min_area_floor,
         )
         remap_nuc_segments_to_cyto(seg_dir, dapi_output_stems, dapi_output_stems)
 
@@ -457,6 +524,9 @@ def segment_all(
             output_stems=fallback_pc_output_stems,
             channels=(0, 0),
             model_input_size=nuc_model_input_size,
+            cellprob_threshold=cellprob_threshold,
+            min_area_ratio=min_area_ratio,
+            min_area_floor=min_area_floor,
         )
 
 
