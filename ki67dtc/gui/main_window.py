@@ -57,6 +57,130 @@ def _rgb_to_bgr(color: tuple[int, int, int]) -> tuple[int, int, int]:
     return blue, green, red
 
 
+def render_fill_overlay_bgr(
+    base_bgr: np.ndarray,
+    nuc_polys: list[np.ndarray] | None,
+    cyto_polys: list[np.ndarray] | None,
+    *,
+    show_nuc: bool = True,
+    show_cyto: bool = True,
+    alpha: float = 0.5,
+) -> np.ndarray:
+    """以 OpenCV 在原圖上產生 nucleus 與 cytoplasm 半透明填色疊圖。
+
+    Args:
+        base_bgr: OpenCV BGR 原圖。
+        nuc_polys: nucleus polygon 清單。
+        cyto_polys: cytoplasm polygon 清單。
+        show_nuc: 是否繪製 nucleus。
+        show_cyto: 是否繪製 cytoplasm。
+        alpha: 填色疊圖透明度，範圍為 0 到 1。
+
+    Returns:
+        完成半透明填色與邊界繪製的 BGR 影像。
+
+    Raises:
+        ValueError: 當 alpha 不在 0 到 1 範圍時拋出。
+    """
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError("alpha 必須介於 0 與 1 之間")
+
+    overlay = base_bgr.copy()
+    nuc_color = (255, 0, 0)
+    cyto_color = (0, 0, 255)
+    thickness = 1
+
+    if cyto_polys and show_cyto:
+        palette_bgr = [_rgb_to_bgr(color) for color in _SEGMENTATION_PALETTE_RGB]
+        for index, poly in enumerate(cyto_polys):
+            pts = poly.reshape(-1, 1, 2)
+            cv2.fillPoly(
+                overlay,
+                [pts],
+                palette_bgr[index % len(palette_bgr)],
+            )
+
+    if nuc_polys and show_nuc:
+        nuc_fill_color = _rgb_to_bgr((0, 0, 240))
+        for poly in nuc_polys:
+            pts = poly.reshape(-1, 1, 2)
+            cv2.fillPoly(overlay, [pts], nuc_fill_color)
+
+    blended = cv2.addWeighted(overlay, alpha, base_bgr, 1 - alpha, 0)
+
+    if nuc_polys and show_nuc:
+        for poly in nuc_polys:
+            pts = poly.reshape(-1, 1, 2)
+            cv2.polylines(
+                blended, [pts], isClosed=True, color=nuc_color, thickness=thickness
+            )
+
+    if cyto_polys and show_cyto:
+        for poly in cyto_polys:
+            pts = poly.reshape(-1, 1, 2)
+            cv2.polylines(
+                blended, [pts], isClosed=True, color=cyto_color, thickness=thickness
+            )
+
+    return blended
+
+
+def save_pipeline_fill_overlays(
+    result: PipelineResult,
+    *,
+    alpha: float = 0.5,
+) -> list[Path]:
+    """批次產生並儲存 pipeline 影像的 fill-overlay，不需啟動 Qt event loop。
+
+    Args:
+        result: Pipeline 完成後的資料集、影像與結果路徑。
+        alpha: 填色疊圖透明度，範圍為 0 到 1。
+
+    Returns:
+        成功寫入的 overlay PNG 路徑清單。
+
+    Raises:
+        FileNotFoundError: 找不到原圖或 merged outline 時拋出。
+        OSError: OpenCV 無法寫入 overlay PNG 時拋出。
+        ValueError: 當 alpha 不在 0 到 1 範圍時拋出。
+    """
+    data_folder = Path(result.data_folder).resolve()
+    results_dir = (
+        Path(result.results_dir)
+        if result.results_dir is not None
+        else data_folder.parent.parent / "output" / "results" / data_folder.name
+    )
+    outline_dir = data_folder.parent.parent / "output" / "outline" / data_folder.name
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_paths: list[Path] = []
+    for image_file in result.image_files:
+        image_path = Path(image_file)
+        base_bgr = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+        if base_bgr is None:
+            raise FileNotFoundError(f"無法載入原始影像：{image_path}")
+        if base_bgr.ndim == 2:
+            base_bgr = cv2.cvtColor(base_bgr, cv2.COLOR_GRAY2BGR)
+
+        merged_path = outline_dir / f"{image_path.stem}_merged_cp_outlines.txt"
+        if not merged_path.exists():
+            raise FileNotFoundError(f"找不到 merged outline：{merged_path}")
+
+        polygons = load_merged_outlines(merged_path)
+        overlay_bgr = render_fill_overlay_bgr(
+            base_bgr,
+            polygons.nuc_polygons,
+            polygons.cyto_polygons,
+            alpha=alpha,
+        )
+        output_path = results_dir / f"{image_path.stem}_overlay.png"
+        if not cv2.imwrite(str(output_path), overlay_bgr):
+            raise OSError(f"無法寫入 fill-overlay：{output_path}")
+        saved_paths.append(output_path)
+
+    return saved_paths
+
+
 class PipelineThread(QThread):
     """背景執行 pipeline 的 QThread。
 
@@ -836,6 +960,18 @@ class MainWindow(QMainWindow):
         # 記錄目前資料夾
         self._current_data_folder = result.data_folder
 
+        try:
+            saved_overlays = save_pipeline_fill_overlays(
+                result, alpha=self._overlay_alpha
+            )
+            self._append_terminal_line(
+                "INFO", f"已自動儲存 {len(saved_overlays)} 張 fill-overlay PNG"
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._append_terminal_line(
+                "ERROR", f"自動儲存 fill-overlay 失敗：{exc}"
+            )
+
         self._populate_image_list(result.image_files)
 
         # pipeline 結束後載入 cleaned CSV
@@ -1133,30 +1269,15 @@ class MainWindow(QMainWindow):
         nuc_polys: list[np.ndarray] | None,
         cyto_polys: list[np.ndarray] | None,
     ) -> np.ndarray:
-        """使用原本 outline polygon 方式產生 fallback 疊圖。"""
-        overlay = base_bgr.copy()
-
-        # 顏色：BGR
-        nuc_color = (255, 0, 0)  # 藍色
-        cyto_color = (0, 0, 255)  # 紅色
-        thickness = 1
-
-        if nuc_polys and self._show_nuc:
-            for poly in nuc_polys:
-                pts = poly.reshape(-1, 1, 2)
-                cv2.polylines(
-                    overlay, [pts], isClosed=True, color=nuc_color, thickness=thickness
-                )
-
-        if cyto_polys and self._show_cyto:
-            for poly in cyto_polys:
-                pts = poly.reshape(-1, 1, 2)
-                cv2.polylines(
-                    overlay, [pts], isClosed=True, color=cyto_color, thickness=thickness
-                )
-
-        alpha = self._overlay_alpha
-        return cv2.addWeighted(overlay, alpha, base_bgr, 1 - alpha, 0)
+        """使用 outline polygon 產生半透明填色的 fallback 疊圖。"""
+        return render_fill_overlay_bgr(
+            base_bgr,
+            nuc_polys,
+            cyto_polys,
+            show_nuc=self._show_nuc,
+            show_cyto=self._show_cyto,
+            alpha=self._overlay_alpha,
+        )
 
     def _create_overlay_pixmap(
         self,

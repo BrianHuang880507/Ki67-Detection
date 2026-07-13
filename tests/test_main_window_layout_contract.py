@@ -300,6 +300,44 @@ class MainWindowLayoutContractTest(unittest.TestCase):
             QtCore.Qt.AlignmentFlag.AlignCenter,
         )
 
+    def test_outline_fallback_fills_polygons_and_honors_alpha(self) -> None:
+        base = np.full((16, 16, 3), 100, dtype=np.uint8)
+        cyto_polys = [
+            np.array([[1, 1], [14, 1], [14, 14], [1, 14]], dtype=np.int32)
+        ]
+        nuc_polys = [
+            np.array([[5, 5], [10, 5], [10, 10], [5, 10]], dtype=np.int32)
+        ]
+        self.window._show_nuc = True
+        self.window._show_cyto = True
+        self.window._overlay_alpha = 0.5
+
+        overlay = self.window._create_outline_overlay_bgr(
+            base,
+            nuc_polys=nuc_polys,
+            cyto_polys=cyto_polys,
+        )
+
+        np.testing.assert_array_equal(overlay[2, 2], np.array([50, 50, 178]))
+        np.testing.assert_array_equal(overlay[7, 7], np.array([170, 50, 50]))
+
+        self.window._overlay_alpha = 0.25
+        lower_alpha = self.window._create_outline_overlay_bgr(
+            base,
+            nuc_polys=nuc_polys,
+            cyto_polys=cyto_polys,
+        )
+        np.testing.assert_array_equal(lower_alpha[2, 2], np.array([75, 75, 139]))
+
+        self.window._show_nuc = False
+        self.window._show_cyto = False
+        hidden = self.window._create_outline_overlay_bgr(
+            base,
+            nuc_polys=nuc_polys,
+            cyto_polys=cyto_polys,
+        )
+        np.testing.assert_array_equal(hidden, base)
+
     def test_segmentation_masks_are_loaded_and_rendered_as_colored_overlay(self) -> None:
         original_cwd = os.getcwd()
         with TemporaryDirectory() as tmp_dir:
