@@ -32,7 +32,12 @@ from ..app_pipeline import (
     PipelineResult,
     _resolve_data_folder,
     find_merged_outline_for_image,
-    load_merged_outlines,
+    load_paired_merged_outlines,
+)
+from ..paired_overlay import (
+    PairedOverlayData,
+    build_paired_overlay_data,
+    render_paired_overlay_bgr,
 )
 from .icons import standard_icon
 from .theme import APP_QSS
@@ -130,7 +135,7 @@ def save_pipeline_fill_overlays(
     *,
     alpha: float = 0.5,
 ) -> list[Path]:
-    """批次產生並儲存 pipeline 影像的 fill-overlay，不需啟動 Qt event loop。
+    """批次產生並儲存 pipeline 影像的 Paired Only fill-overlay。
 
     Args:
         result: Pipeline 完成後的資料集、影像與結果路徑。
@@ -162,17 +167,24 @@ def save_pipeline_fill_overlays(
         if base_bgr.ndim == 2:
             base_bgr = cv2.cvtColor(base_bgr, cv2.COLOR_GRAY2BGR)
 
-        merged_path = outline_dir / f"{image_path.stem}_merged_cp_outlines.txt"
-        if not merged_path.exists():
-            raise FileNotFoundError(f"找不到 merged outline：{merged_path}")
-
-        polygons = load_merged_outlines(merged_path)
-        overlay_bgr = render_fill_overlay_bgr(
-            base_bgr,
-            polygons.nuc_polygons,
-            polygons.cyto_polygons,
-            alpha=alpha,
-        )
+        paired_data = result.paired_overlays.get(image_path.stem)
+        if paired_data is not None:
+            overlay_bgr = render_paired_overlay_bgr(
+                base_bgr,
+                paired_data,
+                alpha=alpha,
+            )
+        else:
+            merged_path = outline_dir / f"{image_path.stem}_merged_cp_outlines.txt"
+            if not merged_path.exists():
+                raise FileNotFoundError(f"找不到 merged outline：{merged_path}")
+            polygons = load_paired_merged_outlines(merged_path)
+            overlay_bgr = render_fill_overlay_bgr(
+                base_bgr,
+                polygons.nuc_polygons,
+                polygons.cyto_polygons,
+                alpha=alpha,
+            )
         output_path = results_dir / f"{image_path.stem}_overlay.png"
         if not cv2.imwrite(str(output_path), overlay_bgr):
             raise OSError(f"無法寫入 fill-overlay：{output_path}")
@@ -960,6 +972,26 @@ class MainWindow(QMainWindow):
         # 記錄目前資料夾
         self._current_data_folder = result.data_folder
 
+        if result.paired_overlays:
+            raw_cytoplasm_count = sum(
+                data.raw_cytoplasm_count for data in result.paired_overlays.values()
+            )
+            paired_cytoplasm_count = sum(
+                data.paired_cytoplasm_count for data in result.paired_overlays.values()
+            )
+            paired_nucleus_count = sum(
+                data.paired_nucleus_count for data in result.paired_overlays.values()
+            )
+            raw_nucleus_count = sum(
+                data.raw_nucleus_count for data in result.paired_overlays.values()
+            )
+            self._append_terminal_line(
+                "INFO",
+                "GUI 強制使用 Paired Only："
+                f"cytoplasm {paired_cytoplasm_count}/{raw_cytoplasm_count}，"
+                f"nucleus {paired_nucleus_count}/{raw_nucleus_count}",
+            )
+
         try:
             saved_overlays = save_pipeline_fill_overlays(
                 result, alpha=self._overlay_alpha
@@ -1033,19 +1065,21 @@ class MainWindow(QMainWindow):
         else:
             self._current_overlay_masks.pop(img_path, None)
 
+        paired_data = self._paired_overlay_data_for_image(img_path)
+
         # 嘗試載入 outlines
         merged_path = find_merged_outline_for_image(img_path)
         nuc_polys: list[np.ndarray] = []
         cyto_polys: list[np.ndarray] = []
         if merged_path is None:
             self._current_overlay_polygons.pop(img_path, None)
-            if nuc_mask is None and cyto_mask is None:
+            if nuc_mask is None and cyto_mask is None and paired_data is None:
                 self._current_overlay_image = None
                 self._current_overlay_image_array = None
                 self._show_status_message(f"沒有找到 outlines：{img_path.name}")
                 return
         else:
-            polygons = load_merged_outlines(merged_path)
+            polygons = load_paired_merged_outlines(merged_path)
             nuc_polys = polygons.nuc_polygons
             cyto_polys = polygons.cyto_polygons
             self._current_overlay_polygons[img_path] = (nuc_polys, cyto_polys)
@@ -1056,6 +1090,7 @@ class MainWindow(QMainWindow):
             cyto_polys,
             nuc_mask=nuc_mask,
             cyto_mask=cyto_mask,
+            paired_data=paired_data,
         )
         self._current_overlay_image_array = overlay_bgr
         self._current_overlay_image = self._pixmap_from_bgr(overlay_bgr)
@@ -1139,6 +1174,15 @@ class MainWindow(QMainWindow):
         )
         return nuc_mask, cyto_mask
 
+    def _paired_overlay_data_for_image(
+        self,
+        image_path: Path,
+    ) -> PairedOverlayData | None:
+        """取得 pipeline 在暫存清理前保留的 SegUI 配對顯示資料。"""
+        if self._pipeline_result is None:
+            return None
+        return self._pipeline_result.paired_overlays.get(image_path.stem)
+
     def _blend_label_regions(
         self,
         overlay: np.ndarray,
@@ -1193,33 +1237,18 @@ class MainWindow(QMainWindow):
             cyto_mask: cytoplasm label mask。
 
         Returns:
-            若至少套用一種 mask，回傳疊圖；否則回傳 `None`。
+            兩種 mask 都存在時回傳 Paired Only 疊圖；否則回傳 `None`。
         """
-        if nuc_mask is None and cyto_mask is None:
+        if nuc_mask is None or cyto_mask is None:
             return None
-
-        overlay = base_bgr.copy()
-        applied = False
-        if cyto_mask is not None and self._show_cyto:
-            palette_bgr = [_rgb_to_bgr(color) for color in _SEGMENTATION_PALETTE_RGB]
-            self._blend_label_regions(
-                overlay,
-                cyto_mask,
-                lambda label: palette_bgr[(label - 1) % len(palette_bgr)],
-            )
-            self._draw_label_contours(overlay, cyto_mask, _rgb_to_bgr((0, 190, 255)))
-            applied = True
-
-        if nuc_mask is not None and self._show_nuc:
-            self._blend_label_regions(
-                overlay,
-                nuc_mask,
-                lambda _label: _rgb_to_bgr((0, 0, 240)),
-            )
-            self._draw_label_contours(overlay, nuc_mask, _rgb_to_bgr((255, 0, 0)))
-            applied = True
-
-        return overlay if applied else None
+        paired_data = build_paired_overlay_data(cyto_mask, nuc_mask)
+        return render_paired_overlay_bgr(
+            base_bgr,
+            paired_data,
+            show_nucleus=self._show_nuc,
+            show_cytoplasm=self._show_cyto,
+            alpha=self._overlay_alpha,
+        )
 
     def _pixmap_from_bgr(self, bgr: np.ndarray) -> QPixmap:
         """將 OpenCV BGR 影像轉為 Qt QPixmap。"""
@@ -1236,17 +1265,27 @@ class MainWindow(QMainWindow):
         cyto_polys: list[np.ndarray] | None,
         nuc_mask: np.ndarray | None = None,
         cyto_mask: np.ndarray | None = None,
+        paired_data: PairedOverlayData | None = None,
     ) -> np.ndarray:
         """根據目前設定，在 base 影像上畫出 mask 或輪廓，回傳 BGR 影像。"""
-        mask_overlay = self._apply_segmentation_mask_overlay(
-            base_bgr, nuc_mask=nuc_mask, cyto_mask=cyto_mask
-        )
-        if mask_overlay is not None:
-            blended = mask_overlay
-        else:
-            blended = self._create_outline_overlay_bgr(
-                base_bgr, nuc_polys=nuc_polys, cyto_polys=cyto_polys
+        if paired_data is not None:
+            blended = render_paired_overlay_bgr(
+                base_bgr,
+                paired_data,
+                show_nucleus=self._show_nuc,
+                show_cytoplasm=self._show_cyto,
+                alpha=self._overlay_alpha,
             )
+        else:
+            mask_overlay = self._apply_segmentation_mask_overlay(
+                base_bgr, nuc_mask=nuc_mask, cyto_mask=cyto_mask
+            )
+            if mask_overlay is not None:
+                blended = mask_overlay
+            else:
+                blended = self._create_outline_overlay_bgr(
+                    base_bgr, nuc_polys=nuc_polys, cyto_polys=cyto_polys
+                )
 
         if self._show_ki67:
             ki67_color = (203, 0, 255)  # 粉色
@@ -1316,12 +1355,14 @@ class MainWindow(QMainWindow):
 
         nuc_polys, cyto_polys = polys if polys is not None else ([], [])
         nuc_mask, cyto_mask = masks if masks is not None else (None, None)
+        paired_data = self._paired_overlay_data_for_image(img_path)
         display_bgr = self._create_overlay_bgr(
             self._current_image_array,
             nuc_polys,
             cyto_polys,
             nuc_mask=nuc_mask,
             cyto_mask=cyto_mask,
+            paired_data=paired_data,
         )
 
         if self._highlight_enabled and self._selected_cell_id is not None:

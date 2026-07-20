@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -7,6 +7,7 @@ import numpy as np
 from .img_prep import segment_all, mask2txt_all, combined
 from .cell_anal import run_all
 from .cell_anal_plot import plot_global_area_analysis
+from .paired_overlay import PairedOverlayData, collect_paired_overlay_data
 from .utils.io import output_dir
 
 
@@ -22,6 +23,7 @@ class PipelineResult:
     results_dir: Path | None = None
     area_scatter_plot: Path | None = None
     area_histogram_plot: Path | None = None
+    paired_overlays: dict[str, PairedOverlayData] = field(default_factory=dict)
 
 
 @dataclass
@@ -70,6 +72,18 @@ def _resolve_data_folder(raw_data_folder: Path) -> Path:
     )
 
 
+def _list_display_image_files(data_folder: Path) -> list[Path]:
+    """列出 GUI 應顯示的 PC 或資料集根目錄影像。"""
+    extensions = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+    pc_dir = data_folder / "PC"
+    search_dir = pc_dir if pc_dir.exists() and pc_dir.is_dir() else data_folder
+    return [
+        path
+        for path in sorted(search_dir.iterdir())
+        if path.is_file() and path.suffix.lower() in extensions
+    ]
+
+
 def run_pipeline(
     data_folder: Path,
     nuc_source: str = "dapi",
@@ -92,6 +106,7 @@ def run_pipeline(
     """
 
     data_folder = _resolve_data_folder(Path(data_folder))
+    image_files = _list_display_image_files(data_folder)
 
     total_steps = 4  # 現在啟用 4 個步驟
     current_step = 0
@@ -100,6 +115,10 @@ def run_pipeline(
     if progress_callback:
         progress_callback(current_step, total_steps, "執行 segmentation (cyto & nuc)")
     segment_all(data_folder, nuc_source=nuc_source)
+    paired_overlays = collect_paired_overlay_data(
+        image_files,
+        output_dir(data_folder, "segment"),
+    )
     current_step += 1
 
     # Step 2: mask -> outlines
@@ -147,24 +166,13 @@ def run_pipeline(
     if progress_callback:
         progress_callback(current_step, total_steps, "Pipeline 完成")
 
-    # 依照實際資料結構決定顯示的原始影像：
-    # 優先使用 data_folder/PC/ 底下的圖；若無 PC 資料夾，再退回 data_folder 本身。
-    exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
-    image_files: list[Path] = []
-
-    pc_dir = data_folder / "PC"
-    search_dir = pc_dir if pc_dir.exists() and pc_dir.is_dir() else data_folder
-
-    for p in sorted(search_dir.iterdir()):
-        if p.is_file() and p.suffix.lower() in exts:
-            image_files.append(p)
-
     return PipelineResult(
         data_folder=data_folder,
         image_files=image_files,
         results_dir=results_dir,
         area_scatter_plot=area_scatter_plot,
         area_histogram_plot=area_histogram_plot,
+        paired_overlays=paired_overlays,
     )
 
 
@@ -225,3 +233,46 @@ def load_merged_outlines(merged_path: Path) -> OverlayPolygons:
             cyto_polys.append(poly)
 
     return OverlayPolygons(nuc_polygons=nuc_polys, cyto_polygons=cyto_polys)
+
+
+def load_paired_merged_outlines(merged_path: Path) -> OverlayPolygons:
+    """讀取 merged outlines，只保留核與質兩側都存在的配對。
+
+    這是原始 segmentation masks 不存在時的顯示 fallback。正常 pipeline
+    會優先使用記憶體中的 SegUI 中心點配對結果。
+
+    Args:
+        merged_path: ``*_merged_cp_outlines.txt`` 路徑。
+
+    Returns:
+        核與質索引彼此對齊的 polygon 集合。
+    """
+    with merged_path.open("r", encoding="utf-8", errors="ignore") as file:
+        lines = [line.strip() for line in file if line.strip()]
+
+    def parse_polygon(line: str) -> np.ndarray | None:
+        """解析單行 outline；缺值或格式錯誤時回傳 ``None``。"""
+        if line == "-1,-1":
+            return None
+        try:
+            coords = list(map(int, line.split(",")))
+        except ValueError:
+            return None
+        if len(coords) < 6 or len(coords) % 2:
+            return None
+        return np.asarray(coords, dtype=np.int32).reshape(-1, 2)
+
+    nucleus_polygons: list[np.ndarray] = []
+    cytoplasm_polygons: list[np.ndarray] = []
+    for index in range(0, len(lines) - 1, 2):
+        nucleus = parse_polygon(lines[index])
+        cytoplasm = parse_polygon(lines[index + 1])
+        if nucleus is None or cytoplasm is None:
+            continue
+        nucleus_polygons.append(nucleus)
+        cytoplasm_polygons.append(cytoplasm)
+
+    return OverlayPolygons(
+        nuc_polygons=nucleus_polygons,
+        cyto_polygons=cytoplasm_polygons,
+    )
