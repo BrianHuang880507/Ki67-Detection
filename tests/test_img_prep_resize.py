@@ -85,6 +85,72 @@ class SegmentResizeTest(unittest.TestCase):
         self.assertEqual(np.count_nonzero(filtered == 2), 100)
         self.assertTrue(np.all(filtered[15:17, 0:5] == 0))
 
+    def test_paired_filter_keeps_small_pairs_and_removes_unpaired_noise(
+        self,
+    ) -> None:
+        cyto_masks = np.zeros((50, 80), dtype=np.int32)
+        nuc_masks = np.zeros_like(cyto_masks)
+
+        for label, x_start in enumerate((5, 25, 45), start=1):
+            cyto_masks[5:15, x_start : x_start + 10] = label
+            nuc_masks[8:12, x_start + 3 : x_start + 7] = label
+
+        cyto_masks[25:28, 5:8] = 4
+        nuc_masks[26:28, 6:8] = 4
+        cyto_masks[25:28, 25:28] = 5
+        nuc_masks[25:27, 45:47] = 5
+
+        result = img_prep._filter_small_unpaired_labels(
+            cyto_masks,
+            nuc_masks,
+            min_area_ratio=0.5,
+            min_area_floor=0,
+            min_reference_count=3,
+        )
+
+        self.assertEqual(result.cytoplasm_threshold, 50.0)
+        self.assertEqual(result.nucleus_threshold, 8.0)
+        self.assertEqual(result.paired_cytoplasm_count, 4)
+        self.assertEqual(result.paired_nucleus_count, 4)
+        self.assertNotEqual(result.cytoplasm_mask[26, 6], 0)
+        self.assertNotEqual(result.nucleus_mask[26, 6], 0)
+        self.assertEqual(result.cytoplasm_mask[26, 26], 0)
+        self.assertEqual(result.nucleus_mask[25, 45], 0)
+
+    def test_paired_segment_file_filter_updates_masks_and_preserves_payload(
+        self,
+    ) -> None:
+        cyto_masks = np.zeros((20, 30), dtype=np.int32)
+        nuc_masks = np.zeros_like(cyto_masks)
+        cyto_masks[2:12, 2:12] = 1
+        nuc_masks[5:9, 5:9] = 1
+        cyto_masks[15:18, 2:5] = 2
+        nuc_masks[15:17, 15:17] = 2
+
+        with tempfile.TemporaryDirectory() as tmp:
+            seg_dir = Path(tmp)
+            cyto_path = seg_dir / "sample_cyto_seg.npy"
+            nuc_path = seg_dir / "sample_nuc_seg.npy"
+            np.save(cyto_path, {"masks": cyto_masks, "flows": ["cyto-flow"]})
+            np.save(nuc_path, {"masks": nuc_masks, "flows": ["nuc-flow"]})
+
+            results = img_prep._filter_paired_segment_files(
+                seg_dir,
+                ["sample"],
+                min_area_ratio=0.15,
+                min_area_floor=30,
+            )
+
+            saved_cyto = np.load(cyto_path, allow_pickle=True).item()
+            saved_nuc = np.load(nuc_path, allow_pickle=True).item()
+
+        self.assertEqual(results["sample"].removed_cytoplasm_count, 1)
+        self.assertEqual(results["sample"].removed_nucleus_count, 1)
+        np.testing.assert_array_equal(np.unique(saved_cyto["masks"]), [0, 1])
+        np.testing.assert_array_equal(np.unique(saved_nuc["masks"]), [0, 1])
+        self.assertEqual(saved_cyto["flows"], ["cyto-flow"])
+        self.assertEqual(saved_nuc["flows"], ["nuc-flow"])
+
     def test_segment_all_passes_default_resize_sizes_to_cyto_and_pc_nuc(
         self,
     ) -> None:
@@ -105,6 +171,7 @@ class SegmentResizeTest(unittest.TestCase):
                 patch.object(img_prep, "output_dir", side_effect=fake_output_dir),
                 patch.object(img_prep, "list_files", return_value=[image_path]),
                 patch.object(img_prep, "segment") as segment_mock,
+                patch.object(img_prep, "_filter_paired_segment_files") as filter_mock,
             ):
                 img_prep.segment_all(root, nuc_source="pc")
 
@@ -121,6 +188,7 @@ class SegmentResizeTest(unittest.TestCase):
                     cellprob_threshold=0.0,
                     min_area_ratio=0.15,
                     min_area_floor=30,
+                    apply_small_label_filter=False,
                 ),
                 call(
                     EXPECTED_PC_NUC_MODEL_PATH,
@@ -132,8 +200,15 @@ class SegmentResizeTest(unittest.TestCase):
                     cellprob_threshold=0.0,
                     min_area_ratio=0.15,
                     min_area_floor=30,
+                    apply_small_label_filter=False,
                 ),
             ],
+        )
+        filter_mock.assert_called_once_with(
+            seg_dir,
+            [image_path.stem],
+            min_area_ratio=0.15,
+            min_area_floor=30,
         )
 
     def test_segment_all_uses_dapi_nuc_model_when_dapi_source_is_available(
@@ -169,6 +244,7 @@ class SegmentResizeTest(unittest.TestCase):
                 patch.object(img_prep, "list_files", side_effect=fake_list_files),
                 patch.object(img_prep, "segment") as segment_mock,
                 patch.object(img_prep, "remap_nuc_segments_to_cyto"),
+                patch.object(img_prep, "_filter_paired_segment_files") as filter_mock,
             ):
                 img_prep.segment_all(root, nuc_source="dapi")
 
@@ -185,6 +261,7 @@ class SegmentResizeTest(unittest.TestCase):
                     cellprob_threshold=0.0,
                     min_area_ratio=0.15,
                     min_area_floor=30,
+                    apply_small_label_filter=False,
                 ),
                 call(
                     EXPECTED_DAPI_NUC_MODEL_PATH,
@@ -197,8 +274,15 @@ class SegmentResizeTest(unittest.TestCase):
                     cellprob_threshold=0.0,
                     min_area_ratio=0.15,
                     min_area_floor=30,
+                    apply_small_label_filter=False,
                 ),
             ],
+        )
+        filter_mock.assert_called_once_with(
+            seg_dir,
+            [pc_image.stem],
+            min_area_ratio=0.15,
+            min_area_floor=30,
         )
 
     def test_segment_all_falls_back_to_pc_nuc_model_when_dapi_folder_is_missing(
@@ -221,6 +305,7 @@ class SegmentResizeTest(unittest.TestCase):
                 patch.object(img_prep, "output_dir", side_effect=fake_output_dir),
                 patch.object(img_prep, "list_files", return_value=[image_path]),
                 patch.object(img_prep, "segment") as segment_mock,
+                patch.object(img_prep, "_filter_paired_segment_files") as filter_mock,
             ):
                 img_prep.segment_all(root, nuc_source="dapi")
 
@@ -237,6 +322,7 @@ class SegmentResizeTest(unittest.TestCase):
                     cellprob_threshold=0.0,
                     min_area_ratio=0.15,
                     min_area_floor=30,
+                    apply_small_label_filter=False,
                 ),
                 call(
                     EXPECTED_PC_NUC_MODEL_PATH,
@@ -248,8 +334,15 @@ class SegmentResizeTest(unittest.TestCase):
                     cellprob_threshold=0.0,
                     min_area_ratio=0.15,
                     min_area_floor=30,
+                    apply_small_label_filter=False,
                 ),
             ],
+        )
+        filter_mock.assert_called_once_with(
+            seg_dir,
+            [image_path.stem],
+            min_area_ratio=0.15,
+            min_area_floor=30,
         )
 
 

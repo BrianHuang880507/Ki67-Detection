@@ -1,5 +1,6 @@
 ﻿import shutil
 import re
+from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
 import cv2
@@ -20,6 +21,37 @@ PC_NUC_MODEL_PATH = "model/model_BDL3_label_dapi"
 NUC_MODEL_PATH = DAPI_NUC_MODEL_PATH
 CYTO_MODEL_INPUT_SIZE = (1280, 1024)
 NUC_MODEL_INPUT_SIZE = (1280, 1024)
+PAIRED_FILTER_MIN_REFERENCE_COUNT = 10
+PAIRED_FILTER_MIN_NUCLEUS_CONTAINMENT = 0.8
+
+
+@dataclass(frozen=True)
+class PairedAreaFilterResult:
+    """儲存配對感知面積過濾的結果與診斷資訊。
+
+    Attributes:
+        cytoplasm_mask: 過濾並重新編號後的細胞質 mask。
+        nucleus_mask: 過濾並重新編號後的細胞核 mask。
+        cytoplasm_threshold: 細胞質最小面積門檻。
+        nucleus_threshold: 細胞核最小面積門檻。
+        paired_cytoplasm_count: 過濾前成功配對的細胞質數量。
+        paired_nucleus_count: 過濾前成功配對的細胞核數量。
+        reference_cytoplasm_count: 用於細胞質中位數的標籤數量。
+        reference_nucleus_count: 用於細胞核中位數的標籤數量。
+        removed_cytoplasm_count: 被移除的未配對細胞質數量。
+        removed_nucleus_count: 被移除的未配對細胞核數量。
+    """
+
+    cytoplasm_mask: np.ndarray
+    nucleus_mask: np.ndarray
+    cytoplasm_threshold: float
+    nucleus_threshold: float
+    paired_cytoplasm_count: int
+    paired_nucleus_count: int
+    reference_cytoplasm_count: int
+    reference_nucleus_count: int
+    removed_cytoplasm_count: int
+    removed_nucleus_count: int
 
 
 # ===============================
@@ -64,6 +96,254 @@ def _filter_small_labels(
     return remapped_labels[inverse].reshape(mask_array.shape)
 
 
+def _label_area_map(mask: np.ndarray) -> dict[int, int]:
+    """計算非背景標籤的像素面積。"""
+    mask_array = np.asarray(mask)
+    nonzero_values = mask_array[mask_array != 0]
+    if nonzero_values.size == 0:
+        return {}
+    labels, areas = np.unique(nonzero_values, return_counts=True)
+    return {
+        int(label): int(area)
+        for label, area in zip(labels.tolist(), areas.tolist(), strict=True)
+    }
+
+
+def _border_labels(mask: np.ndarray) -> set[int]:
+    """找出接觸影像邊界的非背景標籤。"""
+    mask_array = np.asarray(mask)
+    if mask_array.size == 0:
+        return set()
+    border_values = np.concatenate(
+        (
+            mask_array[0, :],
+            mask_array[-1, :],
+            mask_array[:, 0],
+            mask_array[:, -1],
+        )
+    )
+    return {int(label) for label in np.unique(border_values) if label != 0}
+
+
+def _relabel_kept_labels(
+    mask: np.ndarray,
+    kept_labels: set[int],
+) -> np.ndarray:
+    """只保留指定標籤，並依原標籤順序重新連續編號。"""
+    mask_array = np.asarray(mask)
+    unique_labels, inverse = np.unique(mask_array, return_inverse=True)
+    remapped_labels = np.zeros(unique_labels.shape, dtype=mask_array.dtype)
+    kept_positions = np.flatnonzero(
+        np.isin(unique_labels, np.asarray(sorted(kept_labels), dtype=mask_array.dtype))
+    )
+    remapped_labels[kept_positions] = np.arange(
+        1,
+        kept_positions.size + 1,
+        dtype=mask_array.dtype,
+    )
+    return remapped_labels[inverse].reshape(mask_array.shape)
+
+
+def _filter_small_unpaired_labels(
+    cytoplasm_mask: np.ndarray,
+    nucleus_mask: np.ndarray,
+    min_area_ratio: float,
+    min_area_floor: int,
+    *,
+    min_reference_count: int = PAIRED_FILTER_MIN_REFERENCE_COUNT,
+    min_nucleus_containment: float = PAIRED_FILTER_MIN_NUCLEUS_CONTAINMENT,
+) -> PairedAreaFilterResult:
+    """以配對 ROI 建立面積基準，只移除未配對的小物件。
+
+    細胞核質心落在細胞質內即視為配對。所有配對物件均受到保護，不會因
+    面積過小而移除。中位數優先使用核位於細胞質內至少指定比例、且兩者
+    都未接觸影像邊界的高可信配對；樣本不足時退回全部配對，完全無配對
+    時才退回全部標籤。
+
+    Args:
+        cytoplasm_mask: 細胞質二維標籤 mask。
+        nucleus_mask: 細胞核二維標籤 mask，尺寸須與細胞質一致。
+        min_area_ratio: 相對於參考面積中位數的最小面積比例。
+        min_area_floor: 最小面積的絕對像素下限。
+        min_reference_count: 使用高可信配對計算中位數所需的最少標籤數。
+        min_nucleus_containment: 高可信配對所需的最小細胞核包覆比例。
+
+    Returns:
+        過濾後的兩種 mask、門檻與配對診斷資訊。
+
+    Raises:
+        ValueError: 當 mask 尺寸或過濾參數不合法時拋出。
+    """
+    cyto_array = np.asarray(cytoplasm_mask)
+    nuc_array = np.asarray(nucleus_mask)
+    if cyto_array.ndim != 2 or nuc_array.ndim != 2:
+        raise ValueError("cytoplasm_mask and nucleus_mask must be two-dimensional.")
+    if cyto_array.shape != nuc_array.shape:
+        raise ValueError("cytoplasm_mask and nucleus_mask must have the same shape.")
+    if min_area_ratio < 0 or min_area_floor < 0:
+        raise ValueError("Area filter thresholds must be non-negative.")
+    if min_reference_count < 1:
+        raise ValueError("min_reference_count must be at least 1.")
+    if not 0.0 <= min_nucleus_containment <= 1.0:
+        raise ValueError("min_nucleus_containment must be between 0 and 1.")
+
+    cyto_areas = _label_area_map(cyto_array)
+    nuc_areas = _label_area_map(nuc_array)
+    cyto_border = _border_labels(cyto_array)
+    nuc_border = _border_labels(nuc_array)
+    paired_cyto: set[int] = set()
+    paired_nuc: set[int] = set()
+    trusted_cyto: set[int] = set()
+    trusted_nuc: set[int] = set()
+
+    if nuc_areas:
+        pixel_y, pixel_x = np.nonzero(nuc_array)
+        pixel_nuc_labels = nuc_array[pixel_y, pixel_x].astype(np.int64)
+        nucleus_labels = np.asarray(sorted(nuc_areas), dtype=np.int64)
+        label_counts = np.bincount(pixel_nuc_labels)
+        center_y = (
+            np.bincount(pixel_nuc_labels, weights=pixel_y)[nucleus_labels]
+            / label_counts[nucleus_labels]
+        ).astype(int)
+        center_x = (
+            np.bincount(pixel_nuc_labels, weights=pixel_x)[nucleus_labels]
+            / label_counts[nucleus_labels]
+        ).astype(int)
+        centroid_cyto_labels = cyto_array[center_y, center_x].astype(np.int64)
+
+        assigned_cyto_by_nucleus = np.zeros(label_counts.size, dtype=np.int64)
+        assigned_cyto_by_nucleus[nucleus_labels] = centroid_cyto_labels
+        pixel_cyto_labels = cyto_array[pixel_y, pixel_x].astype(np.int64)
+        contained_pixels = (
+            pixel_cyto_labels == assigned_cyto_by_nucleus[pixel_nuc_labels]
+        )
+        contained_counts = np.bincount(
+            pixel_nuc_labels[contained_pixels],
+            minlength=label_counts.size,
+        )
+
+        for nuc_label, cyto_label in zip(
+            nucleus_labels.tolist(),
+            centroid_cyto_labels.tolist(),
+            strict=True,
+        ):
+            if cyto_label == 0:
+                continue
+
+            paired_cyto.add(cyto_label)
+            paired_nuc.add(nuc_label)
+            containment = contained_counts[nuc_label] / label_counts[nuc_label]
+            if (
+                containment >= min_nucleus_containment
+                and cyto_label not in cyto_border
+                and nuc_label not in nuc_border
+            ):
+                trusted_cyto.add(cyto_label)
+                trusted_nuc.add(nuc_label)
+
+    if (
+        len(trusted_cyto) >= min_reference_count
+        and len(trusted_nuc) >= min_reference_count
+    ):
+        reference_cyto = trusted_cyto
+        reference_nuc = trusted_nuc
+    elif paired_cyto and paired_nuc:
+        reference_cyto = paired_cyto
+        reference_nuc = paired_nuc
+    else:
+        reference_cyto = set(cyto_areas)
+        reference_nuc = set(nuc_areas)
+
+    def calculate_threshold(
+        area_by_label: dict[int, int],
+        reference_labels: set[int],
+    ) -> float:
+        reference_areas = [
+            area_by_label[label]
+            for label in reference_labels
+            if label in area_by_label
+        ]
+        if not reference_areas:
+            return 0.0
+        median_area = float(np.median(reference_areas))
+        return max(float(min_area_floor), float(min_area_ratio) * median_area)
+
+    cyto_threshold = calculate_threshold(cyto_areas, reference_cyto)
+    nuc_threshold = calculate_threshold(nuc_areas, reference_nuc)
+    kept_cyto = {
+        label
+        for label, area in cyto_areas.items()
+        if label in paired_cyto or area >= cyto_threshold
+    }
+    kept_nuc = {
+        label
+        for label, area in nuc_areas.items()
+        if label in paired_nuc or area >= nuc_threshold
+    }
+
+    return PairedAreaFilterResult(
+        cytoplasm_mask=_relabel_kept_labels(cyto_array, kept_cyto),
+        nucleus_mask=_relabel_kept_labels(nuc_array, kept_nuc),
+        cytoplasm_threshold=cyto_threshold,
+        nucleus_threshold=nuc_threshold,
+        paired_cytoplasm_count=len(paired_cyto),
+        paired_nucleus_count=len(paired_nuc),
+        reference_cytoplasm_count=len(reference_cyto),
+        reference_nucleus_count=len(reference_nuc),
+        removed_cytoplasm_count=len(cyto_areas) - len(kept_cyto),
+        removed_nucleus_count=len(nuc_areas) - len(kept_nuc),
+    )
+
+
+def _filter_paired_segment_files(
+    seg_dir: Path,
+    stems: list[str],
+    *,
+    min_area_ratio: float,
+    min_area_floor: int,
+) -> dict[str, PairedAreaFilterResult]:
+    """過濾同名 cyto／nuc segmentation 檔並覆寫其 masks。
+
+    Args:
+        seg_dir: 儲存 `*_cyto_seg.npy` 與 `*_nuc_seg.npy` 的資料夾。
+        stems: 要處理的共同影像 stem。
+        min_area_ratio: 相對於配對參考中位數的最小面積比例。
+        min_area_floor: 最小面積的絕對像素下限。
+
+    Returns:
+        以影像 stem 為 key 的過濾結果；缺少任一 segmentation 檔時略過。
+    """
+    results: dict[str, PairedAreaFilterResult] = {}
+    for stem in dict.fromkeys(stems):
+        cyto_path = seg_dir / f"{stem}_cyto_seg.npy"
+        nuc_path = seg_dir / f"{stem}_nuc_seg.npy"
+        if not cyto_path.exists() or not nuc_path.exists():
+            print(f"[WARN] 略過配對面積過濾，缺少 segmentation 檔：{stem}")
+            continue
+
+        cyto_data = np.load(cyto_path, allow_pickle=True).item()
+        nuc_data = np.load(nuc_path, allow_pickle=True).item()
+        result = _filter_small_unpaired_labels(
+            cyto_data["masks"],
+            nuc_data["masks"],
+            min_area_ratio=min_area_ratio,
+            min_area_floor=min_area_floor,
+        )
+        cyto_data["masks"] = result.cytoplasm_mask
+        nuc_data["masks"] = result.nucleus_mask
+        np.save(cyto_path, cyto_data)
+        np.save(nuc_path, nuc_data)
+        results[stem] = result
+        print(
+            f"[INFO] 配對面積過濾 {stem}："
+            f"cyto 移除 {result.removed_cytoplasm_count}、"
+            f"nuc 移除 {result.removed_nucleus_count}；"
+            f"保護配對 {result.paired_cytoplasm_count}/"
+            f"{result.paired_nucleus_count}。"
+        )
+    return results
+
+
 def segment(
     model_path: str,
     img_files: list[Path],
@@ -79,6 +359,7 @@ def segment(
     *,
     min_area_ratio: float = 0.15,
     min_area_floor: int = 30,
+    apply_small_label_filter: bool = True,
 ):
     """使用指定的 Cellpose 模型分割影像。
 
@@ -100,6 +381,8 @@ def segment(
             推論，再將 mask/flow 還原回原圖尺寸。
         min_area_ratio: 相對於標籤面積中位數的最小面積比例。
         min_area_floor: 最小標籤面積的絕對像素下限。
+        apply_small_label_filter: 是否在單一 mask 輸出前套用舊版面積過濾。
+            `segment_all` 會關閉此項，待 cyto／nuc 配對後再共同過濾。
 
     Raises:
         ValueError: 當 `output_stems` 長度不符，或 resize 尺寸不合法時拋出。
@@ -147,7 +430,8 @@ def segment(
                     flows[0], original_size, interpolation=cv2.INTER_LINEAR
                 )
 
-        masks = _filter_small_labels(masks, min_area_ratio, min_area_floor)
+        if apply_small_label_filter:
+            masks = _filter_small_labels(masks, min_area_ratio, min_area_floor)
         io.masks_flows_to_seg(
             img, masks, flows, f, channels=list(channels), diams=eval_diameter
         )
@@ -379,7 +663,7 @@ def segment_all(
         cyto_model_input_size: 細胞質模型推論前的 resize 尺寸；`None` 表示不 resize。
         nuc_model_input_size: 細胞核模型推論前的 resize 尺寸；`None` 表示不 resize。
         cellprob_threshold: Cellpose cellprob threshold。
-        min_area_ratio: 相對於標籤面積中位數的最小面積比例。
+        min_area_ratio: 相對於配對參考標籤面積中位數的最小面積比例。
         min_area_floor: 最小標籤面積的絕對像素下限。
     """
     root_dir = Path(input_dir)
@@ -410,6 +694,7 @@ def segment_all(
         cellprob_threshold=cellprob_threshold,
         min_area_ratio=min_area_ratio,
         min_area_floor=min_area_floor,
+        apply_small_label_filter=False,
     )
 
     if nuc_source == "pc":
@@ -421,6 +706,13 @@ def segment_all(
             channels=(0, 0),
             model_input_size=nuc_model_input_size,
             cellprob_threshold=cellprob_threshold,
+            min_area_ratio=min_area_ratio,
+            min_area_floor=min_area_floor,
+            apply_small_label_filter=False,
+        )
+        _filter_paired_segment_files(
+            seg_dir,
+            [image.stem for image in img_files],
             min_area_ratio=min_area_ratio,
             min_area_floor=min_area_floor,
         )
@@ -439,6 +731,13 @@ def segment_all(
             cellprob_threshold=cellprob_threshold,
             min_area_ratio=min_area_ratio,
             min_area_floor=min_area_floor,
+            apply_small_label_filter=False,
+        )
+        _filter_paired_segment_files(
+            seg_dir,
+            [image.stem for image in img_files],
+            min_area_ratio=min_area_ratio,
+            min_area_floor=min_area_floor,
         )
         return
 
@@ -453,6 +752,13 @@ def segment_all(
             channels=(0, 0),
             model_input_size=nuc_model_input_size,
             cellprob_threshold=cellprob_threshold,
+            min_area_ratio=min_area_ratio,
+            min_area_floor=min_area_floor,
+            apply_small_label_filter=False,
+        )
+        _filter_paired_segment_files(
+            seg_dir,
+            [image.stem for image in img_files],
             min_area_ratio=min_area_ratio,
             min_area_floor=min_area_floor,
         )
@@ -512,6 +818,7 @@ def segment_all(
             cellprob_threshold=cellprob_threshold,
             min_area_ratio=min_area_ratio,
             min_area_floor=min_area_floor,
+            apply_small_label_filter=False,
         )
         remap_nuc_segments_to_cyto(seg_dir, dapi_output_stems, dapi_output_stems)
 
@@ -527,7 +834,15 @@ def segment_all(
             cellprob_threshold=cellprob_threshold,
             min_area_ratio=min_area_ratio,
             min_area_floor=min_area_floor,
+            apply_small_label_filter=False,
         )
+
+    _filter_paired_segment_files(
+        seg_dir,
+        [image.stem for image in img_files],
+        min_area_ratio=min_area_ratio,
+        min_area_floor=min_area_floor,
+    )
 
 
 # ===============================
