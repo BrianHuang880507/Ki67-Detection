@@ -11,6 +11,34 @@
 
 ---
 
+## 零、Paper-compatible Geometry Features
+
+下列形態參數會分別輸出 `_nuc` 與 `_cyto` 版本。依目前專案實作，`_cyto` 的 geometry mask 是 phase-derived whole-cell outline（包含細胞核）；真正排除細胞核的 cytoplasm mask 只用於 IDO 等細胞質螢光量測。
+
+| 特徵參數 | 定義 | 公式 / 來源 |
+| -------- | ---- | ----------- |
+| `Area` | ROI 面積 | ROI 像素數 |
+| `Perimeter` | ROI 邊界長度 | OpenCV contour perimeter |
+| `Compactness` | CellProfiler 相容緊密度 | `2π × mean(pixel-to-centroid distance²) / Area` |
+| `Eccentricity` | 等二階矩橢圓的離心率 | `sqrt(1 - (Minor / Major)^2)` |
+| `Extent` | 外接矩形填充率 | `Area / bounding-box area` |
+| `Sphericity` | 論文的 FormFactor | `4π × Area / Perimeter²` |
+| `Major Axis Length` | 等二階矩橢圓長軸 | `skimage.measure.regionprops` |
+| `Minor Axis Length` | 等二階矩橢圓短軸 | `skimage.measure.regionprops` |
+| `Feret Length` | 最大 Feret 直徑 | 凸包點最大距離 |
+| `Feret Width` | 現有最小 Feret proxy | 既有 backend 的 `MinFeret`／短軸 |
+| `Maximum Radius` | ROI 像素到最近背景像素距離的最大值 | Euclidean distance transform |
+| `Mean Radius` | ROI 像素到最近背景像素距離的平均值 | Euclidean distance transform |
+| `Median Radius` | ROI 像素到最近背景像素距離的中位數 | Euclidean distance transform |
+| `Aspect Ratio` | 長寬比 | `Major / Minor` |
+| `Perimeter/Area Ratio` | 周長面積比 | `Perimeter / Area` |
+| `Solidity` | 實心度 | `Area / convex-hull area` |
+| `Karyoplasmic Ratio` | 核質面積比 | `Area_nuc / (whole-cell area - Area_nuc)` |
+
+三種 Radius 不是「形心到邊界」的距離，而是依 CellProfiler 定義計算每個 ROI 像素到最近外部背景像素的距離。
+
+---
+
 ## 一、Intensity Distribution Features
 
 此特徵描述 ROI 內像素強度分布形狀。Phase contrast 中像素強度可視為細胞厚度、折射率、乾質量與核/質紋理狀態的間接 proxy。

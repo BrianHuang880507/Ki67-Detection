@@ -214,9 +214,24 @@ class PipelineThread(QThread):
         clean_temp: bool,
         width_um_per_px: float,
         height_um_per_px: float,
+        xlsx_profile: str,
         parent: Optional[QWidget] = None,
     ) -> None:
-        """初始化背景 pipeline 執行緒。"""
+        """初始化背景 pipeline 執行緒。
+
+        Args:
+            data_folder: 輸入資料集資料夾。
+            nuc_source: 細胞核分割來源。
+            fluor_analy: 是否執行螢光分析。
+            ki67: 是否執行 Ki67 判定。
+            ki67_backend: Ki67 二值化後端。
+            feature_backend: 特徵提取後端。
+            clean_temp: 是否清理暫存檔。
+            width_um_per_px: 寬度方向的像素比例。
+            height_um_per_px: 高度方向的像素比例。
+            xlsx_profile: cleaned XLSX 輸出版本。
+            parent: Qt 父元件。
+        """
         super().__init__(parent)
         self._data_folder = data_folder
         self._nuc_source = nuc_source
@@ -227,6 +242,7 @@ class PipelineThread(QThread):
         self._clean_temp = clean_temp
         self._width_um_per_px = width_um_per_px
         self._height_um_per_px = height_um_per_px
+        self._xlsx_profile = xlsx_profile
 
     def _progress_callback(self, done: int, total: int, message: str) -> None:
         """將 pipeline 進度轉送為 Qt signal。"""
@@ -245,6 +261,7 @@ class PipelineThread(QThread):
                 clean_temp=self._clean_temp,
                 width_um_per_px=self._width_um_per_px,
                 height_um_per_px=self._height_um_per_px,
+                xlsx_profile=self._xlsx_profile,
                 progress_callback=self._progress_callback,
             )
             self.finished_ok.emit(result)
@@ -319,6 +336,7 @@ class MainWindow(QMainWindow):
         self._clean_temp: bool = True
         self._width_um_per_px: float = 1.5896
         self._height_um_per_px: float = 1.5876
+        self._xlsx_profile: str = "biomedical"
         # 新增：目前選中的 Cell_ID（例如 "1_3"）
         self._selected_cell_id: str | None = None
         self._highlight_enabled: bool = False
@@ -440,6 +458,7 @@ class MainWindow(QMainWindow):
         # 為了讓使用者「再點同一列」也能觸發 selection change（部分平台不會觸發）
         # 先保留顯示上的 row 選取，但不依賴 selection change。
         self._update_display_pixmap()
+
     # --- UI 組裝 ---
 
     def _build_menu_bar(self) -> None:
@@ -449,7 +468,32 @@ class MainWindow(QMainWindow):
         self.action_open_input.triggered.connect(self._on_browse_input)
 
         self.action_analysis_options = self.menuBar().addAction("分析選項")
-        self.action_analysis_options.triggered.connect(self._open_analysis_options_dialog)
+        self.action_analysis_options.triggered.connect(
+            self._open_analysis_options_dialog
+        )
+
+        self.export_menu = self.menuBar().addMenu("輸出")
+        self.export_menu.setObjectName("exportMenu")
+        self.export_profile_actions = self._add_exclusive_option_actions(
+            self.export_menu,
+            [
+                ("生醫版本", "biomedical", True),
+                ("工程版本", "engineer", False),
+            ],
+        )
+        self.export_profile_actions[0].setObjectName("exportBiomedicalAction")
+        self.export_profile_actions[1].setObjectName("exportEngineerAction")
+        for action in self.export_profile_actions:
+            action.triggered.connect(self._on_export_profile_changed)
+
+    def _on_export_profile_changed(self, _checked: bool = False) -> None:
+        """同步 GUI 選取的 cleaned XLSX 輸出版本。"""
+        self._xlsx_profile = self._selected_action_value(
+            self.export_profile_actions,
+            "biomedical",
+        )
+        label = "生醫版本" if self._xlsx_profile == "biomedical" else "工程版本"
+        self._show_status_message(f"XLSX 輸出已切換為：{label}", 3000)
 
     def _new_option_combo(
         self,
@@ -898,6 +942,10 @@ class MainWindow(QMainWindow):
             clean_temp=self._clean_temp,
             width_um_per_px=self._width_um_per_px,
             height_um_per_px=self._height_um_per_px,
+            xlsx_profile=self._selected_action_value(
+                self.export_profile_actions,
+                "biomedical",
+            ),
             parent=self,
         )
         self._pipeline_thread.progress_changed.connect(self._on_progress_changed)
@@ -971,6 +1019,9 @@ class MainWindow(QMainWindow):
         self._pipeline_result = result
         # 記錄目前資料夾
         self._current_data_folder = result.data_folder
+
+        if result.workbook_path is not None:
+            self._append_terminal_line("INFO", f"已輸出 XLSX：{result.workbook_path}")
 
         if result.paired_overlays:
             raw_cytoplasm_count = sum(

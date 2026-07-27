@@ -69,6 +69,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--clean_temp", action="store_true", help="Clean temp files.")
     parser.add_argument(
+        "--xlsx-version",
+        choices=["engineer", "biomedical", "both"],
+        default="engineer",
+        help="cleaned XLSX profile passed to main.py: engineer, biomedical, or both.",
+    )
+    parser.add_argument(
         "--only",
         nargs="+",
         default=None,
@@ -171,6 +177,8 @@ def build_command(
         args.ki67_backend,
         "--feature_backend",
         args.feature_backend,
+        "--xlsx-version",
+        args.xlsx_version,
     ]
     if args.fluor_analy:
         cmd.append("--fluor_analy")

@@ -6,6 +6,8 @@ import cv2
 import numpy as np
 import pandas as pd
 from skimage.feature import graycomatrix, graycoprops
+from scipy.ndimage import distance_transform_edt
+from skimage.measure import regionprops
 
 from ki67dtc.cell_anal import (
     _advanced_texture_feature_values_python,
@@ -50,12 +52,17 @@ class PythonFeatureBackendTest(unittest.TestCase):
         minor = float(min(ellipse_axes))
         eccentricity = float(np.sqrt(max(0.0, 1.0 - (minor / major) ** 2)))
         expected_compactness = float(
-            np.mean(
+            2.0
+            * np.pi
+            * np.mean(
                 (y_coords.astype(float) - y_centroid) ** 2
                 + (x_coords.astype(float) - x_centroid) ** 2
             )
             / area
         )
+        region = regionprops(mask.astype(np.uint8))[0]
+        distance = distance_transform_edt(np.pad(mask_bool, 1))[1:-1, 1:-1]
+        radius_values = distance[mask_bool]
 
         self.assertEqual(measurement["area"], area)
         self.assertAlmostEqual(measurement["x_centroid"], x_centroid)
@@ -68,6 +75,14 @@ class PythonFeatureBackendTest(unittest.TestCase):
         self.assertAlmostEqual(measurement["minferet"], minor)
         self.assertAlmostEqual(measurement["eccentricity"], eccentricity)
         self.assertAlmostEqual(geometry["compactness"], expected_compactness)
+        self.assertAlmostEqual(geometry["extent"], region.extent)
+        self.assertAlmostEqual(geometry["major_axis_length"], region.axis_major_length)
+        self.assertAlmostEqual(geometry["minor_axis_length"], region.axis_minor_length)
+        self.assertAlmostEqual(geometry["maximum_radius"], radius_values.max())
+        self.assertAlmostEqual(geometry["mean_radius"], radius_values.mean())
+        self.assertAlmostEqual(geometry["median_radius"], np.median(radius_values))
+        self.assertAlmostEqual(geometry["perimeter_area_ratio"], perimeter / area)
+        self.assertAlmostEqual(geometry["solidity"], region.solidity)
         self.assertAlmostEqual(
             geometry["circularity"],
             2.0 * np.sqrt(np.pi * area) / perimeter**2,
@@ -263,6 +278,14 @@ class PythonFeatureBackendTest(unittest.TestCase):
                 "Mean",
                 "GLCM Contrast",
                 "Compactness",
+                "Extent",
+                "Major Axis Length",
+                "Minor Axis Length",
+                "Maximum Radius",
+                "Mean Radius",
+                "Median Radius",
+                "Perimeter/Area Ratio",
+                "Solidity",
                 "LBP Entropy",
                 "LBP Uniform R3 Hist Bin 09",
                 "Tamura Coarseness",

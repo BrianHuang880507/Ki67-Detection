@@ -29,6 +29,7 @@ from ki67dtc.utils.io import (
     merge_all_final_csvs,
     generate_image_mapping,
 )
+from ki67dtc.workbook_export import export_cleaned_workbook
 
 _PYIMAGEJ = None
 
@@ -825,7 +826,94 @@ def _empty_imagej_measurements() -> dict[str, float]:
         "round": np.nan,
         "circ": np.nan,
         "convex_perimeter": np.nan,
+        "extent": np.nan,
+        "paper_major": np.nan,
+        "paper_minor": np.nan,
+        "maximum_radius": np.nan,
+        "mean_radius": np.nan,
+        "median_radius": np.nan,
+        "solidity": np.nan,
+        "paper_compactness": np.nan,
     }
+
+
+def _paper_shape_measurements(roi_mask: np.ndarray | None) -> dict[str, float]:
+    """計算論文使用的 CellProfiler 相容形狀特徵。
+
+    Args:
+        roi_mask: ROI 布林遮罩；空遮罩會回傳全缺值。
+
+    Returns:
+        Extent、主次軸、三種內切半徑、Solidity 與 Compactness。
+
+    Notes:
+        半徑依 CellProfiler 定義，為每個物件像素到最近背景像素的距離，
+        並非形心到邊界的距離。Compactness 採 CellProfiler 的
+        ``2π × 平均形心平方距離 / 面積``。
+    """
+    from scipy.ndimage import distance_transform_edt
+    from skimage.measure import regionprops
+
+    out = {
+        "extent": np.nan,
+        "paper_major": np.nan,
+        "paper_minor": np.nan,
+        "maximum_radius": np.nan,
+        "mean_radius": np.nan,
+        "median_radius": np.nan,
+        "solidity": np.nan,
+        "paper_compactness": np.nan,
+    }
+    if roi_mask is None:
+        return out
+
+    full_mask = np.asarray(roi_mask, dtype=bool)
+    if full_mask.ndim != 2 or not np.any(full_mask):
+        return out
+
+    full_y, full_x = np.nonzero(full_mask)
+    mask = full_mask[
+        int(full_y.min()) : int(full_y.max()) + 1,
+        int(full_x.min()) : int(full_x.max()) + 1,
+    ]
+    properties = regionprops(mask.astype(np.uint8))
+    if not properties:
+        return out
+    region = properties[0]
+
+    #補零可讓接觸影像邊緣的 ROI 也有明確的外部背景像素。
+    padded_mask = np.pad(mask, 1, mode="constant", constant_values=False)
+    distance = distance_transform_edt(padded_mask)[1:-1, 1:-1]
+    radius_values = distance[mask]
+
+    y_coords, x_coords = np.nonzero(mask)
+    y_centroid = float(np.mean(y_coords))
+    x_centroid = float(np.mean(x_coords))
+    area = float(region.area)
+    mean_squared_radius = float(
+        np.mean(
+            (y_coords.astype(np.float64) - y_centroid) ** 2
+            + (x_coords.astype(np.float64) - x_centroid) ** 2
+        )
+    )
+
+    out.update(
+        {
+            "extent": float(region.extent),
+            "paper_major": float(region.axis_major_length),
+            "paper_minor": float(region.axis_minor_length),
+            "maximum_radius": float(np.max(radius_values)),
+            "mean_radius": float(np.mean(radius_values)),
+            "median_radius": float(np.median(radius_values)),
+            "solidity": float(region.solidity),
+            "paper_compactness": (
+                float(2.0 * math.pi * mean_squared_radius / area)
+                if area > 0
+                else np.nan
+            ),
+        }
+    )
+    return out
 
 
 def _histogram_entropy(values: np.ndarray, bins: int = 256) -> float:
@@ -963,17 +1051,7 @@ def _measure_roi_with_python(
         and perimeter > 0
         else np.nan
     )
-    compactness = (
-        float(
-            np.mean(
-                (y_coords.astype(np.float64) - y_centroid) ** 2
-                + (x_coords.astype(np.float64) - x_centroid) ** 2
-            )
-            / area
-        )
-        if area > 0
-        else np.nan
-    )
+    paper_shape = _paper_shape_measurements(mask)
 
     out.update(
         {
@@ -990,8 +1068,9 @@ def _measure_roi_with_python(
             "circ": circularity,
             "sphericity": sphericity,
             "roughness": roughness,
-            "compactness": compactness,
+            "compactness": paper_shape["paper_compactness"],
             "convex_perimeter": convex_perimeter,
+            **paper_shape,
         }
     )
     return out
@@ -1849,7 +1928,11 @@ def _measure_roi_with_imagej(
             "output_path": str(out_path),
         },
     )
-    return _read_kv_measurements(out_path)
+    measurements = _read_kv_measurements(out_path)
+    paper_shape = _paper_shape_measurements(roi_mask)
+    measurements.update(paper_shape)
+    measurements["compactness"] = paper_shape["paper_compactness"]
+    return measurements
 
 
 def _make_edge_signal_with_imagej(ij: Any, signal_path: Path, temp_dir: Path) -> Path:
@@ -2575,6 +2658,8 @@ def _geometry_from_measurements(m: dict[str, float]) -> dict[str, float]:
     eccentricity = m.get("eccentricity", np.nan)
     roughness = m.get("roughness", np.nan)
     compactness = m.get("compactness", np.nan)
+    paper_major = m.get("paper_major", np.nan)
+    paper_minor = m.get("paper_minor", np.nan)
 
     if (
         np.isnan(aspect_ratio)
@@ -2617,6 +2702,14 @@ def _geometry_from_measurements(m: dict[str, float]) -> dict[str, float]:
         "circular_diameter": circular_diameter,
         "feret_length": m["feret"],
         "feret_width": m["minferet"],
+        "extent": m.get("extent", np.nan),
+        "major_axis_length": paper_major,
+        "minor_axis_length": paper_minor,
+        "maximum_radius": m.get("maximum_radius", np.nan),
+        "mean_radius": m.get("mean_radius", np.nan),
+        "median_radius": m.get("median_radius", np.nan),
+        "perimeter_area_ratio": _safe_divide(perimeter, area),
+        "solidity": m.get("solidity", np.nan),
         "aspect_ratio": aspect_ratio,
         "eccentricity": eccentricity,
         "roundness": roundness,
@@ -2712,12 +2805,21 @@ def _empty_geometry() -> dict[str, float]:
         "circular_diameter": np.nan,
         "feret_length": np.nan,
         "feret_width": np.nan,
+        "extent": np.nan,
+        "major_axis_length": np.nan,
+        "minor_axis_length": np.nan,
+        "maximum_radius": np.nan,
+        "mean_radius": np.nan,
+        "median_radius": np.nan,
+        "perimeter_area_ratio": np.nan,
+        "solidity": np.nan,
         "aspect_ratio": np.nan,
         "eccentricity": np.nan,
         "roundness": np.nan,
         "circularity": np.nan,
         "sphericity": np.nan,
         "roughness": np.nan,
+        "compactness": np.nan,
         "x_centroid": np.nan,
         "y_centroid": np.nan,
     }
@@ -3649,6 +3751,14 @@ def param_anal(
                         nuc_g["circular_diameter"],
                         nuc_g["feret_length"],
                         nuc_g["feret_width"],
+                        nuc_g["extent"],
+                        nuc_g["major_axis_length"],
+                        nuc_g["minor_axis_length"],
+                        nuc_g["maximum_radius"],
+                        nuc_g["mean_radius"],
+                        nuc_g["median_radius"],
+                        nuc_g["perimeter_area_ratio"],
+                        nuc_g["solidity"],
                         nuc_g["aspect_ratio"],
                         nuc_g["eccentricity"],
                         nuc_g["roundness"],
@@ -3672,6 +3782,14 @@ def param_anal(
                         cyto_g["circular_diameter"],
                         cyto_g["feret_length"],
                         cyto_g["feret_width"],
+                        cyto_g["extent"],
+                        cyto_g["major_axis_length"],
+                        cyto_g["minor_axis_length"],
+                        cyto_g["maximum_radius"],
+                        cyto_g["mean_radius"],
+                        cyto_g["median_radius"],
+                        cyto_g["perimeter_area_ratio"],
+                        cyto_g["solidity"],
                         cyto_g["aspect_ratio"],
                         cyto_g["eccentricity"],
                         cyto_g["roundness"],
@@ -3696,6 +3814,14 @@ def param_anal(
             "Circular Diameter",
             "Feret Length",
             "Feret Width",
+            "Extent",
+            "Major Axis Length",
+            "Minor Axis Length",
+            "Maximum Radius",
+            "Mean Radius",
+            "Median Radius",
+            "Perimeter/Area Ratio",
+            "Solidity",
             "Aspect Ratio",
             "Eccentricity",
             "Roundness",
@@ -4309,6 +4435,7 @@ def run_all(
     ki67_backend: str = "pyimagej",
     feature_backend: str = "pyimagej",
     clean_temp: bool = True,
+    xlsx_profile: str | None = None,
 ) -> None:
     """執行主流程的幾何、螢光與 Ki67 分析。
 
@@ -4319,6 +4446,9 @@ def run_all(
         ki67_backend (str, optional): Ki67 二值化後端。
         feature_backend (str, optional): 特徵提取後端。
         clean_temp (bool, optional): 是否清理暫存檔。
+        xlsx_profile (str | None, optional): cleaned CSV 的工作簿版本；可為
+            ``engineer``、``biomedical``、``both``，或 ``None`` 表示不輸出
+            XLSX。
 
     Returns:
         None: 此函式僅負責輸出檔案。
@@ -4537,7 +4667,16 @@ def run_all(
 
         add_outline_status_column(final_csv, outlines_txt, pc_img)
 
-    merge_all_final_csvs(data_path)
+    cleaned_csv = merge_all_final_csvs(data_path)
+    if cleaned_csv is not None and xlsx_profile is not None:
+        profiles = (
+            ("engineer", "biomedical")
+            if xlsx_profile == "both"
+            else (xlsx_profile,)
+        )
+        for profile in profiles:
+            workbook_path = export_cleaned_workbook(cleaned_csv, profile)
+            print(f"[INFO] 已輸出 cleaned 工作簿：{workbook_path}")
 
     if clean_temp:
         remove_temp_files(analy_dir)

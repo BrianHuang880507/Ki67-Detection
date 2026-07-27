@@ -4,12 +4,10 @@ from typing import Callable, Optional, Sequence
 
 import numpy as np
 
-from .img_prep import segment_all, mask2txt_all, combined
-from .cell_anal import run_all
 from .cell_anal_plot import plot_global_area_analysis
 from .paired_overlay import PairedOverlayData, collect_paired_overlay_data
 from .utils.io import output_dir
-
+from .workbook_export import WorkbookProfile, workbook_output_path
 
 ProgressCallback = Callable[[int, int, str], None]
 
@@ -23,6 +21,7 @@ class PipelineResult:
     results_dir: Path | None = None
     area_scatter_plot: Path | None = None
     area_histogram_plot: Path | None = None
+    workbook_path: Path | None = None
     paired_overlays: dict[str, PairedOverlayData] = field(default_factory=dict)
 
 
@@ -94,16 +93,30 @@ def run_pipeline(
     clean_temp: bool = True,
     width_um_per_px: float = 1.5896,
     height_um_per_px: float = 1.5876,
+    xlsx_profile: WorkbookProfile = "biomedical",
     progress_callback: Optional[ProgressCallback] = None,
 ) -> PipelineResult:
-    """高階 pipeline 入口，給 GUI 或其他程式呼叫使用。
+    """執行 GUI 使用的完整影像分析流程。
 
-    依序執行：
-    1. segmentation (cyto & nuc)
-    2. segmentation npy -> outlines txt
-    3. 合併 nucleus 與 cytoplasm outlines
-    4. 幾何參數與螢光/陽性分析
+    Args:
+        data_folder: 輸入資料集資料夾。
+        nuc_source: 細胞核分割來源，可為 ``dapi`` 或 ``pc``。
+        fluor_analy: 是否執行螢光分析。
+        ki67: 是否執行 Ki67 判定。
+        ki67_backend: Ki67 二值化後端。
+        feature_backend: 特徵提取後端。
+        clean_temp: 是否清理中間暫存檔。
+        width_um_per_px: 影像寬度方向的像素比例。
+        height_um_per_px: 影像高度方向的像素比例。
+        xlsx_profile: cleaned XLSX 版本；GUI 預設為 ``biomedical``。
+        progress_callback: 接收完成步驟、總步驟與訊息的回呼函式。
+
+    Returns:
+        Pipeline 輸出路徑與影像清單。
     """
+
+    from .cell_anal import run_all
+    from .img_prep import combined, mask2txt_all, segment_all
 
     data_folder = _resolve_data_folder(Path(data_folder))
     image_files = _list_display_image_files(data_folder)
@@ -147,6 +160,7 @@ def run_pipeline(
         ki67_backend=ki67_backend,
         feature_backend=feature_backend,
         clean_temp=clean_temp,
+        xlsx_profile=xlsx_profile,
     )
     current_step += 1
 
@@ -154,7 +168,11 @@ def run_pipeline(
     cleaned_csv = results_dir / f"{data_folder.name}_cleaned.csv"
     area_scatter_plot: Path | None = None
     area_histogram_plot: Path | None = None
+    workbook_path: Path | None = None
     if cleaned_csv.exists():
+        candidate_workbook = workbook_output_path(cleaned_csv, xlsx_profile)
+        if candidate_workbook.exists():
+            workbook_path = candidate_workbook
         area_scatter_plot, area_histogram_plot = plot_global_area_analysis(
             cleaned_csv,
             results_dir,
@@ -172,6 +190,7 @@ def run_pipeline(
         results_dir=results_dir,
         area_scatter_plot=area_scatter_plot,
         area_histogram_plot=area_histogram_plot,
+        workbook_path=workbook_path,
         paired_overlays=paired_overlays,
     )
 

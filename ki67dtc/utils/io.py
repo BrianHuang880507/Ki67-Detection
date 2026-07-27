@@ -283,12 +283,15 @@ def merge_with_flour(
     merged.to_csv(output_csv, index=False)
 
 
-def merge_all_final_csvs(input_dir: Union[str, Path]):
-    """
-    合併某資料夾內所有 *_final.csv 為一個 CSV 檔。
-    - 會在每筆資料中加入 'Image' 欄位標記來源影像
-    - 會清除任一 `_nuc` 或 `_cyto` 欄位缺值的列，避免殘缺紀錄
-    - 輸出為 {input_dir.name}_final.csv
+def merge_all_final_csvs(input_dir: Union[str, Path]) -> Path | None:
+    """合併某資料夾內所有 ``*_final.csv`` 為 cleaned CSV。
+
+    Args:
+        input_dir: 原始資料集資料夾。
+
+    Returns:
+        建立的 ``<folder_name>_cleaned.csv`` 路徑；找不到 final CSV 時回傳
+        ``None``。
     """
     input_dir = Path(input_dir)
     result_dir = output_dir(input_dir, "results")
@@ -296,7 +299,7 @@ def merge_all_final_csvs(input_dir: Union[str, Path]):
 
     if not final_files:
         print(f"[WARN] 找不到 *_final.csv 於 {input_dir}")
-        return
+        return None
 
     all_dfs = []
     for file in final_files:
@@ -336,6 +339,7 @@ def merge_all_final_csvs(input_dir: Union[str, Path]):
     output_path = result_dir / f"{input_dir.name}_cleaned.csv"
     merged_df.to_csv(output_path, index=False)
     print(f"[INFO] 已合併 {len(final_files)} 個檔案 → {output_path}")
+    return output_path
 
 
 def generate_image_mapping(

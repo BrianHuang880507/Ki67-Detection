@@ -101,7 +101,7 @@ Ki67-Detection/
 │       ├── segment/<資料集>/        # Cellpose 分割遮罩
 │       ├── outline/<資料集>/        # 細胞質、細胞核、合併輪廓 txt
 │       ├── binary/<資料集>/         # Ki67 二值化遮罩與陽性標記
-│       ├── results/<資料集>/        # 每張影像 final CSV 與 <資料集>_cleaned.csv
+│       ├── results/<資料集>/        # final CSV、cleaned CSV 與分群 XLSX
 │       ├── train
 │       │     └──ki67_pred/
 │       │        └──model/           # 訓練後模型輸出檔
@@ -155,6 +155,16 @@ python main.py --data_folder data/input/example_data --nuc_source dapi --ki67_ba
 - `--ki67_backend`：Ki67 二值化後端，可用 `pyimagej` 或 `opencv`。
 - `--feature_backend`：特徵提取後端，可用 `pyimagej` 或 `python`。`python` 特徵提取本身不會啟動 JVM。
 - `--clean_temp`：清理中間暫存檔。
+- `--xlsx-version`：cleaned XLSX 版本，可用 `engineer`、`biomedical` 或 `both`；CLI
+  預設為 `engineer`。
+
+cleaned CSV 會依版本產生下列檔名：
+
+- 生醫版：`<資料集>_cleaned.xlsx`
+- 工程版：`<資料集>_cleaned_se.xlsx`
+
+此設定只套用在合併後的 `<資料集>_cleaned.csv`；每張影像原有的
+`*_final.csv` 產生方式與檔名不變。
 
 純 Python 特徵提取：
 
@@ -214,6 +224,8 @@ python app.py
 - `分析選項 > 螢光分析`：勾選或取消螢光強度分析。
 - `分析選項 > Ki67 分析`：勾選或取消 Ki67 陽性分析。
 - `分析選項 > 清理暫存檔案`：勾選或取消分析後清理中間檔。
+- `輸出 > 生醫版本`：輸出 `<資料集>_cleaned.xlsx`，為 GUI 預設值。
+- `輸出 > 工程版本`：輸出 `<資料集>_cleaned_se.xlsx`。
 
 畫面左側約 2/3 為主要影像顯示區，可搭配下方 overlay 勾選項檢視細胞核、
 細胞質與 Ki67 顯示狀態。右側約 1/3 分成四個區塊，依序顯示輸出主控台與

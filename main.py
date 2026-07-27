@@ -1,8 +1,6 @@
 ﻿import argparse
 from pathlib import Path
 
-from ki67dtc.cell_anal import run_all
-
 
 def run_preprocessing(data_folder: Path, nuc_source: str) -> None:
     """Run segmentation and outline preparation."""
@@ -21,8 +19,12 @@ def run_preprocessing(data_folder: Path, nuc_source: str) -> None:
     combined(data_folder)
 
 
-def main() -> None:
-    """解析命令列參數並執行 Ki67 影像分析主流程。"""
+def build_parser() -> argparse.ArgumentParser:
+    """建立主流程命令列解析器。
+
+    Returns:
+        設定完成的 ``ArgumentParser``。
+    """
     parser = argparse.ArgumentParser(description="細胞影像分析 Pipeline")
     parser.add_argument(
         "--data_folder", type=str, required=True, help="輸入資料夾名稱或路徑"
@@ -51,6 +53,23 @@ def main() -> None:
         help="特徵提取方法（預設 pyimagej）",
     )
     parser.add_argument("--clean_temp", action="store_true", help="是否清理暫存資料")
+    parser.add_argument(
+        "--xlsx-version",
+        "--xlsx_version",
+        dest="xlsx_version",
+        choices=["engineer", "biomedical", "both"],
+        default="engineer",
+        help=(
+            "cleaned CSV 的 XLSX 版本：engineer 產生 *_cleaned_se.xlsx；"
+            "biomedical 產生 *_cleaned.xlsx；both 同時產生兩者（預設 engineer）"
+        ),
+    )
+    return parser
+
+
+def main() -> None:
+    """解析命令列參數並執行 Ki67 影像分析主流程。"""
+    parser = build_parser()
 
     args = parser.parse_args()
 
@@ -92,12 +111,15 @@ def main() -> None:
     print(f"[資訊] Ki67 backend：{args.ki67_backend}")
     print(f"[資訊] Feature backend：{args.feature_backend}")
     print(f"[資訊] 清理暫存檔：{args.clean_temp}")
+    print(f"[資訊] XLSX 版本：{args.xlsx_version}")
     print("=" * 50)
 
     run_preprocessing(data_folder, args.nuc_source)
 
     # Step 4: geometry & intensity analysis
     print("\n[STEP 4] 幾何參數與螢光/陽性分析")
+    from ki67dtc.cell_anal import run_all
+
     run_all(
         data_folder,
         fluor_analy=args.fluor_analy,
@@ -105,6 +127,7 @@ def main() -> None:
         ki67_backend=args.ki67_backend,
         feature_backend=args.feature_backend,
         clean_temp=args.clean_temp,
+        xlsx_profile=args.xlsx_version,
     )
 
     print("\n[資訊] Pipeline 完成！請檢查輸出結果。")

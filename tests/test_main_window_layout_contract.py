@@ -32,6 +32,26 @@ class MainWindowLayoutContractTest(unittest.TestCase):
 
         self.assertIn("檔案", menu_titles)
         self.assertIn("分析選項", menu_titles)
+        self.assertIn("輸出", menu_titles)
+
+    def test_export_menu_defaults_to_biomedical_and_exposes_two_profiles(self) -> None:
+        actions = self.window.export_profile_actions
+
+        self.assertEqual(
+            [(action.text(), action.data()) for action in actions],
+            [("生醫版本", "biomedical"), ("工程版本", "engineer")],
+        )
+        self.assertTrue(actions[0].isChecked())
+        self.assertFalse(actions[1].isChecked())
+        self.assertEqual(self.window._xlsx_profile, "biomedical")
+
+    def test_export_menu_can_switch_to_engineer_profile(self) -> None:
+        engineer_action = self.window.export_profile_actions[1]
+        engineer_action.setChecked(True)
+
+        self.window._on_export_profile_changed()
+
+        self.assertEqual(self.window._xlsx_profile, "engineer")
 
     def test_file_menu_exposes_open_action(self) -> None:
         self.assertEqual(self.window.action_open_input.text(), "開啟")
