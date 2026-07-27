@@ -46,6 +46,8 @@ cell_outlines/
 ki67_contours/
 predict_regenerated/
 pasted-text.txt
+analysis/output/training/
+outputs/
 
 # Temporary scripts
 scripts/batch_total_cell_mask_pyimagej.py

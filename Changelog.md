@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026.07.27
+
+  * GUI 對齊 SegUI 的 Paired Only 顯示，使用細胞核中心點配對細胞質；
+    顯示層只呈現有效核質配對，並保留 outline fallback。
+  * 將分割後的小面積過濾改為配對感知流程：優先以高可信配對 ROI
+    計算面積中位數、保留所有已配對的小 ROI，只移除低於門檻的未配對物件。
+  * 擴充 CellProfiler 相容形狀特徵，加入 Extent、主次軸、半徑統計、
+    Perimeter/Area Ratio、Solidity 與 Compactness，並同步更新輸出欄位與訓練特徵。
+  * 新增 B4 p6 morphology → IDO response proxy 探索流程，包含資料配對、
+    image-level 彙整、repeated CV、leave-one-condition-out、dose-response AUC
+    與結果報告。
+
+## 2026.07.15
+
+  * 新增 cleaned CSV 的工程版／生醫版 XLSX 匯出，分別命名為
+    `<資料集>_cleaned_se.xlsx` 與 `<資料集>_cleaned.xlsx`。
+  * CLI 新增 `--xlsx-version`，預設輸出工程版；GUI 新增「輸出」選單，
+    預設輸出生醫版。
+  * 新版工作簿只套用於合併後的 `*_cleaned.csv`，每張影像的
+    `*_final.csv` 維持既有流程與命名。
+
 ## 2026.07.10
 
   * 將 Python feature backend 的 ROI 幾何量測改為 OpenCV，並將 GLCM 灰階層數由 256 降為 64；同批合成 ROI 實測幾何由 10.907 降至 0.140 ms/cell（77.8×），材質由 23.641 降至 1.442 ms/cell（16.4×）。
