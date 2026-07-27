@@ -1,0 +1,41 @@
+experiment_name: b4_p6_morphology_to_ido_proxy
+
+dataset:
+  input_dir: "data/input/B4  p6"
+  expected_triplets: 80
+  expected_conditions:
+    "0,0": 9
+    "0,25": 10
+    "0,50": 10
+    "25,0": 9
+    "25,25": 12
+    "25,50": 12
+    "50,0": 9
+    "100,0": 9
+
+segmentation:
+  enabled: true
+  force: false
+  nuc_source: dapi
+  cellprob_threshold: 0.0
+  min_area_ratio: 0.15
+  min_area_floor: 30
+
+analysis:
+  output_dir: immunity/outputs/b4_p6
+  feature_source: cleaned_csv
+  cleaned_csv: "data/output/results/B4  p6/B4  p6_cleaned.csv"
+  min_cells_per_image: 3
+  max_nucleus_outside_fraction: 0.05
+
+modeling:
+  outer_splits: 5
+  inner_splits: 3
+  seeds: [42, 314, 2026]
+  loco_seed: 42
+  final_seed: 42
+  ridge_alphas: [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
+  elasticnet_alphas: [0.001, 0.01, 0.1, 1.0]
+  elasticnet_l1_ratios: [0.1, 0.5, 0.9]
+  elasticnet_max_iter: 50000
+  n_jobs: 1
