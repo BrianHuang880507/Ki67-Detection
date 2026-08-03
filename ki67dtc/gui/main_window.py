@@ -961,6 +961,7 @@ class MainWindow(QMainWindow):
         data_folder = Path(path_text)
         self._paired_only_preference = True
         self._set_paired_only_control_availability(False)
+        self._update_display_pixmap()
 
         self._pipeline_thread = PipelineThread(
             data_folder,
@@ -995,6 +996,7 @@ class MainWindow(QMainWindow):
             self._pipeline_thread.wait()
             self._show_status_message("Pipeline 已中止")
             self._set_running_state(False)
+            self._restore_paired_only_control_availability()
 
     def _on_reset_clicked(self) -> None:
         """重設 UI 狀態、影像清單、結果表與 overlay。"""
@@ -1106,6 +1108,7 @@ class MainWindow(QMainWindow):
     def _on_pipeline_failed(self, message: str) -> None:
         """處理 pipeline 失敗訊息並恢復 Run 按鈕。"""
         self._set_running_state(False)
+        self._restore_paired_only_control_availability()
         self._show_status_message(f"錯誤：{message}")
 
         self._append_terminal_line("ERROR", message)
@@ -1662,6 +1665,26 @@ class MainWindow(QMainWindow):
 
         if notify and not available:
             self._show_status_message("缺少完整 segmentation 資料，僅能顯示核質配對")
+
+    def _restore_paired_only_control_availability(self) -> None:
+        """依目前影像保留的 regions 或完整 masks 恢復控制項 availability。"""
+        image_path = self._current_image_path()
+        paired_data = (
+            self._paired_overlay_data_for_image(image_path)
+            if image_path is not None
+            else None
+        )
+        masks = (
+            self._current_overlay_masks.get(image_path)
+            if image_path is not None
+            else None
+        )
+        has_complete_masks = (
+            masks is not None and masks[0] is not None and masks[1] is not None
+        )
+        self._set_paired_only_control_availability(
+            paired_data is not None or has_complete_masks
+        )
 
     def _load_images_from_folder(self, raw_folder: Path) -> None:
         """從使用者選擇的資料夾載入影像列表（不跑 pipeline）。"""

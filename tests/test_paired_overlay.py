@@ -19,6 +19,52 @@ from ki67dtc.paired_overlay import (
 
 
 class PairedOverlayTest(unittest.TestCase):
+    def test_paired_renderer_preserves_pair_interleaved_overlap_order(self) -> None:
+        base = np.full((13, 13, 3), 120, dtype=np.uint8)
+        cytoplasm_mask = np.zeros((13, 13), dtype=np.int32)
+        cytoplasm_mask[1:12, 1:12] = 1
+        nucleus_mask = np.zeros_like(cytoplasm_mask)
+        nucleus_mask[3:6, 3:6] = 1
+        nucleus_mask[7:10, 7:10] = 2
+
+        data = build_paired_overlay_data(cytoplasm_mask, nucleus_mask)
+        rendered = render_paired_overlay_bgr(base, data, alpha=1.0)
+
+        self.assertEqual(len(data.pairs), 2)
+        np.testing.assert_array_equal(rendered[4, 4], np.array([0, 255, 0]))
+        np.testing.assert_array_equal(rendered[8, 8], np.array([240, 0, 0]))
+
+    def test_saved_overlay_preserves_pair_interleaved_overlap_order(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            image_dir = root / "data" / "input" / "demo" / "PC"
+            results_dir = root / "data" / "output" / "results" / "demo"
+            image_dir.mkdir(parents=True)
+            image_path = image_dir / "sample.png"
+            base = np.full((13, 13, 3), 120, dtype=np.uint8)
+            self.assertTrue(cv2.imwrite(str(image_path), base))
+
+            cytoplasm_mask = np.zeros((13, 13), dtype=np.int32)
+            cytoplasm_mask[1:12, 1:12] = 1
+            nucleus_mask = np.zeros_like(cytoplasm_mask)
+            nucleus_mask[3:6, 3:6] = 1
+            nucleus_mask[7:10, 7:10] = 2
+            data = build_paired_overlay_data(cytoplasm_mask, nucleus_mask)
+            result = PipelineResult(
+                data_folder=root / "data" / "input" / "demo",
+                image_files=[image_path],
+                results_dir=results_dir,
+                paired_overlays={image_path.stem: data},
+            )
+
+            saved_paths = save_pipeline_fill_overlays(result, alpha=1.0)
+
+            saved = cv2.imread(str(saved_paths[0]), cv2.IMREAD_COLOR)
+            self.assertIsNotNone(saved)
+            assert saved is not None
+            np.testing.assert_array_equal(saved[4, 4], np.array([0, 255, 0]))
+            np.testing.assert_array_equal(saved[8, 8], np.array([240, 0, 0]))
+
     def test_all_regions_are_cached_and_rendered_without_mutating_inputs(self) -> None:
         base = np.full((12, 14, 3), 120, dtype=np.uint8)
         cytoplasm_mask = np.zeros((12, 14), dtype=np.int32)

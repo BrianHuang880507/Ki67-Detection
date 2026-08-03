@@ -133,14 +133,15 @@ def build_paired_overlay_data(
     cytoplasm_mask: np.ndarray,
     nucleus_mask: np.ndarray,
 ) -> PairedOverlayData:
-    """從完整 label masks 建立輕量化 Paired Only 顯示資料。
+    """從完整 label masks 建立配對與全部 segmentation 顯示資料。
 
     Args:
         cytoplasm_mask: 細胞質 label mask。
         nucleus_mask: 細胞核 label mask。
 
     Returns:
-        可供 GUI 與 PNG 輸出共用的配對區域資料。
+        可供 GUI 與 PNG 輸出共用的 ``PairedOverlayData``，包含配對與
+        全部 segmentation regions 及數量統計。
     """
     cytoplasm_mask = np.asarray(cytoplasm_mask)
     nucleus_mask = np.asarray(nucleus_mask)
@@ -261,14 +262,43 @@ def render_paired_overlay_bgr(
     Raises:
         ValueError: 原圖格式或透明度不合法時拋出。
     """
-    return _render_regions_overlay_bgr(
-        base_bgr,
-        [pair.cytoplasm for pair in data.pairs],
-        [pair.nucleus for pair in data.pairs],
-        show_nucleus=show_nucleus,
-        show_cytoplasm=show_cytoplasm,
-        alpha=alpha,
-    )
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError("alpha 必須介於 0 與 1 之間")
+    if base_bgr.ndim != 3 or base_bgr.shape[2] != 3:
+        raise ValueError("base_bgr 必須是三通道 BGR 影像")
+
+    overlay = base_bgr.copy()
+    color_layer = np.zeros_like(overlay)
+    paint_mask = np.zeros(overlay.shape[:2], dtype=bool)
+    palette_bgr = tuple((blue, green, red) for red, green, blue in _PALETTE_RGB)
+    nucleus_fill_bgr = (240, 0, 0)
+
+    for index, pair in enumerate(data.pairs):
+        if show_cytoplasm:
+            _paint_region(
+                color_layer,
+                paint_mask,
+                pair.cytoplasm,
+                palette_bgr[index % len(palette_bgr)],
+            )
+        if show_nucleus:
+            _paint_region(
+                color_layer,
+                paint_mask,
+                pair.nucleus,
+                nucleus_fill_bgr,
+            )
+
+    overlay[paint_mask] = (
+        alpha * color_layer[paint_mask] + (1.0 - alpha) * overlay[paint_mask]
+    ).astype(np.uint8)
+
+    for pair in data.pairs:
+        if show_cytoplasm:
+            cv2.drawContours(overlay, pair.cytoplasm.contours, -1, (255, 190, 0), 1)
+        if show_nucleus:
+            cv2.drawContours(overlay, pair.nucleus.contours, -1, (255, 0, 0), 1)
+    return overlay
 
 
 def render_all_overlay_bgr(
@@ -330,14 +360,15 @@ def collect_paired_overlay_data(
     image_files: Sequence[Path],
     segment_dir: Path,
 ) -> dict[str, PairedOverlayData]:
-    """在 segmentation 暫存檔清理前收集各影像的配對顯示資料。
+    """在暫存檔清理前收集各影像的配對與全部 segmentation 顯示資料。
 
     Args:
         image_files: GUI 將顯示的原始影像清單。
         segment_dir: ``*_cyto_seg.npy`` 與 ``*_nuc_seg.npy`` 所在資料夾。
 
     Returns:
-        以影像 stem 為索引的記憶體配對資料；缺少任一 mask 的影像會略過。
+        以影像 stem 為索引的 ``PairedOverlayData``；每筆資料包含配對與
+        全部 segmentation regions，缺少任一 mask 的影像會略過。
     """
     collected: dict[str, PairedOverlayData] = {}
     for image_file in image_files:

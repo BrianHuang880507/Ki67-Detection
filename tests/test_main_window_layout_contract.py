@@ -29,6 +29,32 @@ class MainWindowLayoutContractTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.window.close()
 
+    def _display_all_regions_with_unpaired_data(
+        self,
+        root: Path,
+    ) -> np.ndarray:
+        """載入含未配對區域的實際影像，並切換為顯示全部 regions。"""
+        image_path = root / "sample.png"
+        base = np.full((12, 14, 3), 120, dtype=np.uint8)
+        self.assertTrue(cv2.imwrite(str(image_path), base))
+
+        cytoplasm_mask = np.zeros((12, 14), dtype=np.int32)
+        cytoplasm_mask[1:10, 1:9] = 1
+        cytoplasm_mask[1:4, 10:13] = 2
+        nucleus_mask = np.zeros_like(cytoplasm_mask)
+        nucleus_mask[4:7, 4:7] = 1
+        data = build_paired_overlay_data(cytoplasm_mask, nucleus_mask)
+        self.window._pipeline_result = PipelineResult(
+            data_folder=root,
+            image_files=[image_path],
+            paired_overlays={image_path.stem: data},
+        )
+        self.window._current_image_index = 0
+        self.window._load_image_and_overlays(image_path)
+        self.window.chk_paired_only.setChecked(False)
+        QApplication.processEvents()
+        return base
+
     def test_menu_bar_contains_file_and_analysis_options(self) -> None:
         menu_titles = [action.text() for action in self.window.menuBar().actions()]
 
@@ -557,6 +583,60 @@ class MainWindowLayoutContractTest(unittest.TestCase):
         self.assertTrue(self.window._paired_only_preference)
         self.assertTrue(self.window.chk_paired_only.isChecked())
         self.assertFalse(self.window.chk_paired_only.isEnabled())
+
+    def test_run_redraws_existing_image_as_paired_only(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            base = self._display_all_regions_with_unpaired_data(root)
+            self.assertFalse(
+                np.array_equal(
+                    self.window._current_overlay_image_array[2, 11],
+                    base[2, 11],
+                )
+            )
+            self.window.input_dir_edit.setText(str(root))
+
+            with patch("ki67dtc.gui.main_window.PipelineThread"):
+                self.window._on_run_clicked()
+
+            self.assertTrue(self.window._paired_only_preference)
+            self.assertTrue(self.window.chk_paired_only.isChecked())
+            self.assertFalse(self.window.chk_paired_only.isEnabled())
+            np.testing.assert_array_equal(
+                self.window._current_overlay_image_array[2, 11], base[2, 11]
+            )
+
+    def test_pipeline_failure_restores_paired_only_availability(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            base = self._display_all_regions_with_unpaired_data(root)
+            self.window.input_dir_edit.setText(str(root))
+            with patch("ki67dtc.gui.main_window.PipelineThread"):
+                self.window._on_run_clicked()
+
+            self.window._on_pipeline_failed("測試失敗")
+
+            self.assertTrue(self.window.chk_paired_only.isEnabled())
+            self.assertTrue(self.window.chk_paired_only.isChecked())
+            np.testing.assert_array_equal(
+                self.window._current_overlay_image_array[2, 11], base[2, 11]
+            )
+
+    def test_stopping_running_pipeline_restores_paired_only_availability(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            base = self._display_all_regions_with_unpaired_data(root)
+            self.window.input_dir_edit.setText(str(root))
+
+            with patch("ki67dtc.gui.main_window.PipelineThread"):
+                self.window._on_run_clicked()
+                self.window._on_stop_clicked()
+
+            self.assertTrue(self.window.chk_paired_only.isEnabled())
+            self.assertTrue(self.window.chk_paired_only.isChecked())
+            np.testing.assert_array_equal(
+                self.window._current_overlay_image_array[2, 11], base[2, 11]
+            )
 
 
 if __name__ == "__main__":
