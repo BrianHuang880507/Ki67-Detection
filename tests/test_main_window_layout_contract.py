@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import QApplication, QStatusBar, QToolButton
 from ki67dtc.app_pipeline import PipelineResult
 from ki67dtc.gui.main_window import MainWindow
 from ki67dtc.gui.theme import APP_QSS
+from ki67dtc.paired_overlay import build_paired_overlay_data
 
 
 class MainWindowLayoutContractTest(unittest.TestCase):
@@ -203,6 +204,14 @@ class MainWindowLayoutContractTest(unittest.TestCase):
         self.assertIs(self.window.image_file_label.parent(), self.window.image_header_widget)
         self.assertIs(self.window.chk_show_nuc.parent(), self.window.image_header_widget)
         self.assertIs(self.window.chk_show_cyto.parent(), self.window.image_header_widget)
+        self.assertIs(
+            self.window.chk_paired_only.parent(), self.window.image_header_widget
+        )
+        self.assertEqual(self.window.chk_paired_only.objectName(), "pairedOnlyCheck")
+        self.assertEqual(self.window.chk_paired_only.text(), "僅顯示核質配對")
+        self.assertTrue(self.window.chk_paired_only.isChecked())
+        self.assertFalse(self.window.chk_paired_only.isEnabled())
+        self.assertTrue(self.window._paired_only_preference)
         self.assertIs(self.window.chk_show_ki67.parent(), self.window.image_header_widget)
         self.assertIs(self.window.alpha_slider.parent(), self.window.image_header_widget)
 
@@ -432,6 +441,108 @@ class MainWindowLayoutContractTest(unittest.TestCase):
             self.assertIsNotNone(nuc_loaded)
             self.assertIsNotNone(cyto_loaded)
             self.assertFalse(np.array_equal(self.window._current_overlay_image_array, base))
+            self.assertTrue(self.window.chk_paired_only.isEnabled())
+            self.assertIn(image_path.stem, self.window._pipeline_result.paired_overlays)
+
+    def test_paired_only_checkbox_switches_display_without_starting_pipeline(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            image_path = Path(tmp_dir) / "sample.png"
+            base = np.full((12, 14, 3), 120, dtype=np.uint8)
+            self.assertTrue(cv2.imwrite(str(image_path), base))
+
+            cyto_mask = np.zeros((12, 14), dtype=np.int32)
+            cyto_mask[1:10, 1:9] = 1
+            cyto_mask[1:4, 10:13] = 2
+            nuc_mask = np.zeros_like(cyto_mask)
+            nuc_mask[4:6, 4:6] = 1
+            data = build_paired_overlay_data(cyto_mask, nuc_mask)
+            self.window._pipeline_result = PipelineResult(
+                data_folder=Path(tmp_dir),
+                image_files=[image_path],
+                paired_overlays={image_path.stem: data},
+            )
+            self.window._current_image_index = 0
+
+            self.window._load_image_and_overlays(image_path)
+            self.window._update_display_pixmap()
+            paired = self.window._current_overlay_image_array.copy()
+            self.window._selected_cell_id = "sample_1"
+            self.window._highlight_enabled = True
+
+            self.window.chk_paired_only.setChecked(False)
+            QApplication.processEvents()
+            all_regions = self.window._current_overlay_image_array
+
+            self.assertTrue(self.window.chk_paired_only.isEnabled())
+            self.assertFalse(self.window._paired_only_preference)
+            np.testing.assert_array_equal(paired[2, 11], base[2, 11])
+            self.assertFalse(np.array_equal(all_regions[2, 11], base[2, 11]))
+            self.assertTrue(self.window._highlight_enabled)
+            self.assertEqual(self.window._selected_cell_id, "sample_1")
+            self.assertIsNone(self.window._pipeline_thread)
+
+    def test_missing_full_data_forces_paired_only_and_restores_preference(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            available_path = root / "available.png"
+            missing_path = root / "missing.png"
+            base = np.full((12, 14, 3), 120, dtype=np.uint8)
+            self.assertTrue(cv2.imwrite(str(available_path), base))
+            self.assertTrue(cv2.imwrite(str(missing_path), base))
+
+            cyto_mask = np.zeros((12, 14), dtype=np.int32)
+            cyto_mask[1:10, 1:9] = 1
+            nuc_mask = np.zeros_like(cyto_mask)
+            nuc_mask[4:6, 4:6] = 1
+            data = build_paired_overlay_data(cyto_mask, nuc_mask)
+            self.window._pipeline_result = PipelineResult(
+                data_folder=root,
+                image_files=[available_path, missing_path],
+                paired_overlays={available_path.stem: data},
+            )
+
+            self.window._current_image_index = 0
+            self.window._load_image_and_overlays(available_path)
+            self.window.chk_paired_only.setChecked(False)
+            self.window._current_image_index = 1
+            self.window._load_image_and_overlays(missing_path)
+
+            self.assertFalse(self.window.chk_paired_only.isEnabled())
+            self.assertTrue(self.window.chk_paired_only.isChecked())
+            self.assertFalse(self.window._paired_only_preference)
+            self.assertIn("僅能顯示核質配對", self.window._last_status_message)
+
+            self.window._current_image_index = 0
+            self.window._load_image_and_overlays(available_path)
+
+            self.assertTrue(self.window.chk_paired_only.isEnabled())
+            self.assertFalse(self.window.chk_paired_only.isChecked())
+            self.assertFalse(self.window._paired_only_preference)
+
+    def test_reset_restores_paired_only_default(self) -> None:
+        self.window.chk_paired_only.setEnabled(True)
+        self.window.chk_paired_only.setChecked(False)
+
+        self.window._on_reset_clicked()
+
+        self.assertTrue(self.window._paired_only_preference)
+        self.assertTrue(self.window.chk_paired_only.isChecked())
+        self.assertFalse(self.window.chk_paired_only.isEnabled())
+
+    def test_loading_new_dataset_restores_paired_only_default(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            dataset = Path(tmp_dir) / "data" / "input" / "demo"
+            pc_dir = dataset / "PC"
+            pc_dir.mkdir(parents=True)
+            image_path = pc_dir / "sample.png"
+            image = np.full((8, 8, 3), 120, dtype=np.uint8)
+            self.assertTrue(cv2.imwrite(str(image_path), image))
+            self.window._paired_only_preference = False
+
+            self.window._load_images_from_folder(dataset)
+
+            self.assertTrue(self.window._paired_only_preference)
+            self.assertTrue(self.window.chk_paired_only.isChecked())
 
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@ from ..app_pipeline import (
 from ..paired_overlay import (
     PairedOverlayData,
     build_paired_overlay_data,
+    render_all_overlay_bgr,
     render_paired_overlay_bgr,
 )
 from .icons import standard_icon
@@ -342,6 +343,7 @@ class MainWindow(QMainWindow):
         self._width_um_per_px: float = 1.5896
         self._height_um_per_px: float = 1.5876
         self._xlsx_profile: str = "biomedical"
+        self._paired_only_preference: bool = True
         # 新增：目前選中的 Cell_ID（例如 "1_3"）
         self._selected_cell_id: str | None = None
         self._highlight_enabled: bool = False
@@ -830,6 +832,13 @@ class MainWindow(QMainWindow):
         self.chk_show_nuc.setChecked(True)
         self.chk_show_cyto = QtWidgets.QCheckBox("顯示質輪廓", self.image_header_widget)
         self.chk_show_cyto.setChecked(True)
+        self.chk_paired_only = QtWidgets.QCheckBox(
+            "僅顯示核質配對",
+            self.image_header_widget,
+        )
+        self.chk_paired_only.setObjectName("pairedOnlyCheck")
+        self.chk_paired_only.setChecked(True)
+        self.chk_paired_only.setEnabled(False)
         self.chk_show_ki67 = QtWidgets.QCheckBox("顯示ki67", self.image_header_widget)
         self.chk_show_ki67.setChecked(False)
 
@@ -846,6 +855,7 @@ class MainWindow(QMainWindow):
 
         overlay_controls.addWidget(self.chk_show_nuc)
         overlay_controls.addWidget(self.chk_show_cyto)
+        overlay_controls.addWidget(self.chk_paired_only)
         overlay_controls.addWidget(self.chk_show_ki67)
         overlay_controls.addWidget(alpha_label)
         overlay_controls.addWidget(self.alpha_slider)
@@ -879,6 +889,7 @@ class MainWindow(QMainWindow):
         # 連接 overlay 控制訊號
         self.chk_show_nuc.toggled.connect(self._on_overlay_controls_changed)
         self.chk_show_cyto.toggled.connect(self._on_overlay_controls_changed)
+        self.chk_paired_only.toggled.connect(self._on_paired_only_changed)
         self.chk_show_ki67.toggled.connect(self._on_overlay_controls_changed)
         self.alpha_slider.valueChanged.connect(self._on_overlay_controls_changed)
 
@@ -985,6 +996,8 @@ class MainWindow(QMainWindow):
 
     def _on_reset_clicked(self) -> None:
         """重設 UI 狀態、影像清單、結果表與 overlay。"""
+        self._paired_only_preference = True
+        self._set_paired_only_control_availability(False)
         self.progress_bar.setValue(0)
         if hasattr(self, "terminal_output"):
             self.terminal_output.clear()
@@ -1056,7 +1069,7 @@ class MainWindow(QMainWindow):
             )
             self._append_terminal_line(
                 "INFO",
-                "GUI 強制使用 Paired Only："
+                "核質配對統計："
                 f"cytoplasm {paired_cytoplasm_count}/{raw_cytoplasm_count}，"
                 f"nucleus {paired_nucleus_count}/{raw_nucleus_count}",
             )
@@ -1118,6 +1131,7 @@ class MainWindow(QMainWindow):
             self._current_image_array = None
             self._current_overlay_image_array = None
             self.image_file_label.setText("無法載入影像")
+            self._set_paired_only_control_availability(False)
             return
 
         if img_bgr.ndim == 2:  # 灰階 -> 轉成 BGR
@@ -1135,6 +1149,12 @@ class MainWindow(QMainWindow):
             self._current_overlay_masks.pop(img_path, None)
 
         paired_data = self._paired_overlay_data_for_image(img_path)
+        if paired_data is None and nuc_mask is not None and cyto_mask is not None:
+            paired_data = build_paired_overlay_data(cyto_mask, nuc_mask)
+            if self._pipeline_result is not None:
+                self._pipeline_result.paired_overlays[img_path.stem] = paired_data
+
+        self._set_paired_only_control_availability(paired_data is not None)
 
         # 嘗試載入 outlines
         merged_path = find_merged_outline_for_image(img_path)
@@ -1146,12 +1166,18 @@ class MainWindow(QMainWindow):
                 self._current_overlay_image = None
                 self._current_overlay_image_array = None
                 self._show_status_message(f"沒有找到 outlines：{img_path.name}")
+                self._set_paired_only_control_availability(False, notify=True)
                 return
         else:
             polygons = load_paired_merged_outlines(merged_path)
             nuc_polys = polygons.nuc_polygons
             cyto_polys = polygons.cyto_polygons
             self._current_overlay_polygons[img_path] = (nuc_polys, cyto_polys)
+
+        self._set_paired_only_control_availability(
+            paired_data is not None,
+            notify=paired_data is None,
+        )
 
         overlay_bgr = self._create_overlay_bgr(
             img_bgr,
@@ -1311,7 +1337,12 @@ class MainWindow(QMainWindow):
         if nuc_mask is None or cyto_mask is None:
             return None
         paired_data = build_paired_overlay_data(cyto_mask, nuc_mask)
-        return render_paired_overlay_bgr(
+        renderer = (
+            render_paired_overlay_bgr
+            if self._paired_only_preference
+            else render_all_overlay_bgr
+        )
+        return renderer(
             base_bgr,
             paired_data,
             show_nucleus=self._show_nuc,
@@ -1338,7 +1369,12 @@ class MainWindow(QMainWindow):
     ) -> np.ndarray:
         """根據目前設定，在 base 影像上畫出 mask 或輪廓，回傳 BGR 影像。"""
         if paired_data is not None:
-            blended = render_paired_overlay_bgr(
+            renderer = (
+                render_paired_overlay_bgr
+                if self._paired_only_preference
+                else render_all_overlay_bgr
+            )
+            blended = renderer(
                 base_bgr,
                 paired_data,
                 show_nucleus=self._show_nuc,
@@ -1418,13 +1454,13 @@ class MainWindow(QMainWindow):
 
         polys = self._current_overlay_polygons.get(img_path)
         masks = self._current_overlay_masks.get(img_path)
-        if polys is None and masks is None:
+        paired_data = self._paired_overlay_data_for_image(img_path)
+        if polys is None and masks is None and paired_data is None:
             self._set_pixmap_in_view(self._pixmap_from_bgr(self._current_image_array))
             return
 
         nuc_polys, cyto_polys = polys if polys is not None else ([], [])
         nuc_mask, cyto_mask = masks if masks is not None else (None, None)
-        paired_data = self._paired_overlay_data_for_image(img_path)
         display_bgr = self._create_overlay_bgr(
             self._current_image_array,
             nuc_polys,
@@ -1594,6 +1630,37 @@ class MainWindow(QMainWindow):
         self._overlay_alpha = self.alpha_slider.value() / 100.0
         self._update_display_pixmap()
 
+    def _on_paired_only_changed(self, checked: bool) -> None:
+        """保存核質配對顯示偏好並重繪目前影像。"""
+        if not self.chk_paired_only.isEnabled():
+            return
+        self._paired_only_preference = checked
+        self._update_display_pixmap()
+
+    def _set_paired_only_control_availability(
+        self,
+        available: bool,
+        *,
+        notify: bool = False,
+    ) -> None:
+        """依完整 segmentation 顯示資料同步 Paired Only 控制項。
+
+        Args:
+            available: 當前影像是否具備完整 nucleus 與 cytoplasm regions。
+            notify: 資料不足時是否更新非阻斷狀態訊息。
+        """
+        was_blocked = self.chk_paired_only.blockSignals(True)
+        try:
+            self.chk_paired_only.setEnabled(available)
+            self.chk_paired_only.setChecked(
+                self._paired_only_preference if available else True
+            )
+        finally:
+            self.chk_paired_only.blockSignals(was_blocked)
+
+        if notify and not available:
+            self._show_status_message("缺少完整 segmentation 資料，僅能顯示核質配對")
+
     def _load_images_from_folder(self, raw_folder: Path) -> None:
         """從使用者選擇的資料夾載入影像列表（不跑 pipeline）。"""
         try:
@@ -1604,6 +1671,8 @@ class MainWindow(QMainWindow):
 
         # 記錄目前資料夾，供載入 cleaned CSV 使用
         self._current_data_folder = data_folder
+        self._paired_only_preference = True
+        self._set_paired_only_control_availability(False)
 
         exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
         pc_dir = data_folder / "PC"
@@ -1653,6 +1722,7 @@ class MainWindow(QMainWindow):
             self._current_overlay_image_array = None
             self.image_file_label.setText("Image File Name")
             self._scene.clear()
+            self._set_paired_only_control_availability(False)
 
     def _load_cleaned_csv_for_dataset(self) -> None:
         """嘗試載入 data/output/results/<dataset>/<dataset>_cleaned.csv 並填表"""

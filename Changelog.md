@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026.08.03
+
+  * GUI overlay 控制列新增「僅顯示核質配對」開關，可即時切換
+    Paired Only 與全部 segmentation 物件；此設定只影響畫面，不修改
+    segmentation、CSV、XLSX 或自動輸出的 overlay PNG。
+
 ## 2026.07.27
 
   * GUI 對齊 SegUI 的 Paired Only 顯示，使用細胞核中心點配對細胞質；
