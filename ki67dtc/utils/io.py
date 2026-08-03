@@ -314,8 +314,17 @@ def merge_all_final_csvs(input_dir: Union[str, Path]) -> Path | None:
     cols_to_check = []
     if "cell_status" in merged_df.columns:
         before = len(merged_df)
+        # 保留所有六種有效的輪廓判定結果；只有 empty 與 unknown 會被移除，
+        # 這兩者代表輪廓分類失敗或缺少 Cell_ID 對應，不是有效的細胞。
         keep_mask = merged_df["cell_status"].isin(
-            ["full_cell", "nuc_only", "cyto_cut"]
+            [
+                "full_cell",
+                "nuc_only",
+                "cyto_cut",
+                "cyto_only",
+                "nuc_cut",
+                "both_cut",
+            ]
         )
         merged_df = merged_df[keep_mask].reset_index(drop=True)
         removed = before - len(merged_df)

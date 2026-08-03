@@ -123,6 +123,21 @@ keep_mask = merged_df["cell_status"].isin(
 **回歸**
 - `python -m pytest tests/ -q` 全綠。
 
+### 變更三的資料層驗證
+
+改完之後，每個資料集的 `sum(*_final.csv 筆數)` 應等於該資料集 `*_cleaned.csv` 的筆數。
+
+已對 73 個有 `*_final.csv` 的現有資料集實測（把真實 final CSV 複製到暫存目錄後跑改動後的 `merge_all_final_csvs()`，不覆寫既有輸出），確認等式**精確成立**：
+
+| 項目 | 筆數 |
+|---|---|
+| `sum(*_final.csv)` | 261,127 |
+| 改動後 `*_cleaned.csv` | 261,127 |
+| 差異 | **0** |
+| 改動前 `*_cleaned.csv` | 201,389（少 59,738 筆） |
+
+現有資料裡沒有任何一列是 `empty` 或 `unknown`，所以擴為 6 種等同於完全不過濾。若日後這個等式不成立，差額就是 `empty` / `unknown` 的筆數 —— 那代表輪廓分類出了問題，值得追查而不是放寬清單。
+
 ## 不在範圍內
 
 - `analysis/ki67_pred_utils.py` 的訓練資料篩選（使用者明確決定先不管）。
