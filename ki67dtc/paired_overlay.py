@@ -41,9 +41,21 @@ class PairedLabelRegions:
 
 @dataclass(frozen=True)
 class PairedOverlayData:
-    """保存單張影像的 Paired Only 顯示資料與數量統計。"""
+    """保存單張影像的配對與完整 segmentation 顯示資料。
+
+    Attributes:
+        pairs: 依 nucleus label 排列的核質配對 regions。
+        all_cytoplasm_regions: 依 label 排列的全部細胞質 regions。
+        all_nucleus_regions: 依 label 排列的全部細胞核 regions。
+        raw_nucleus_count: 原始細胞核 label 數量。
+        raw_cytoplasm_count: 原始細胞質 label 數量。
+        paired_nucleus_count: 成功配對的唯一細胞核數量。
+        paired_cytoplasm_count: 成功配對的唯一細胞質數量。
+    """
 
     pairs: tuple[PairedLabelRegions, ...]
+    all_cytoplasm_regions: tuple[LabelRegion, ...]
+    all_nucleus_regions: tuple[LabelRegion, ...]
     raw_nucleus_count: int
     raw_cytoplasm_count: int
     paired_nucleus_count: int
@@ -134,31 +146,31 @@ def build_paired_overlay_data(
     nucleus_mask = np.asarray(nucleus_mask)
     label_pairs = find_paired_labels(cytoplasm_mask, nucleus_mask)
 
-    cytoplasm_regions: dict[int, LabelRegion] = {}
-    nucleus_regions: dict[int, LabelRegion] = {}
-    paired_regions: list[PairedLabelRegions] = []
-    for cytoplasm_label, nucleus_label in label_pairs:
-        if cytoplasm_label not in cytoplasm_regions:
-            cytoplasm_regions[cytoplasm_label] = _extract_label_region(
-                cytoplasm_mask, cytoplasm_label
-            )
-        if nucleus_label not in nucleus_regions:
-            nucleus_regions[nucleus_label] = _extract_label_region(
-                nucleus_mask, nucleus_label
-            )
-        paired_regions.append(
-            PairedLabelRegions(
-                cytoplasm=cytoplasm_regions[cytoplasm_label],
-                nucleus=nucleus_regions[nucleus_label],
-            )
+    cytoplasm_labels = [
+        int(label) for label in np.unique(cytoplasm_mask) if label != 0
+    ]
+    nucleus_labels = [int(label) for label in np.unique(nucleus_mask) if label != 0]
+    cytoplasm_regions = {
+        label: _extract_label_region(cytoplasm_mask, label)
+        for label in cytoplasm_labels
+    }
+    nucleus_regions = {
+        label: _extract_label_region(nucleus_mask, label) for label in nucleus_labels
+    }
+    paired_regions = [
+        PairedLabelRegions(
+            cytoplasm=cytoplasm_regions[cytoplasm_label],
+            nucleus=nucleus_regions[nucleus_label],
         )
+        for cytoplasm_label, nucleus_label in label_pairs
+    ]
 
-    raw_nucleus_labels = np.unique(nucleus_mask)
-    raw_cytoplasm_labels = np.unique(cytoplasm_mask)
     return PairedOverlayData(
         pairs=tuple(paired_regions),
-        raw_nucleus_count=int(np.count_nonzero(raw_nucleus_labels)),
-        raw_cytoplasm_count=int(np.count_nonzero(raw_cytoplasm_labels)),
+        all_cytoplasm_regions=tuple(cytoplasm_regions.values()),
+        all_nucleus_regions=tuple(nucleus_regions.values()),
+        raw_nucleus_count=len(nucleus_regions),
+        raw_cytoplasm_count=len(cytoplasm_regions),
         paired_nucleus_count=len({nucleus for _, nucleus in label_pairs}),
         paired_cytoplasm_count=len({cytoplasm for cytoplasm, _ in label_pairs}),
     )
@@ -178,6 +190,52 @@ def _paint_region(
     mask_view = paint_mask[row_slice, col_slice]
     color_view[region.mask] = color_bgr
     mask_view[region.mask] = True
+
+
+def _render_regions_overlay_bgr(
+    base_bgr: np.ndarray,
+    cytoplasm_regions: Sequence[LabelRegion],
+    nucleus_regions: Sequence[LabelRegion],
+    *,
+    show_nucleus: bool,
+    show_cytoplasm: bool,
+    alpha: float,
+) -> np.ndarray:
+    """將指定核質 regions 繪製在 BGR 原圖上。"""
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError("alpha 必須介於 0 與 1 之間")
+    if base_bgr.ndim != 3 or base_bgr.shape[2] != 3:
+        raise ValueError("base_bgr 必須是三通道 BGR 影像")
+
+    overlay = base_bgr.copy()
+    color_layer = np.zeros_like(overlay)
+    paint_mask = np.zeros(overlay.shape[:2], dtype=bool)
+    palette_bgr = tuple((blue, green, red) for red, green, blue in _PALETTE_RGB)
+    nucleus_fill_bgr = (240, 0, 0)
+
+    if show_cytoplasm:
+        for index, region in enumerate(cytoplasm_regions):
+            _paint_region(
+                color_layer,
+                paint_mask,
+                region,
+                palette_bgr[index % len(palette_bgr)],
+            )
+    if show_nucleus:
+        for region in nucleus_regions:
+            _paint_region(color_layer, paint_mask, region, nucleus_fill_bgr)
+
+    overlay[paint_mask] = (
+        alpha * color_layer[paint_mask] + (1.0 - alpha) * overlay[paint_mask]
+    ).astype(np.uint8)
+
+    if show_cytoplasm:
+        for region in cytoplasm_regions:
+            cv2.drawContours(overlay, region.contours, -1, (255, 190, 0), 1)
+    if show_nucleus:
+        for region in nucleus_regions:
+            cv2.drawContours(overlay, region.contours, -1, (255, 0, 0), 1)
+    return overlay
 
 
 def render_paired_overlay_bgr(
@@ -203,43 +261,47 @@ def render_paired_overlay_bgr(
     Raises:
         ValueError: 原圖格式或透明度不合法時拋出。
     """
-    if not 0.0 <= alpha <= 1.0:
-        raise ValueError("alpha 必須介於 0 與 1 之間")
-    if base_bgr.ndim != 3 or base_bgr.shape[2] != 3:
-        raise ValueError("base_bgr 必須是三通道 BGR 影像")
+    return _render_regions_overlay_bgr(
+        base_bgr,
+        [pair.cytoplasm for pair in data.pairs],
+        [pair.nucleus for pair in data.pairs],
+        show_nucleus=show_nucleus,
+        show_cytoplasm=show_cytoplasm,
+        alpha=alpha,
+    )
 
-    overlay = base_bgr.copy()
-    color_layer = np.zeros_like(overlay)
-    paint_mask = np.zeros(overlay.shape[:2], dtype=bool)
-    palette_bgr = tuple((blue, green, red) for red, green, blue in _PALETTE_RGB)
-    nucleus_fill_bgr = (240, 0, 0)
 
-    for index, pair in enumerate(data.pairs):
-        if show_cytoplasm:
-            _paint_region(
-                color_layer,
-                paint_mask,
-                pair.cytoplasm,
-                palette_bgr[index % len(palette_bgr)],
-            )
-        if show_nucleus:
-            _paint_region(
-                color_layer,
-                paint_mask,
-                pair.nucleus,
-                nucleus_fill_bgr,
-            )
+def render_all_overlay_bgr(
+    base_bgr: np.ndarray,
+    data: PairedOverlayData,
+    *,
+    show_nucleus: bool = True,
+    show_cytoplasm: bool = True,
+    alpha: float = 0.5,
+) -> np.ndarray:
+    """將全部 segmentation 核質區域直接繪製在 BGR 原圖上。
 
-    overlay[paint_mask] = (
-        alpha * color_layer[paint_mask] + (1.0 - alpha) * overlay[paint_mask]
-    ).astype(np.uint8)
+    Args:
+        base_bgr: OpenCV BGR 原圖。
+        data: 同時包含配對與全部 label regions 的顯示資料。
+        show_nucleus: 是否顯示全部細胞核。
+        show_cytoplasm: 是否顯示全部細胞質。
+        alpha: 填色透明度，範圍為 0 到 1。
 
-    for pair in data.pairs:
-        if show_cytoplasm:
-            cv2.drawContours(overlay, pair.cytoplasm.contours, -1, (255, 190, 0), 1)
-        if show_nucleus:
-            cv2.drawContours(overlay, pair.nucleus.contours, -1, (255, 0, 0), 1)
-    return overlay
+    Returns:
+        套用全部 segmentation 半透明填色與輪廓後的 BGR 影像。
+
+    Raises:
+        ValueError: 原圖不是三通道 BGR，或透明度不在 0 到 1 時拋出。
+    """
+    return _render_regions_overlay_bgr(
+        base_bgr,
+        data.all_cytoplasm_regions,
+        data.all_nucleus_regions,
+        show_nucleus=show_nucleus,
+        show_cytoplasm=show_cytoplasm,
+        alpha=alpha,
+    )
 
 
 def _load_mask(mask_path: Path, image_shape: tuple[int, int]) -> np.ndarray | None:

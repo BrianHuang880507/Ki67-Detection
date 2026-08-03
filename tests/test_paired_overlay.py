@@ -13,11 +13,60 @@ from ki67dtc.gui.main_window import save_pipeline_fill_overlays
 from ki67dtc.paired_overlay import (
     build_paired_overlay_data,
     find_paired_labels,
+    render_all_overlay_bgr,
     render_paired_overlay_bgr,
 )
 
 
 class PairedOverlayTest(unittest.TestCase):
+    def test_all_regions_are_cached_and_rendered_without_mutating_inputs(self) -> None:
+        base = np.full((12, 14, 3), 120, dtype=np.uint8)
+        cytoplasm_mask = np.zeros((12, 14), dtype=np.int32)
+        cytoplasm_mask[1:10, 1:9] = 1
+        cytoplasm_mask[1:4, 10:13] = 2
+        nucleus_mask = np.zeros_like(cytoplasm_mask)
+        nucleus_mask[4:6, 4:6] = 1
+        nucleus_mask[8:10, 10:12] = 2
+        base_before = base.copy()
+        cytoplasm_before = cytoplasm_mask.copy()
+        nucleus_before = nucleus_mask.copy()
+
+        data = build_paired_overlay_data(cytoplasm_mask, nucleus_mask)
+        paired = render_paired_overlay_bgr(base, data, alpha=0.5)
+        all_regions = render_all_overlay_bgr(base, data, alpha=0.5)
+
+        self.assertEqual(
+            [region.label for region in data.all_cytoplasm_regions],
+            [1, 2],
+        )
+        self.assertEqual(
+            [region.label for region in data.all_nucleus_regions],
+            [1, 2],
+        )
+        np.testing.assert_array_equal(paired[2, 11], base[2, 11])
+        np.testing.assert_array_equal(paired[8, 10], base[8, 10])
+        self.assertFalse(np.array_equal(all_regions[2, 11], base[2, 11]))
+        self.assertFalse(np.array_equal(all_regions[8, 10], base[8, 10]))
+        hidden = render_all_overlay_bgr(
+            base,
+            data,
+            show_nucleus=False,
+            show_cytoplasm=False,
+            alpha=0.5,
+        )
+        lower_alpha = render_all_overlay_bgr(base, data, alpha=0.25)
+        np.testing.assert_array_equal(hidden, base)
+        full_distance = np.linalg.norm(
+            all_regions[2, 11].astype(int) - base[2, 11].astype(int)
+        )
+        lower_distance = np.linalg.norm(
+            lower_alpha[2, 11].astype(int) - base[2, 11].astype(int)
+        )
+        self.assertLess(lower_distance, full_distance)
+        np.testing.assert_array_equal(base, base_before)
+        np.testing.assert_array_equal(cytoplasm_mask, cytoplasm_before)
+        np.testing.assert_array_equal(nucleus_mask, nucleus_before)
+
     def test_find_paired_labels_matches_segui_centroid_rule(self) -> None:
         cytoplasm_mask = np.zeros((12, 14), dtype=np.int32)
         cytoplasm_mask[1:10, 1:9] = 4
