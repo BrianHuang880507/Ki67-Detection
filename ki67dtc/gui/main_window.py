@@ -206,6 +206,7 @@ class PipelineThread(QThread):
     def __init__(
         self,
         data_folder: Path,
+        device: str,
         nuc_source: str,
         fluor_analy: bool,
         ki67: bool,
@@ -221,6 +222,7 @@ class PipelineThread(QThread):
 
         Args:
             data_folder: 輸入資料集資料夾。
+            device: 分割使用的運算裝置，`gpu` 或 `cpu`。
             nuc_source: 細胞核分割來源。
             fluor_analy: 是否執行螢光分析。
             ki67: 是否執行 Ki67 判定。
@@ -234,6 +236,7 @@ class PipelineThread(QThread):
         """
         super().__init__(parent)
         self._data_folder = data_folder
+        self._device = device
         self._nuc_source = nuc_source
         self._fluor_analy = fluor_analy
         self._ki67 = ki67
@@ -253,6 +256,7 @@ class PipelineThread(QThread):
         try:
             result = run_pipeline(
                 self._data_folder,
+                device=self._device,
                 nuc_source=self._nuc_source,
                 fluor_analy=self._fluor_analy,
                 ki67=self._ki67,
@@ -328,9 +332,10 @@ class MainWindow(QMainWindow):
         self._area_scatter_pixmap: QPixmap | None = None
         self._area_histogram_pixmap: QPixmap | None = None
         self._last_status_message: str = ""
-        self._nuc_source: str = "dapi"
+        self._device: str = "gpu"
+        self._nuc_source: str = "pc"
         self._ki67_backend: str = "pyimagej"
-        self._feature_backend: str = "pyimagej"
+        self._feature_backend: str = "python"
         self._fluor_analy: bool = True
         self._ki67: bool = True
         self._clean_temp: bool = True
@@ -528,6 +533,15 @@ class MainWindow(QMainWindow):
         root.addLayout(form)
 
         form.addRow(
+            "運算裝置",
+            self._new_option_combo(
+                dialog,
+                "deviceCombo",
+                [("GPU", "gpu"), ("CPU", "cpu")],
+                self._device,
+            ),
+        )
+        form.addRow(
             "核來源",
             self._new_option_combo(
                 dialog,
@@ -600,6 +614,7 @@ class MainWindow(QMainWindow):
 
     def _apply_analysis_options_dialog(self, dialog: QtWidgets.QDialog) -> None:
         """套用分析選項子視窗目前值。"""
+        device_combo = dialog.findChild(QtWidgets.QComboBox, "deviceCombo")
         nuc_combo = dialog.findChild(QtWidgets.QComboBox, "nucSourceCombo")
         ki67_backend_combo = dialog.findChild(QtWidgets.QComboBox, "ki67BackendCombo")
         feature_backend_combo = dialog.findChild(QtWidgets.QComboBox, "featureBackendCombo")
@@ -609,6 +624,8 @@ class MainWindow(QMainWindow):
         width_spin = dialog.findChild(QtWidgets.QDoubleSpinBox, "widthPixelScaleSpin")
         height_spin = dialog.findChild(QtWidgets.QDoubleSpinBox, "heightPixelScaleSpin")
 
+        if device_combo is not None:
+            self._device = str(device_combo.currentData())
         if nuc_combo is not None:
             self._nuc_source = str(nuc_combo.currentData())
         if ki67_backend_combo is not None:
@@ -934,6 +951,7 @@ class MainWindow(QMainWindow):
 
         self._pipeline_thread = PipelineThread(
             data_folder,
+            device=self._device,
             nuc_source=self._nuc_source,
             fluor_analy=self._fluor_analy,
             ki67=self._ki67,

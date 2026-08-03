@@ -45,11 +45,18 @@ def parse_args() -> argparse.Namespace:
         help="Python executable used to launch each run.",
     )
     parser.add_argument(
+        "--device",
+        type=str,
+        default="gpu",
+        choices=["gpu", "cpu"],
+        help="Compute device for segmentation (gpu or cpu, default gpu).",
+    )
+    parser.add_argument(
         "--nuc_source",
         type=str,
-        default="dapi",
+        default="pc",
         choices=["pc", "dapi"],
-        help="nucleus segmentation source (pc or dapi).",
+        help="nucleus segmentation source (pc or dapi, default pc).",
     )
     parser.add_argument("--fluor_analy", action="store_true", help="Enable fluor analysis.")
     parser.add_argument("--ki67", action="store_true", help="Enable Ki67 analysis.")
@@ -63,9 +70,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--feature_backend",
         type=str,
-        default="pyimagej",
+        default="python",
         choices=["pyimagej", "python"],
-        help="Feature extraction backend.",
+        help="Feature extraction backend (default python).",
     )
     parser.add_argument("--clean_temp", action="store_true", help="Clean temp files.")
     parser.add_argument(
@@ -171,6 +178,8 @@ def build_command(
         str(main_script),
         "--data_folder",
         str(dataset),
+        "--device",
+        args.device,
         "--nuc_source",
         args.nuc_source,
         "--ki67_backend",

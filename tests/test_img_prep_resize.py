@@ -66,6 +66,48 @@ class SegmentResizeTest(unittest.TestCase):
         self.assertEqual(saved_shapes["channels"], (0, 0))
         self.assertIsNone(saved_shapes["diams"])
 
+    def _run_segment_capturing_gpu_flag(self, **segment_kwargs) -> list[bool]:
+        """執行 segment() 並回傳每次建立 CellposeModel 時收到的 gpu 旗標。"""
+        original = np.zeros((6, 8, 3), dtype=np.uint8)
+        gpu_flags: list[bool] = []
+
+        class FakeModel:
+            def __init__(self, gpu: bool, pretrained_model: str) -> None:
+                gpu_flags.append(gpu)
+
+            def eval(self, img, **kwargs):
+                masks = np.ones(img.shape[:2], dtype=np.int32)
+                flows = [np.zeros((*img.shape[:2], 3), dtype=np.float32)]
+                return masks, flows, None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_dir = root / "segment"
+            output_dir.mkdir()
+
+            with (
+                patch.object(img_prep.io, "imread", return_value=original),
+                patch.object(img_prep.models, "CellposeModel", FakeModel),
+                patch.object(img_prep.io, "masks_flows_to_seg"),
+                patch.object(img_prep.shutil, "move"),
+            ):
+                img_prep.segment(
+                    "model/path",
+                    [root / "sample.jpg"],
+                    output_dir,
+                    "cyto",
+                    channels=(0, 0),
+                    **segment_kwargs,
+                )
+
+        return gpu_flags
+
+    def test_segment_defaults_to_gpu(self) -> None:
+        self.assertEqual(self._run_segment_capturing_gpu_flag(), [True])
+
+    def test_segment_forces_cpu_when_use_gpu_is_false(self) -> None:
+        self.assertEqual(self._run_segment_capturing_gpu_flag(use_gpu=False), [False])
+
     def test_filter_small_labels_removes_fragments_and_relabels_contiguously(
         self,
     ) -> None:
@@ -189,6 +231,7 @@ class SegmentResizeTest(unittest.TestCase):
                     min_area_ratio=0.15,
                     min_area_floor=30,
                     apply_small_label_filter=False,
+                    use_gpu=True,
                 ),
                 call(
                     EXPECTED_PC_NUC_MODEL_PATH,
@@ -201,6 +244,7 @@ class SegmentResizeTest(unittest.TestCase):
                     min_area_ratio=0.15,
                     min_area_floor=30,
                     apply_small_label_filter=False,
+                    use_gpu=True,
                 ),
             ],
         )
@@ -210,6 +254,29 @@ class SegmentResizeTest(unittest.TestCase):
             min_area_ratio=0.15,
             min_area_floor=30,
         )
+
+    def test_segment_all_forwards_use_gpu_to_every_segment_call(self) -> None:
+        """use_gpu 必須傳到每一個 segment() 呼叫，漏掉的分支會靜默回到 GPU。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pc_dir = root / "PC"
+            pc_dir.mkdir()
+            image_path = pc_dir / "sample.jpg"
+            image_path.write_bytes(b"placeholder")
+
+            with (
+                patch.object(
+                    img_prep, "output_dir", return_value=root / "segment"
+                ),
+                patch.object(img_prep, "list_files", return_value=[image_path]),
+                patch.object(img_prep, "segment") as segment_mock,
+                patch.object(img_prep, "_filter_paired_segment_files"),
+            ):
+                img_prep.segment_all(root, nuc_source="pc", use_gpu=False)
+
+        self.assertGreater(len(segment_mock.call_args_list), 0)
+        for segment_call in segment_mock.call_args_list:
+            self.assertIs(segment_call.kwargs["use_gpu"], False)
 
     def test_segment_all_uses_dapi_nuc_model_when_dapi_source_is_available(
         self,
@@ -262,6 +329,7 @@ class SegmentResizeTest(unittest.TestCase):
                     min_area_ratio=0.15,
                     min_area_floor=30,
                     apply_small_label_filter=False,
+                    use_gpu=True,
                 ),
                 call(
                     EXPECTED_DAPI_NUC_MODEL_PATH,
@@ -275,6 +343,7 @@ class SegmentResizeTest(unittest.TestCase):
                     min_area_ratio=0.15,
                     min_area_floor=30,
                     apply_small_label_filter=False,
+                    use_gpu=True,
                 ),
             ],
         )
@@ -323,6 +392,7 @@ class SegmentResizeTest(unittest.TestCase):
                     min_area_ratio=0.15,
                     min_area_floor=30,
                     apply_small_label_filter=False,
+                    use_gpu=True,
                 ),
                 call(
                     EXPECTED_PC_NUC_MODEL_PATH,
@@ -335,6 +405,7 @@ class SegmentResizeTest(unittest.TestCase):
                     min_area_ratio=0.15,
                     min_area_floor=30,
                     apply_small_label_filter=False,
+                    use_gpu=True,
                 ),
             ],
         )

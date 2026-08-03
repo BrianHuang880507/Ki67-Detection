@@ -31,6 +31,7 @@ class XlsxProfileOptionsTest(unittest.TestCase):
 
     def test_batch_command_forwards_xlsx_profile(self) -> None:
         args = Namespace(
+            device="cpu",
             nuc_source="dapi",
             ki67_backend="opencv",
             feature_backend="python",
@@ -49,6 +50,28 @@ class XlsxProfileOptionsTest(unittest.TestCase):
 
         option_index = command.index("--xlsx-version")
         self.assertEqual(command[option_index + 1], "biomedical")
+
+    def test_batch_command_forwards_device(self) -> None:
+        args = Namespace(
+            device="cpu",
+            nuc_source="pc",
+            ki67_backend="opencv",
+            feature_backend="python",
+            xlsx_version="biomedical",
+            fluor_analy=False,
+            ki67=False,
+            clean_temp=False,
+        )
+
+        command = build_command(
+            "python",
+            Path("main.py"),
+            Path("data/input/demo"),
+            args,
+        )
+
+        option_index = command.index("--device")
+        self.assertEqual(command[option_index + 1], "cpu")
 
 
 if __name__ == "__main__":

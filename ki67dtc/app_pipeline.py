@@ -85,6 +85,7 @@ def _list_display_image_files(data_folder: Path) -> list[Path]:
 
 def run_pipeline(
     data_folder: Path,
+    device: str = "gpu",
     nuc_source: str = "dapi",
     fluor_analy: bool = True,
     ki67: bool = True,
@@ -100,6 +101,8 @@ def run_pipeline(
 
     Args:
         data_folder: 輸入資料集資料夾。
+        device: 分割使用的運算裝置，``gpu`` 或 ``cpu``。只有 ``cpu`` 會強制關閉
+            GPU；其餘值一律視為 ``gpu``，實際有無 GPU 由 Cellpose 自行判斷。
         nuc_source: 細胞核分割來源，可為 ``dapi`` 或 ``pc``。
         fluor_analy: 是否執行螢光分析。
         ki67: 是否執行 Ki67 判定。
@@ -127,7 +130,7 @@ def run_pipeline(
     # Step 1: segmentation
     if progress_callback:
         progress_callback(current_step, total_steps, "執行 segmentation (cyto & nuc)")
-    segment_all(data_folder, nuc_source=nuc_source)
+    segment_all(data_folder, nuc_source=nuc_source, use_gpu=device != "cpu")
     paired_overlays = collect_paired_overlay_data(
         image_files,
         output_dir(data_folder, "segment"),

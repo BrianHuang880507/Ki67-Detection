@@ -2,13 +2,19 @@
 from pathlib import Path
 
 
-def run_preprocessing(data_folder: Path, nuc_source: str) -> None:
-    """Run segmentation and outline preparation."""
+def run_preprocessing(data_folder: Path, nuc_source: str, device: str = "gpu") -> None:
+    """Run segmentation and outline preparation.
+
+    Args:
+        data_folder: 輸入資料集資料夾。
+        nuc_source: nucleus segmentation 來源，``pc`` 或 ``dapi``。
+        device: 分割使用的運算裝置，``gpu`` 或 ``cpu``。
+    """
     from ki67dtc.img_prep import combined, mask2txt_all, segment_all
 
     # Step 1: segmentation
     print("\n[STEP 1] 執行 segmentation (cyto & nuc)")
-    segment_all(data_folder, nuc_source=nuc_source)
+    segment_all(data_folder, nuc_source=nuc_source, use_gpu=device != "cpu")
 
     # Step 2: mask -> outlines
     print("\n[STEP 2] 將 segmentation npy 轉成 outlines txt")
@@ -30,11 +36,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--data_folder", type=str, required=True, help="輸入資料夾名稱或路徑"
     )
     parser.add_argument(
+        "--device",
+        type=str,
+        default="gpu",
+        choices=["gpu", "cpu"],
+        help="分割使用的運算裝置（gpu 或 cpu，預設 gpu）",
+    )
+    parser.add_argument(
         "--nuc_source",
         type=str,
-        default="dapi",
+        default="pc",
         choices=["pc", "dapi"],
-        help="nucleus segmentation 來源（pc 或 dapi，預設 dapi）",
+        help="nucleus segmentation 來源（pc 或 dapi，預設 pc）",
     )
     parser.add_argument("--fluor_analy", action="store_true", help="是否執行螢光分析")
     parser.add_argument("--ki67", action="store_true", help="是否執行 Ki67 判斷")
@@ -48,9 +61,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--feature_backend",
         type=str,
-        default="pyimagej",
+        default="python",
         choices=["pyimagej", "python"],
-        help="特徵提取方法（預設 pyimagej）",
+        help="特徵提取方法（預設 python）",
     )
     parser.add_argument("--clean_temp", action="store_true", help="是否清理暫存資料")
     parser.add_argument(
@@ -105,6 +118,7 @@ def main() -> None:
 
     print("=" * 50)
     print(f"[資訊] 使用資料夾：{data_folder}")
+    print(f"[資訊] 運算裝置：{args.device}")
     print(f"[資訊] nucleus 來源：{args.nuc_source}")
     print(f"[資訊] 啟用螢光分析：{args.fluor_analy}")
     print(f"[資訊] 啟用 Ki67 分析：{args.ki67}")
@@ -114,7 +128,7 @@ def main() -> None:
     print(f"[資訊] XLSX 版本：{args.xlsx_version}")
     print("=" * 50)
 
-    run_preprocessing(data_folder, args.nuc_source)
+    run_preprocessing(data_folder, args.nuc_source, args.device)
 
     # Step 4: geometry & intensity analysis
     print("\n[STEP 4] 幾何參數與螢光/陽性分析")

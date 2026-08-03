@@ -65,6 +65,7 @@ class MainWindowLayoutContractTest(unittest.TestCase):
 
         self.assertEqual(dialog.windowTitle(), "分析選項")
         for widget_type, object_name in [
+            (QtWidgets.QComboBox, "deviceCombo"),
             (QtWidgets.QComboBox, "nucSourceCombo"),
             (QtWidgets.QComboBox, "ki67BackendCombo"),
             (QtWidgets.QComboBox, "featureBackendCombo"),
@@ -77,9 +78,40 @@ class MainWindowLayoutContractTest(unittest.TestCase):
             with self.subTest(object_name=object_name):
                 self.assertIsNotNone(dialog.findChild(widget_type, object_name))
 
+    def test_analysis_options_defaults_to_gpu_pc_and_python(self) -> None:
+        self.assertEqual(self.window._device, "gpu")
+        self.assertEqual(self.window._nuc_source, "pc")
+        self.assertEqual(self.window._feature_backend, "python")
+
+        dialog = self.window._build_analysis_options_dialog()
+        for object_name, expected in [
+            ("deviceCombo", "gpu"),
+            ("nucSourceCombo", "pc"),
+            ("featureBackendCombo", "python"),
+        ]:
+            combo = dialog.findChild(QtWidgets.QComboBox, object_name)
+            self.assertIsNotNone(combo)
+            assert combo is not None
+            self.assertEqual(combo.currentData(), expected)
+
+    def test_analysis_options_dialog_puts_device_first(self) -> None:
+        dialog = self.window._build_analysis_options_dialog()
+        form = dialog.findChild(QtWidgets.QFormLayout)
+        self.assertIsNotNone(form)
+        assert form is not None
+
+        label = form.itemAt(0, QtWidgets.QFormLayout.ItemRole.LabelRole)
+        field = form.itemAt(0, QtWidgets.QFormLayout.ItemRole.FieldRole)
+        self.assertIsNotNone(label)
+        self.assertIsNotNone(field)
+        assert label is not None and field is not None
+        self.assertEqual(label.widget().text(), "運算裝置")
+        self.assertEqual(field.widget().objectName(), "deviceCombo")
+
     def test_analysis_options_dialog_exposes_backend_values(self) -> None:
         dialog = self.window._build_analysis_options_dialog()
         option_groups = {
+            "deviceCombo": [("GPU", "gpu"), ("CPU", "cpu")],
             "nucSourceCombo": [("DAPI", "dapi"), ("PC", "pc")],
             "ki67BackendCombo": [("PyImageJ", "pyimagej"), ("OpenCV", "opencv")],
             "featureBackendCombo": [("PyImageJ", "pyimagej"), ("Python", "python")],
@@ -98,10 +130,12 @@ class MainWindowLayoutContractTest(unittest.TestCase):
 
     def test_analysis_options_dialog_applies_pipeline_values(self) -> None:
         dialog = self.window._build_analysis_options_dialog()
+        # 每個值都刻意選成與預設不同，套用失敗時測試才會失敗。
         for object_name, value in [
-            ("nucSourceCombo", "pc"),
+            ("deviceCombo", "cpu"),
+            ("nucSourceCombo", "dapi"),
             ("ki67BackendCombo", "opencv"),
-            ("featureBackendCombo", "python"),
+            ("featureBackendCombo", "pyimagej"),
         ]:
             combo = dialog.findChild(QtWidgets.QComboBox, object_name)
             self.assertIsNotNone(combo)
@@ -126,9 +160,10 @@ class MainWindowLayoutContractTest(unittest.TestCase):
 
         self.window._apply_analysis_options_dialog(dialog)
 
-        self.assertEqual(self.window._nuc_source, "pc")
+        self.assertEqual(self.window._device, "cpu")
+        self.assertEqual(self.window._nuc_source, "dapi")
         self.assertEqual(self.window._ki67_backend, "opencv")
-        self.assertEqual(self.window._feature_backend, "python")
+        self.assertEqual(self.window._feature_backend, "pyimagej")
         self.assertFalse(self.window._fluor_analy)
         self.assertFalse(self.window._ki67)
         self.assertFalse(self.window._clean_temp)

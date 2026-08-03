@@ -360,6 +360,7 @@ def segment(
     min_area_ratio: float = 0.15,
     min_area_floor: int = 30,
     apply_small_label_filter: bool = True,
+    use_gpu: bool = True,
 ):
     """使用指定的 Cellpose 模型分割影像。
 
@@ -383,6 +384,8 @@ def segment(
         min_area_floor: 最小標籤面積的絕對像素下限。
         apply_small_label_filter: 是否在單一 mask 輸出前套用舊版面積過濾。
             `segment_all` 會關閉此項，待 cyto／nuc 配對後再共同過濾。
+        use_gpu: 是否使用 GPU 推論。`False` 時強制走 CPU；`True` 時若機器沒有
+            可用的 CUDA 裝置，Cellpose 會自行退回 CPU。
 
     Raises:
         ValueError: 當 `output_stems` 長度不符，或 resize 尺寸不合法時拋出。
@@ -394,7 +397,7 @@ def segment(
         if target_w <= 0 or target_h <= 0:
             raise ValueError("model_input_size must contain positive width and height.")
 
-    model = models.CellposeModel(gpu=True, pretrained_model=model_path)
+    model = models.CellposeModel(gpu=use_gpu, pretrained_model=model_path)
     for i in trange(len(img_files), desc=f"Segmenting ({suffix})"):
         f = img_files[i]
         img = io.imread(f)
@@ -649,6 +652,7 @@ def segment_all(
     cellprob_threshold: float = 0.0,
     min_area_ratio: float = 0.15,
     min_area_floor: int = 30,
+    use_gpu: bool = True,
 ):
     """執行細胞質與細胞核分割。
 
@@ -665,6 +669,8 @@ def segment_all(
         cellprob_threshold: Cellpose cellprob threshold。
         min_area_ratio: 相對於配對參考標籤面積中位數的最小面積比例。
         min_area_floor: 最小標籤面積的絕對像素下限。
+        use_gpu: 是否使用 GPU 推論。`False` 時強制走 CPU；`True` 時若機器沒有
+            可用的 CUDA 裝置，Cellpose 會自行退回 CPU。
     """
     root_dir = Path(input_dir)
     pc_dir = root_dir / "PC"
@@ -695,6 +701,7 @@ def segment_all(
         min_area_ratio=min_area_ratio,
         min_area_floor=min_area_floor,
         apply_small_label_filter=False,
+        use_gpu=use_gpu,
     )
 
     if nuc_source == "pc":
@@ -709,6 +716,7 @@ def segment_all(
             min_area_ratio=min_area_ratio,
             min_area_floor=min_area_floor,
             apply_small_label_filter=False,
+            use_gpu=use_gpu,
         )
         _filter_paired_segment_files(
             seg_dir,
@@ -732,6 +740,7 @@ def segment_all(
             min_area_ratio=min_area_ratio,
             min_area_floor=min_area_floor,
             apply_small_label_filter=False,
+            use_gpu=use_gpu,
         )
         _filter_paired_segment_files(
             seg_dir,
@@ -755,6 +764,7 @@ def segment_all(
             min_area_ratio=min_area_ratio,
             min_area_floor=min_area_floor,
             apply_small_label_filter=False,
+            use_gpu=use_gpu,
         )
         _filter_paired_segment_files(
             seg_dir,
@@ -819,6 +829,7 @@ def segment_all(
             min_area_ratio=min_area_ratio,
             min_area_floor=min_area_floor,
             apply_small_label_filter=False,
+            use_gpu=use_gpu,
         )
         remap_nuc_segments_to_cyto(seg_dir, dapi_output_stems, dapi_output_stems)
 
@@ -835,6 +846,7 @@ def segment_all(
             min_area_ratio=min_area_ratio,
             min_area_floor=min_area_floor,
             apply_small_label_filter=False,
+            use_gpu=use_gpu,
         )
 
     _filter_paired_segment_files(
