@@ -55,6 +55,42 @@ class MainWindowLayoutContractTest(unittest.TestCase):
         QApplication.processEvents()
         return base
 
+    def _load_outline_only_old_dataset(
+        self,
+        root: Path,
+    ) -> tuple[Path, Path, np.ndarray]:
+        """載入只有 merged outlines 的舊資料 fixture。"""
+        image_dir = root / "data" / "input" / "demo" / "PC"
+        outline_dir = root / "data" / "output" / "outline" / "demo"
+        image_dir.mkdir(parents=True)
+        outline_dir.mkdir(parents=True)
+        image_path = image_dir / "sample.png"
+        outline_path = outline_dir / "sample_merged_cp_outlines.txt"
+        base = np.full((18, 18, 3), 100, dtype=np.uint8)
+        self.assertTrue(cv2.imwrite(str(image_path), base))
+        outline_path.write_text(
+            "5,5,9,5,9,9,5,9\n"
+            "2,2,11,2,11,11,2,11\n"
+            "12,10,16,10,16,15,12,15\n"
+            "-1,-1\n"
+            "-1,-1\n"
+            "12,1,16,1,16,6,12,6\n",
+            encoding="utf-8",
+        )
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(root)
+            self.window._pipeline_result = PipelineResult(
+                data_folder=root / "data" / "input" / "demo",
+                image_files=[image_path],
+            )
+            self.window._current_image_index = 0
+            self.window._load_image_and_overlays(image_path)
+            self.window._update_display_pixmap()
+        finally:
+            os.chdir(original_cwd)
+        return image_path, outline_path, base
+
     def test_menu_bar_contains_file_and_analysis_options(self) -> None:
         menu_titles = [action.text() for action in self.window.menuBar().actions()]
 
@@ -507,6 +543,123 @@ class MainWindowLayoutContractTest(unittest.TestCase):
             self.assertTrue(self.window._highlight_enabled)
             self.assertEqual(self.window._selected_cell_id, "sample_1")
             self.assertIsNone(self.window._pipeline_thread)
+
+    def test_outline_only_old_dataset_switches_paired_and_all_display(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            image_path, outline_path, base = self._load_outline_only_old_dataset(
+                Path(temporary_directory)
+            )
+            original_outline = outline_path.read_bytes()
+            paired = self.window._current_overlay_image_array.copy()
+            self.window._selected_cell_id = "sample_1"
+            self.window._highlight_enabled = True
+
+            self.window.chk_paired_only.setChecked(False)
+            QApplication.processEvents()
+            all_regions = self.window._current_overlay_image_array
+
+            self.assertTrue(self.window.chk_paired_only.isEnabled())
+            self.assertFalse(self.window._paired_only_preference)
+            np.testing.assert_array_equal(paired[12, 14], base[12, 14])
+            np.testing.assert_array_equal(paired[3, 14], base[3, 14])
+            self.assertFalse(np.array_equal(all_regions[12, 14], base[12, 14]))
+            self.assertFalse(np.array_equal(all_regions[3, 14], base[3, 14]))
+            self.assertEqual(outline_path.read_bytes(), original_outline)
+            self.assertTrue(self.window._highlight_enabled)
+            self.assertEqual(self.window._selected_cell_id, "sample_1")
+            self.assertIsNone(self.window._pipeline_thread)
+            self.assertIn(image_path, self.window._current_all_overlay_polygons)
+
+    def test_outline_only_availability_recovers_after_failure_and_stop(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            _, _, base = self._load_outline_only_old_dataset(root)
+            self.window.chk_paired_only.setChecked(False)
+            self.window.input_dir_edit.setText(str(root))
+
+            with patch("ki67dtc.gui.main_window.PipelineThread"):
+                self.window._on_run_clicked()
+            self.assertFalse(self.window.chk_paired_only.isEnabled())
+            self.assertTrue(self.window.chk_paired_only.isChecked())
+            np.testing.assert_array_equal(
+                self.window._current_overlay_image_array[12, 14], base[12, 14]
+            )
+
+            self.window._on_pipeline_failed("測試失敗")
+            self.assertTrue(self.window.chk_paired_only.isEnabled())
+
+            self.window.chk_paired_only.setChecked(False)
+            with patch("ki67dtc.gui.main_window.PipelineThread"):
+                self.window._on_run_clicked()
+                self.window._on_stop_clicked()
+            self.assertTrue(self.window.chk_paired_only.isEnabled())
+            self.assertTrue(self.window.chk_paired_only.isChecked())
+            np.testing.assert_array_equal(
+                self.window._current_overlay_image_array[12, 14], base[12, 14]
+            )
+
+    def test_invalid_outline_only_dataset_disables_paired_toggle(self) -> None:
+        for content in ("", "not,a,polygon\n-1,-1\n"):
+            with self.subTest(content=content), TemporaryDirectory() as directory:
+                root = Path(directory)
+                _, outline_path, _ = self._load_outline_only_old_dataset(root)
+                outline_path.write_text(content, encoding="utf-8")
+                original_cwd = os.getcwd()
+                try:
+                    os.chdir(root)
+                    self.window._load_image_and_overlays(
+                        self.window._pipeline_result.image_files[0]
+                    )
+                finally:
+                    os.chdir(original_cwd)
+
+                self.assertFalse(self.window.chk_paired_only.isEnabled())
+                self.assertTrue(self.window.chk_paired_only.isChecked())
+                self.assertIn("僅能顯示核質配對", self.window._last_status_message)
+
+    def test_segmentation_masks_remain_preferred_over_merged_outlines(self) -> None:
+        original_cwd = os.getcwd()
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            image_dir = root / "data" / "input" / "demo" / "PC"
+            segment_dir = root / "data" / "output" / "segment" / "demo"
+            outline_dir = root / "data" / "output" / "outline" / "demo"
+            image_dir.mkdir(parents=True)
+            segment_dir.mkdir(parents=True)
+            outline_dir.mkdir(parents=True)
+            image_path = image_dir / "sample.png"
+            base = np.full((18, 18, 3), 100, dtype=np.uint8)
+            self.assertTrue(cv2.imwrite(str(image_path), base))
+            cyto_mask = np.zeros((18, 18), dtype=np.int32)
+            cyto_mask[2:11, 2:11] = 1
+            nuc_mask = np.zeros_like(cyto_mask)
+            nuc_mask[5:9, 5:9] = 1
+            np.save(segment_dir / "sample_cyto_seg.npy", {"masks": cyto_mask})
+            np.save(segment_dir / "sample_nuc_seg.npy", {"masks": nuc_mask})
+            (outline_dir / "sample_merged_cp_outlines.txt").write_text(
+                "5,5,9,5,9,9,5,9\n"
+                "2,2,11,2,11,11,2,11\n"
+                "-1,-1\n"
+                "12,1,16,1,16,6,12,6\n",
+                encoding="utf-8",
+            )
+            try:
+                os.chdir(root)
+                self.window._pipeline_result = PipelineResult(
+                    data_folder=root / "data" / "input" / "demo",
+                    image_files=[image_path],
+                )
+                self.window._current_image_index = 0
+                self.window._load_image_and_overlays(image_path)
+                self.window.chk_paired_only.setChecked(False)
+                QApplication.processEvents()
+            finally:
+                os.chdir(original_cwd)
+
+            np.testing.assert_array_equal(
+                self.window._current_overlay_image_array[3, 14], base[3, 14]
+            )
+            self.assertIn(image_path.stem, self.window._pipeline_result.paired_overlays)
 
     def test_missing_full_data_forces_paired_only_and_restores_preference(self) -> None:
         with TemporaryDirectory() as tmp_dir:

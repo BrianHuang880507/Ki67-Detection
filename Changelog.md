@@ -5,6 +5,8 @@
   * GUI overlay 控制列新增「僅顯示核質配對」開關，可即時切換
     Paired Only 與全部 segmentation 物件；此設定只影響畫面，不修改
     segmentation、CSV、XLSX 或自動輸出的 overlay PNG。
+  * 舊資料即使已清除 `*_seg.npy`，只要保留 merged outlines，GUI 仍可切換
+    Paired Only 與全部 segmentation 物件；來源檔與自動輸出維持不變。
 
 ## 2026.07.27
 

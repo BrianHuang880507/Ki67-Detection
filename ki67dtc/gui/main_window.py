@@ -32,6 +32,7 @@ from ..app_pipeline import (
     PipelineResult,
     _resolve_data_folder,
     find_merged_outline_for_image,
+    load_merged_outlines,
     load_paired_merged_outlines,
 )
 from ..paired_overlay import (
@@ -318,6 +319,9 @@ class MainWindow(QMainWindow):
         self._current_image_index: int | None = None
         self._current_image_array: np.ndarray | None = None
         self._current_overlay_polygons: dict[
+            Path, tuple[list[np.ndarray], list[np.ndarray]]
+        ] = {}
+        self._current_all_overlay_polygons: dict[
             Path, tuple[list[np.ndarray], list[np.ndarray]]
         ] = {}
         self._current_overlay_masks: dict[
@@ -1021,6 +1025,7 @@ class MainWindow(QMainWindow):
         self._current_image_index = None
         self._current_image_array = None
         self._current_overlay_polygons.clear()
+        self._current_all_overlay_polygons.clear()
         self._current_overlay_masks.clear()
         self._current_overlay_image = None
         self._current_overlay_image_array = None
@@ -1107,6 +1112,7 @@ class MainWindow(QMainWindow):
 
     def _on_pipeline_failed(self, message: str) -> None:
         """處理 pipeline 失敗訊息並恢復 Run 按鈕。"""
+        self._pipeline_thread = None
         self._set_running_state(False)
         self._restore_paired_only_control_availability()
         self._show_status_message(f"錯誤：{message}")
@@ -1159,14 +1165,20 @@ class MainWindow(QMainWindow):
             if self._pipeline_result is not None:
                 self._pipeline_result.paired_overlays[img_path.stem] = paired_data
 
-        self._set_paired_only_control_availability(paired_data is not None)
+        display_modes_available = (
+            paired_data is not None or self._has_all_outline_polygons(img_path)
+        )
+        self._set_paired_only_control_availability(display_modes_available)
 
         # 嘗試載入 outlines
         merged_path = find_merged_outline_for_image(img_path)
         nuc_polys: list[np.ndarray] = []
         cyto_polys: list[np.ndarray] = []
+        all_nuc_polys: list[np.ndarray] = []
+        all_cyto_polys: list[np.ndarray] = []
         if merged_path is None:
             self._current_overlay_polygons.pop(img_path, None)
+            self._current_all_overlay_polygons.pop(img_path, None)
             if nuc_mask is None and cyto_mask is None and paired_data is None:
                 self._current_overlay_image = None
                 self._current_overlay_image_array = None
@@ -1174,14 +1186,28 @@ class MainWindow(QMainWindow):
                 self._set_paired_only_control_availability(False, notify=True)
                 return
         else:
-            polygons = load_paired_merged_outlines(merged_path)
-            nuc_polys = polygons.nuc_polygons
-            cyto_polys = polygons.cyto_polygons
-            self._current_overlay_polygons[img_path] = (nuc_polys, cyto_polys)
+            paired_polygons = load_paired_merged_outlines(merged_path)
+            all_polygons = load_merged_outlines(merged_path)
+            nuc_polys = paired_polygons.nuc_polygons
+            cyto_polys = paired_polygons.cyto_polygons
+            all_nuc_polys = all_polygons.nuc_polygons
+            all_cyto_polys = all_polygons.cyto_polygons
+            if all_nuc_polys or all_cyto_polys:
+                self._current_overlay_polygons[img_path] = (nuc_polys, cyto_polys)
+                self._current_all_overlay_polygons[img_path] = (
+                    all_nuc_polys,
+                    all_cyto_polys,
+                )
+            else:
+                self._current_overlay_polygons.pop(img_path, None)
+                self._current_all_overlay_polygons.pop(img_path, None)
 
+        display_modes_available = (
+            paired_data is not None or self._has_all_outline_polygons(img_path)
+        )
         self._set_paired_only_control_availability(
-            paired_data is not None,
-            notify=paired_data is None,
+            display_modes_available,
+            notify=not display_modes_available,
         )
 
         overlay_bgr = self._create_overlay_bgr(
@@ -1191,6 +1217,8 @@ class MainWindow(QMainWindow):
             nuc_mask=nuc_mask,
             cyto_mask=cyto_mask,
             paired_data=paired_data,
+            all_nuc_polys=all_nuc_polys,
+            all_cyto_polys=all_cyto_polys,
         )
         self._current_overlay_image_array = overlay_bgr
         self._current_overlay_image = self._pixmap_from_bgr(overlay_bgr)
@@ -1283,6 +1311,13 @@ class MainWindow(QMainWindow):
             return None
         return self._pipeline_result.paired_overlays.get(image_path.stem)
 
+    def _has_all_outline_polygons(self, image_path: Path | None) -> bool:
+        """判斷目前影像是否保留可供雙模式顯示的 merged polygons。"""
+        if image_path is None:
+            return False
+        polygons = self._current_all_overlay_polygons.get(image_path)
+        return polygons is not None and bool(polygons[0] or polygons[1])
+
     def _blend_label_regions(
         self,
         overlay: np.ndarray,
@@ -1371,6 +1406,8 @@ class MainWindow(QMainWindow):
         nuc_mask: np.ndarray | None = None,
         cyto_mask: np.ndarray | None = None,
         paired_data: PairedOverlayData | None = None,
+        all_nuc_polys: list[np.ndarray] | None = None,
+        all_cyto_polys: list[np.ndarray] | None = None,
     ) -> np.ndarray:
         """根據目前設定，在 base 影像上畫出 mask 或輪廓，回傳 BGR 影像。"""
         if paired_data is not None:
@@ -1393,8 +1430,17 @@ class MainWindow(QMainWindow):
             if mask_overlay is not None:
                 blended = mask_overlay
             else:
+                display_nuc_polys = nuc_polys
+                display_cyto_polys = cyto_polys
+                if not self._paired_only_preference:
+                    if all_nuc_polys is not None:
+                        display_nuc_polys = all_nuc_polys
+                    if all_cyto_polys is not None:
+                        display_cyto_polys = all_cyto_polys
                 blended = self._create_outline_overlay_bgr(
-                    base_bgr, nuc_polys=nuc_polys, cyto_polys=cyto_polys
+                    base_bgr,
+                    nuc_polys=display_nuc_polys,
+                    cyto_polys=display_cyto_polys,
                 )
 
         if self._show_ki67:
@@ -1458,13 +1504,17 @@ class MainWindow(QMainWindow):
             return
 
         polys = self._current_overlay_polygons.get(img_path)
+        all_polys = self._current_all_overlay_polygons.get(img_path)
         masks = self._current_overlay_masks.get(img_path)
         paired_data = self._paired_overlay_data_for_image(img_path)
-        if polys is None and masks is None and paired_data is None:
+        if polys is None and all_polys is None and masks is None and paired_data is None:
             self._set_pixmap_in_view(self._pixmap_from_bgr(self._current_image_array))
             return
 
         nuc_polys, cyto_polys = polys if polys is not None else ([], [])
+        all_nuc_polys, all_cyto_polys = (
+            all_polys if all_polys is not None else (None, None)
+        )
         nuc_mask, cyto_mask = masks if masks is not None else (None, None)
         display_bgr = self._create_overlay_bgr(
             self._current_image_array,
@@ -1473,6 +1523,8 @@ class MainWindow(QMainWindow):
             nuc_mask=nuc_mask,
             cyto_mask=cyto_mask,
             paired_data=paired_data,
+            all_nuc_polys=all_nuc_polys,
+            all_cyto_polys=all_cyto_polys,
         )
 
         if self._highlight_enabled and self._selected_cell_id is not None:
@@ -1683,7 +1735,9 @@ class MainWindow(QMainWindow):
             masks is not None and masks[0] is not None and masks[1] is not None
         )
         self._set_paired_only_control_availability(
-            paired_data is not None or has_complete_masks
+            paired_data is not None
+            or has_complete_masks
+            or self._has_all_outline_polygons(image_path)
         )
 
     def _load_images_from_folder(self, raw_folder: Path) -> None:
@@ -1742,6 +1796,7 @@ class MainWindow(QMainWindow):
             self._current_image_index = None
             self._current_image_array = None
             self._current_overlay_polygons.clear()
+            self._current_all_overlay_polygons.clear()
             self._current_overlay_masks.clear()
             self._current_overlay_image = None
             self._current_overlay_image_array = None
