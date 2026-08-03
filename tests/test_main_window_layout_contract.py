@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -543,6 +544,19 @@ class MainWindowLayoutContractTest(unittest.TestCase):
 
             self.assertTrue(self.window._paired_only_preference)
             self.assertTrue(self.window.chk_paired_only.isChecked())
+
+    def test_running_new_dataset_restores_paired_only_default(self) -> None:
+        """Run 路徑啟動新資料集前應恢復 Paired Only 顯示偏好。"""
+        self.window.chk_paired_only.setEnabled(True)
+        self.window.chk_paired_only.setChecked(False)
+        self.window.input_dir_edit.setText("new-dataset")
+
+        with patch("ki67dtc.gui.main_window.PipelineThread"):
+            self.window._on_run_clicked()
+
+        self.assertTrue(self.window._paired_only_preference)
+        self.assertTrue(self.window.chk_paired_only.isChecked())
+        self.assertFalse(self.window.chk_paired_only.isEnabled())
 
 
 if __name__ == "__main__":

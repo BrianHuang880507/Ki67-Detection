@@ -959,6 +959,8 @@ class MainWindow(QMainWindow):
             return
 
         data_folder = Path(path_text)
+        self._paired_only_preference = True
+        self._set_paired_only_control_availability(False)
 
         self._pipeline_thread = PipelineThread(
             data_folder,
