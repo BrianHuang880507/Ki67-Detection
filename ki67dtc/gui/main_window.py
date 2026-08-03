@@ -327,6 +327,7 @@ class MainWindow(QMainWindow):
         self._current_overlay_masks: dict[
             Path, tuple[np.ndarray | None, np.ndarray | None]
         ] = {}
+        self._current_paired_polygon_indices: dict[Path, dict[int, int]] = {}
         self._current_overlay_image: QPixmap | None = None
         self._current_overlay_image_array: np.ndarray | None = None
         self._show_nuc: bool = True
@@ -1024,9 +1025,7 @@ class MainWindow(QMainWindow):
         self._pipeline_result = None
         self._current_image_index = None
         self._current_image_array = None
-        self._current_overlay_polygons.clear()
-        self._current_all_overlay_polygons.clear()
-        self._current_overlay_masks.clear()
+        self._clear_overlay_caches()
         self._current_overlay_image = None
         self._current_overlay_image_array = None
         self._current_data_folder = None
@@ -1056,6 +1055,7 @@ class MainWindow(QMainWindow):
         """處理 pipeline 成功結束後的影像清單與結果載入。"""
         self._set_running_state(False)
         self.progress_bar.setValue(100)
+        self._clear_overlay_caches()
         self._pipeline_result = result
         # 記錄目前資料夾
         self._current_data_folder = result.data_folder
@@ -1179,6 +1179,7 @@ class MainWindow(QMainWindow):
         if merged_path is None:
             self._current_overlay_polygons.pop(img_path, None)
             self._current_all_overlay_polygons.pop(img_path, None)
+            self._current_paired_polygon_indices.pop(img_path, None)
             if nuc_mask is None and cyto_mask is None and paired_data is None:
                 self._current_overlay_image = None
                 self._current_overlay_image_array = None
@@ -1192,6 +1193,12 @@ class MainWindow(QMainWindow):
             cyto_polys = paired_polygons.cyto_polygons
             all_nuc_polys = all_polygons.nuc_polygons
             all_cyto_polys = all_polygons.cyto_polygons
+            self._current_paired_polygon_indices[img_path] = {
+                record_index: compact_index
+                for compact_index, record_index in enumerate(
+                    paired_polygons.pair_record_indices
+                )
+            }
             if all_nuc_polys or all_cyto_polys:
                 self._current_overlay_polygons[img_path] = (nuc_polys, cyto_polys)
                 self._current_all_overlay_polygons[img_path] = (
@@ -1445,7 +1452,10 @@ class MainWindow(QMainWindow):
 
         if self._show_ki67:
             ki67_color = (203, 0, 255)  # 粉色
-            for idx in self._ki67_positive_indices_for_current_image():
+            for original_index in self._ki67_positive_indices_for_current_image():
+                idx = self._paired_polygon_index(original_index)
+                if idx is None:
+                    continue
                 if cyto_polys and 0 <= idx < len(cyto_polys):
                     pts = cyto_polys[idx].reshape(-1, 1, 2)
                 elif nuc_polys and 0 <= idx < len(nuc_polys):
@@ -1528,7 +1538,12 @@ class MainWindow(QMainWindow):
         )
 
         if self._highlight_enabled and self._selected_cell_id is not None:
-            idx = self._cell_index_from_cell_id(self._selected_cell_id)
+            original_index = self._cell_index_from_cell_id(self._selected_cell_id)
+            idx = (
+                self._paired_polygon_index(original_index, img_path)
+                if original_index is not None
+                else None
+            )
             if idx is not None:
                 if 0 <= idx < len(cyto_polys):
                     cyto_pts = cyto_polys[idx].reshape(-1, 1, 2)
@@ -1762,6 +1777,9 @@ class MainWindow(QMainWindow):
             if p.is_file() and p.suffix.lower() in exts:
                 image_files.append(p)
 
+        if image_files:
+            self._clear_overlay_caches()
+
         result_dir = data_folder.parent.parent / "output" / "results" / data_folder.name
         scatter_path = result_dir / "all_cell_nucleus_area.png"
         histogram_path = result_dir / "all_log_cell_area_distribution.png"
@@ -1795,9 +1813,7 @@ class MainWindow(QMainWindow):
         else:
             self._current_image_index = None
             self._current_image_array = None
-            self._current_overlay_polygons.clear()
-            self._current_all_overlay_polygons.clear()
-            self._current_overlay_masks.clear()
+            self._clear_overlay_caches()
             self._current_overlay_image = None
             self._current_overlay_image_array = None
             self.image_file_label.setText("Image File Name")
@@ -1904,6 +1920,36 @@ class MainWindow(QMainWindow):
         except ValueError:
             return None
         return index if index >= 0 else None
+
+    def _paired_polygon_index(
+        self,
+        original_index: int,
+        image_path: Path | None = None,
+    ) -> int | None:
+        """將 Cell_ID 原始 index 對應到壓縮後的配對 polygon index。
+
+        Args:
+            original_index: 從 Cell_ID 取得的原始 0-based record index。
+            image_path: 要查詢的影像；省略時使用目前選取影像。
+
+        Returns:
+            配對 polygon 的壓縮 index。影像已有 outline mapping 但該 record
+            損壞或未配對時回傳 ``None``；沒有 mapping 時維持原始 identity 行為。
+        """
+        target_path = image_path if image_path is not None else self._current_image_path()
+        if target_path is None:
+            return original_index
+        mapping = self._current_paired_polygon_indices.get(target_path)
+        if mapping is None:
+            return original_index
+        return mapping.get(original_index)
+
+    def _clear_overlay_caches(self) -> None:
+        """清除目前資料集專屬的 overlay 與配對 index caches。"""
+        self._current_overlay_polygons.clear()
+        self._current_all_overlay_polygons.clear()
+        self._current_overlay_masks.clear()
+        self._current_paired_polygon_indices.clear()
 
     def _row_matches_image(self, row: list[str], image_path: Path) -> bool:
         """判斷 cleaned CSV row 是否屬於目前影像。"""

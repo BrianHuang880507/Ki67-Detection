@@ -570,6 +570,77 @@ class MainWindowLayoutContractTest(unittest.TestCase):
             self.assertIsNone(self.window._pipeline_thread)
             self.assertIn(image_path, self.window._current_all_overlay_polygons)
 
+    def test_damaged_middle_outline_maps_record_three_ki67_and_highlight(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            image_dir = root / "data" / "input" / "demo" / "PC"
+            outline_dir = root / "data" / "output" / "outline" / "demo"
+            image_dir.mkdir(parents=True)
+            outline_dir.mkdir(parents=True)
+            image_path = image_dir / "sample.png"
+            base = np.full((32, 32, 3), 100, dtype=np.uint8)
+            self.assertTrue(cv2.imwrite(str(image_path), base))
+            (outline_dir / "sample_merged_cp_outlines.txt").write_text(
+                "3,3,6,3,6,6,3,6\n"
+                "1,1,8,1,8,8,1,8\n"
+                "11,11,14,11,14,14,11,14\n"
+                "-1,-1\n"
+                "22,22,25,22,25,25,22,25\n"
+                "19,19,28,19,28,28,19,28\n",
+                encoding="utf-8",
+            )
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(root)
+                self.window._pipeline_result = PipelineResult(
+                    data_folder=root / "data" / "input" / "demo",
+                    image_files=[image_path],
+                )
+                self.window._current_image_index = 0
+                self.window._load_image_and_overlays(image_path)
+
+                self.assertEqual(
+                    self.window._current_paired_polygon_indices[image_path],
+                    {0: 0, 2: 1},
+                )
+                self.assertEqual(self.window._paired_polygon_index(2), 1)
+                self.assertIsNone(self.window._paired_polygon_index(1))
+                self.window._selected_cell_id = "sample_3"
+                self.window._highlight_enabled = True
+                self.window._show_ki67 = False
+                self.window._update_display_pixmap()
+                highlighted = self.window._current_overlay_image_array.copy()
+
+                np.testing.assert_array_equal(
+                    highlighted[19, 19], np.array([0, 255, 255])
+                )
+                self.assertFalse(
+                    np.array_equal(highlighted[1, 1], np.array([0, 255, 255]))
+                )
+
+                self.window._highlight_enabled = False
+                self.window._show_ki67 = True
+                self.window._cleaned_csv_header = ["Cell_ID", "ki67_positive"]
+                self.window._cleaned_csv_rows = [["sample_3", "1"]]
+                self.window.chk_paired_only.setChecked(False)
+                QApplication.processEvents()
+                ki67 = self.window._current_overlay_image_array
+
+                self.assertFalse(self.window._paired_only_preference)
+                np.testing.assert_array_equal(
+                    ki67[19, 19], np.array([203, 0, 255])
+                )
+                self.assertFalse(
+                    np.array_equal(ki67[1, 1], np.array([203, 0, 255]))
+                )
+            finally:
+                os.chdir(original_cwd)
+
+    def test_paired_polygon_index_preserves_identity_without_outline_mapping(
+        self,
+    ) -> None:
+        self.assertEqual(self.window._paired_polygon_index(2), 2)
+
     def test_outline_only_availability_recovers_after_failure_and_stop(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -723,6 +794,74 @@ class MainWindowLayoutContractTest(unittest.TestCase):
 
             self.assertTrue(self.window._paired_only_preference)
             self.assertTrue(self.window.chk_paired_only.isChecked())
+
+    def test_loading_new_nonempty_dataset_clears_overlay_caches_before_first_image(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            dataset = root / "data" / "input" / "replacement"
+            pc_dir = dataset / "PC"
+            pc_dir.mkdir(parents=True)
+            image_path = pc_dir / "new.png"
+            base = np.full((8, 8, 3), 120, dtype=np.uint8)
+            self.assertTrue(cv2.imwrite(str(image_path), base))
+            stale_path = root / "stale.png"
+            polygon = np.array([[0, 0], [1, 0], [1, 1]], dtype=np.int32)
+            mask = np.ones((2, 2), dtype=np.int32)
+            self.window._current_overlay_polygons[stale_path] = ([polygon], [polygon])
+            self.window._current_all_overlay_polygons[stale_path] = (
+                [polygon],
+                [polygon],
+            )
+            self.window._current_overlay_masks[stale_path] = (mask, mask)
+            self.window._current_paired_polygon_indices[stale_path] = {0: 0}
+
+            self.window._load_images_from_folder(dataset)
+
+            self.assertNotIn(stale_path, self.window._current_overlay_polygons)
+            self.assertNotIn(stale_path, self.window._current_all_overlay_polygons)
+            self.assertNotIn(stale_path, self.window._current_overlay_masks)
+            self.assertNotIn(stale_path, self.window._current_paired_polygon_indices)
+            self.assertEqual(self.window.image_file_label.text(), "new.png")
+            np.testing.assert_array_equal(self.window._current_image_array, base)
+
+    def test_successful_pipeline_replacement_clears_caches_before_first_image(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            dataset = root / "replacement"
+            dataset.mkdir()
+            image_path = dataset / "new.png"
+            base = np.full((8, 8, 3), 130, dtype=np.uint8)
+            self.assertTrue(cv2.imwrite(str(image_path), base))
+            stale_path = root / "stale.png"
+            polygon = np.array([[0, 0], [1, 0], [1, 1]], dtype=np.int32)
+            mask = np.ones((2, 2), dtype=np.int32)
+            self.window._current_overlay_polygons[stale_path] = ([polygon], [polygon])
+            self.window._current_all_overlay_polygons[stale_path] = (
+                [polygon],
+                [polygon],
+            )
+            self.window._current_overlay_masks[stale_path] = (mask, mask)
+            self.window._current_paired_polygon_indices[stale_path] = {0: 0}
+            result = PipelineResult(data_folder=dataset, image_files=[image_path])
+
+            with (
+                patch("ki67dtc.gui.main_window.save_pipeline_fill_overlays", return_value=[]),
+                patch.object(self.window, "_load_cleaned_csv_for_dataset"),
+                patch.object(self.window, "_load_area_charts"),
+                patch.object(self.window, "_show_analysis_complete_dialog"),
+            ):
+                self.window._on_pipeline_finished(result)
+
+            self.assertNotIn(stale_path, self.window._current_overlay_polygons)
+            self.assertNotIn(stale_path, self.window._current_all_overlay_polygons)
+            self.assertNotIn(stale_path, self.window._current_overlay_masks)
+            self.assertNotIn(stale_path, self.window._current_paired_polygon_indices)
+            self.assertEqual(self.window.image_file_label.text(), "new.png")
+            np.testing.assert_array_equal(self.window._current_image_array, base)
 
     def test_running_new_dataset_restores_paired_only_default(self) -> None:
         """Run 路徑啟動新資料集前應恢復 Paired Only 顯示偏好。"""

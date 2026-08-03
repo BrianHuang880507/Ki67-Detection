@@ -27,10 +27,18 @@ class PipelineResult:
 
 @dataclass
 class OverlayPolygons:
-    """GUI 疊圖所需的 nucleus 與 cytoplasm polygon 集合。"""
+    """GUI 疊圖所需的 nucleus 與 cytoplasm polygon 集合。
+
+    Attributes:
+        nuc_polygons: 依載入模式保留的 nucleus polygons。
+        cyto_polygons: 依載入模式保留的 cytoplasm polygons。
+        pair_record_indices: 每組完整配對在原始檔案中的 0-based record index；
+            非配對載入模式維持空串列。
+    """
 
     nuc_polygons: list[np.ndarray]
     cyto_polygons: list[np.ndarray]
+    pair_record_indices: list[int] = field(default_factory=list)
 
 
 def _resolve_data_folder(raw_data_folder: Path) -> Path:
@@ -256,6 +264,9 @@ def _parse_merged_outline_polygon(line: str) -> np.ndarray | None:
         return None
     if len(coords) < 6 or len(coords) % 2:
         return None
+    int32_info = np.iinfo(np.int32)
+    if any(coord < int32_info.min or coord > int32_info.max for coord in coords):
+        return None
     return np.asarray(coords, dtype=np.int32).reshape(-1, 2)
 
 
@@ -296,6 +307,7 @@ def load_paired_merged_outlines(merged_path: Path) -> OverlayPolygons:
     lines = _load_merged_outline_lines(merged_path)
     nucleus_polygons: list[np.ndarray] = []
     cytoplasm_polygons: list[np.ndarray] = []
+    pair_record_indices: list[int] = []
     for index in range(0, len(lines) - 1, 2):
         nucleus = _parse_merged_outline_polygon(lines[index])
         cytoplasm = _parse_merged_outline_polygon(lines[index + 1])
@@ -303,4 +315,9 @@ def load_paired_merged_outlines(merged_path: Path) -> OverlayPolygons:
             continue
         nucleus_polygons.append(nucleus)
         cytoplasm_polygons.append(cytoplasm)
-    return OverlayPolygons(nucleus_polygons, cytoplasm_polygons)
+        pair_record_indices.append(index // 2)
+    return OverlayPolygons(
+        nucleus_polygons,
+        cytoplasm_polygons,
+        pair_record_indices=pair_record_indices,
+    )

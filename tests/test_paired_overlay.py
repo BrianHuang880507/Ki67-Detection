@@ -257,6 +257,72 @@ class PairedOverlayTest(unittest.TestCase):
             self.assertEqual(all_polygons.nuc_polygons, [])
             self.assertEqual(all_polygons.cyto_polygons, [])
 
+    def test_merged_outline_loaders_return_empty_for_existing_empty_file(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            merged_path = Path(temporary_directory) / "empty_merged_cp_outlines.txt"
+            merged_path.touch()
+
+            paired = load_paired_merged_outlines(merged_path)
+            all_polygons = load_merged_outlines(merged_path)
+
+            self.assertEqual(paired.nuc_polygons, [])
+            self.assertEqual(paired.cyto_polygons, [])
+            self.assertEqual(paired.pair_record_indices, [])
+            self.assertEqual(all_polygons.nuc_polygons, [])
+            self.assertEqual(all_polygons.cyto_polygons, [])
+
+    def test_merged_outline_loaders_reject_all_invalid_and_odd_polygons(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            merged_path = Path(temporary_directory) / "invalid_merged_cp_outlines.txt"
+            merged_path.write_text(
+                "not,a,polygon\n"
+                "1,2,3,4,5\n"
+                "1,2,3,4\n"
+                "-1,-1\n",
+                encoding="utf-8",
+            )
+
+            paired = load_paired_merged_outlines(merged_path)
+            all_polygons = load_merged_outlines(merged_path)
+
+            self.assertEqual(paired.nuc_polygons, [])
+            self.assertEqual(paired.cyto_polygons, [])
+            self.assertEqual(paired.pair_record_indices, [])
+            self.assertEqual(all_polygons.nuc_polygons, [])
+            self.assertEqual(all_polygons.cyto_polygons, [])
+
+    def test_merged_outline_loaders_reject_out_of_range_coordinates_per_side(
+        self,
+    ) -> None:
+        int32_max = np.iinfo(np.int32).max
+        int32_min = np.iinfo(np.int32).min
+        with TemporaryDirectory() as temporary_directory:
+            merged_path = Path(temporary_directory) / "overflow_merged_cp_outlines.txt"
+            merged_path.write_text(
+                f"{int32_max + 1},1,5,1,5,5,1,5\n"
+                "0,0,6,0,6,6,0,6\n"
+                "20,20,24,20,24,24,20,24\n"
+                f"{int32_min - 1},16,28,16,28,28,16,28\n",
+                encoding="utf-8",
+            )
+
+            paired = load_paired_merged_outlines(merged_path)
+            all_polygons = load_merged_outlines(merged_path)
+
+            self.assertEqual(paired.nuc_polygons, [])
+            self.assertEqual(paired.cyto_polygons, [])
+            self.assertEqual(paired.pair_record_indices, [])
+            self.assertEqual(len(all_polygons.nuc_polygons), 1)
+            self.assertEqual(len(all_polygons.cyto_polygons), 1)
+            np.testing.assert_array_equal(
+                all_polygons.nuc_polygons[0],
+                np.array([[20, 20], [24, 20], [24, 24], [20, 24]], dtype=np.int32),
+            )
+            np.testing.assert_array_equal(
+                all_polygons.cyto_polygons[0],
+                np.array([[0, 0], [6, 0], [6, 6], [0, 6]], dtype=np.int32),
+            )
+
     def test_saved_outline_fallback_remains_paired_only(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
