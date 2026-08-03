@@ -8,7 +8,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import cv2
 import numpy as np
 
-from ki67dtc.app_pipeline import PipelineResult, load_paired_merged_outlines
+from ki67dtc.app_pipeline import (
+    PipelineResult,
+    load_merged_outlines,
+    load_paired_merged_outlines,
+)
 from ki67dtc.gui.main_window import save_pipeline_fill_overlays
 from ki67dtc.paired_overlay import (
     build_paired_overlay_data,
@@ -208,6 +212,85 @@ class PairedOverlayTest(unittest.TestCase):
                 polygons.nuc_polygons[0],
                 np.array([[1, 1], [3, 1], [3, 3], [1, 3]], dtype=np.int32),
             )
+
+    def test_merged_outline_loaders_separate_paired_and_all_records(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            merged_path = Path(temporary_directory) / "sample_merged_cp_outlines.txt"
+            merged_path.write_text(
+                "1,1,5,1,5,5,1,5\n"
+                "0,0,6,0,6,6,0,6\n"
+                "8,8,12,8,12,12,8,12\n"
+                "-1,-1\n"
+                "-1,-1\n"
+                "8,1,13,1,13,6,8,6\n"
+                "not,a,polygon\n"
+                "14,1,18,1,18,5,14,5\n"
+                "20,20,24,20,24,24,20,24\n",
+                encoding="utf-8",
+            )
+
+            paired = load_paired_merged_outlines(merged_path)
+            all_polygons = load_merged_outlines(merged_path)
+
+            self.assertEqual(len(paired.nuc_polygons), 1)
+            self.assertEqual(len(paired.cyto_polygons), 1)
+            self.assertEqual(len(all_polygons.nuc_polygons), 2)
+            self.assertEqual(len(all_polygons.cyto_polygons), 3)
+            np.testing.assert_array_equal(
+                all_polygons.nuc_polygons[1],
+                np.array([[8, 8], [12, 8], [12, 12], [8, 12]], dtype=np.int32),
+            )
+            np.testing.assert_array_equal(
+                all_polygons.cyto_polygons[-1],
+                np.array([[14, 1], [18, 1], [18, 5], [14, 5]], dtype=np.int32),
+            )
+
+    def test_merged_outline_loaders_return_empty_for_unreadable_file(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            missing_path = Path(temporary_directory) / "missing_merged_cp_outlines.txt"
+
+            paired = load_paired_merged_outlines(missing_path)
+            all_polygons = load_merged_outlines(missing_path)
+
+            self.assertEqual(paired.nuc_polygons, [])
+            self.assertEqual(paired.cyto_polygons, [])
+            self.assertEqual(all_polygons.nuc_polygons, [])
+            self.assertEqual(all_polygons.cyto_polygons, [])
+
+    def test_saved_outline_fallback_remains_paired_only(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            image_dir = root / "data" / "input" / "demo" / "PC"
+            outline_dir = root / "data" / "output" / "outline" / "demo"
+            results_dir = root / "data" / "output" / "results" / "demo"
+            image_dir.mkdir(parents=True)
+            outline_dir.mkdir(parents=True)
+            image_path = image_dir / "sample.png"
+            base = np.full((18, 18, 3), 100, dtype=np.uint8)
+            self.assertTrue(cv2.imwrite(str(image_path), base))
+            (outline_dir / "sample_merged_cp_outlines.txt").write_text(
+                "5,5,9,5,9,9,5,9\n"
+                "2,2,11,2,11,11,2,11\n"
+                "12,10,16,10,16,15,12,15\n"
+                "-1,-1\n"
+                "-1,-1\n"
+                "12,1,16,1,16,6,12,6\n",
+                encoding="utf-8",
+            )
+            result = PipelineResult(
+                data_folder=root / "data" / "input" / "demo",
+                image_files=[image_path],
+                results_dir=results_dir,
+            )
+
+            saved_path = save_pipeline_fill_overlays(result, alpha=0.5)[0]
+            saved = cv2.imread(str(saved_path), cv2.IMREAD_COLOR)
+
+            self.assertIsNotNone(saved)
+            assert saved is not None
+            self.assertFalse(np.array_equal(saved[3, 3], base[3, 3]))
+            np.testing.assert_array_equal(saved[12, 14], base[12, 14])
+            np.testing.assert_array_equal(saved[3, 14], base[3, 14])
 
 
 if __name__ == "__main__":

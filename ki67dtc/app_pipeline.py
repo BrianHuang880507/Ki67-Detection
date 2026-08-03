@@ -223,78 +223,84 @@ def find_merged_outline_for_image(image_path: Path) -> Path | None:
     return merged_path if merged_path.exists() else None
 
 
-def load_merged_outlines(merged_path: Path) -> OverlayPolygons:
-    """讀取 merged_cp_outlines.txt 並拆成 nucleus / cytoplasm polygons。
-
-    檔案格式：兩行為一組，偶數行 (0-based) 為 nucleus，奇數行為 cytoplasm。
-    缺少一側時會以 "-1,-1" 佔位，這裡會直接略過該行。
-    """
-    nuc_polys: list[np.ndarray] = []
-    cyto_polys: list[np.ndarray] = []
-
-    with merged_path.open("r") as f:
-        lines = [ln.strip() for ln in f.readlines() if ln.strip()]
-
-    def _line_to_poly(line: str) -> Optional[np.ndarray]:
-        """將 merged outline 單行座標轉為 polygon 陣列。"""
-        if line == "-1,-1":
-            return None
-        coords = list(map(int, line.split(",")))
-        if len(coords) < 6:  # 至少 3 個點
-            return None
-        arr = np.asarray(coords, dtype=np.int32).reshape(-1, 2)
-        return arr
-
-    for idx, line in enumerate(lines):
-        poly = _line_to_poly(line)
-        if poly is None:
-            continue
-        if idx % 2 == 0:
-            nuc_polys.append(poly)
-        else:
-            cyto_polys.append(poly)
-
-    return OverlayPolygons(nuc_polygons=nuc_polys, cyto_polygons=cyto_polys)
-
-
-def load_paired_merged_outlines(merged_path: Path) -> OverlayPolygons:
-    """讀取 merged outlines，只保留核與質兩側都存在的配對。
-
-    這是原始 segmentation masks 不存在時的顯示 fallback。正常 pipeline
-    會優先使用記憶體中的 SegUI 中心點配對結果。
+def _load_merged_outline_lines(merged_path: Path) -> list[str]:
+    """安全讀取 merged outlines 的非空白資料列。
 
     Args:
-        merged_path: ``*_merged_cp_outlines.txt`` 路徑。
+        merged_path: ``*_merged_cp_outlines.txt`` 檔案路徑。
 
     Returns:
-        核與質索引彼此對齊的 polygon 集合。
+        已移除前後空白的非空白資料列；檔案無法讀取時回傳空串列。
     """
-    with merged_path.open("r", encoding="utf-8", errors="ignore") as file:
-        lines = [line.strip() for line in file if line.strip()]
+    try:
+        with merged_path.open("r", encoding="utf-8", errors="ignore") as file:
+            return [line.strip() for line in file if line.strip()]
+    except OSError:
+        return []
 
-    def parse_polygon(line: str) -> np.ndarray | None:
-        """解析單行 outline；缺值或格式錯誤時回傳 ``None``。"""
-        if line == "-1,-1":
-            return None
-        try:
-            coords = list(map(int, line.split(",")))
-        except ValueError:
-            return None
-        if len(coords) < 6 or len(coords) % 2:
-            return None
-        return np.asarray(coords, dtype=np.int32).reshape(-1, 2)
 
+def _parse_merged_outline_polygon(line: str) -> np.ndarray | None:
+    """將單筆 merged outline 解析為 polygon。
+
+    Args:
+        line: 以逗號分隔的 x、y 座標，或缺失標記 ``-1,-1``。
+
+    Returns:
+        合法座標的 ``int32`` polygon；缺失或格式無效時回傳 ``None``。
+    """
+    if line == "-1,-1":
+        return None
+    try:
+        coords = list(map(int, line.split(",")))
+    except ValueError:
+        return None
+    if len(coords) < 6 or len(coords) % 2:
+        return None
+    return np.asarray(coords, dtype=np.int32).reshape(-1, 2)
+
+
+def load_merged_outlines(merged_path: Path) -> OverlayPolygons:
+    """讀取 merged outlines 中所有有效的 nucleus 與 cytoplasm polygons。
+
+    Args:
+        merged_path: ``*_merged_cp_outlines.txt`` 檔案路徑。
+
+    Returns:
+        依原始列位置分類的有效 polygon；不完整配對中的有效 polygon 也會保留。
+    """
+    lines = _load_merged_outline_lines(merged_path)
     nucleus_polygons: list[np.ndarray] = []
     cytoplasm_polygons: list[np.ndarray] = []
     for index in range(0, len(lines) - 1, 2):
-        nucleus = parse_polygon(lines[index])
-        cytoplasm = parse_polygon(lines[index + 1])
+        nucleus = _parse_merged_outline_polygon(lines[index])
+        cytoplasm = _parse_merged_outline_polygon(lines[index + 1])
+        if nucleus is not None:
+            nucleus_polygons.append(nucleus)
+        if cytoplasm is not None:
+            cytoplasm_polygons.append(cytoplasm)
+    return OverlayPolygons(nucleus_polygons, cytoplasm_polygons)
+
+
+def load_paired_merged_outlines(merged_path: Path) -> OverlayPolygons:
+    """讀取 merged outlines 中完整配對的 nucleus 與 cytoplasm polygons。
+
+    僅保留同一配對中兩者皆有效的 polygon，供 segmentation masks 不存在時的
+    舊版 outline fallback 使用。
+
+    Args:
+        merged_path: ``*_merged_cp_outlines.txt`` 檔案路徑。
+
+    Returns:
+        完整配對的 nucleus 與 cytoplasm polygon。
+    """
+    lines = _load_merged_outline_lines(merged_path)
+    nucleus_polygons: list[np.ndarray] = []
+    cytoplasm_polygons: list[np.ndarray] = []
+    for index in range(0, len(lines) - 1, 2):
+        nucleus = _parse_merged_outline_polygon(lines[index])
+        cytoplasm = _parse_merged_outline_polygon(lines[index + 1])
         if nucleus is None or cytoplasm is None:
             continue
         nucleus_polygons.append(nucleus)
         cytoplasm_polygons.append(cytoplasm)
-
-    return OverlayPolygons(
-        nuc_polygons=nucleus_polygons,
-        cyto_polygons=cytoplasm_polygons,
-    )
+    return OverlayPolygons(nucleus_polygons, cytoplasm_polygons)
