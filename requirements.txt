@@ -1,30 +1,46 @@
-# Install pyimagej + Java with mamba first (see README.md):
-#   mamba create -n ki67 python=3.10 pyimagej openjdk=11 pip -c conda-forge -y
-# Then install the remaining pip dependencies:
-#   pip install -r requirements.txt
-# Supported Python range: 3.10-3.12. Cellpose 3.1.1.1 requires numpy<2.1.
+# pip-only 相依套件 —— 只放 conda-forge 無法乾淨提供的套件。
+#
+# 完整安裝步驟見 README.md，摘要：
+#   1. mamba env create -f environment.yml
+#   2. mamba activate ki67dtc
+#   3. pip install torch torchvision --index-url <見下方>
+#   4. pip install -r requirements.txt
+#   5. python scripts/check_env.py
+#
+# ---------------------------------------------------------------------------
+# PyTorch 為什麼不在這個檔案裡
+# ---------------------------------------------------------------------------
+# torch/torchvision 必須從 PyTorch 官方 index 安裝，而 --index-url 一旦寫進
+# requirements.txt 就會套用到檔案裡的每個套件，導致 pip 跑去 PyTorch index
+# 找 cellpose 等套件。因此請用獨立指令安裝：
+#
+#   NVIDIA GPU（CUDA 13.0）：
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+#   純 CPU：
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#
+# 不要安裝 torchaudio：本專案沒有任何程式碼引用它，而且它的 CUDA 版本容易
+# 與 torch 不一致而無法載入。
+#
+# ---------------------------------------------------------------------------
+# 加套件前請先確認
+# ---------------------------------------------------------------------------
+# conda-forge 有提供的套件請加到 environment.yml，不要加在這裡。用 pip 安裝
+# conda 已提供的套件會覆蓋掉 conda 版本，原生函式庫因此對不起來 —— numpy、
+# scipy、pandas、matplotlib 過去就是這樣被換掉的。
+# ---------------------------------------------------------------------------
 
-pyimagej
-scyjava
-jpype1
+# 影像分割主體。版本鎖定 3.1.1.1，本專案的模型檔以此版本產出。
 cellpose==3.1.1.1
-pandas
-numpy>=1.20,<2.1
-scipy
-mahotas
-scikit-learn
-xgboost
-lightgbm
-torch
-torchvision
-matplotlib
-openpyxl
-imageio
-scikit-image
-tifffile
-opencv-python-headless
-shapely
-fastremap
-natsort
-tqdm
-PyYAML
+
+# cellpose 相依，且 conda-forge 沒有 headless 版本（conda 的 opencv 會帶入
+# GUI 相依，和 environment.yml 的 pyqt6 重複）。
+opencv-python-headless==4.13.0.92
+
+# cellpose 相依，conda-forge 未提供對應的 Windows build。
+fastremap==1.18.0
+roifile==2025.12.12
+
+# cellpose 的 JIT 相依。numba 對 numpy 版本敏感，此組合已與 numpy<2.1 一起驗證。
+numba==0.64.0
+llvmlite==0.46.0

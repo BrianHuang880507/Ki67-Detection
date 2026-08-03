@@ -1,0 +1,70 @@
+# Ki67-Detection conda environment.
+#
+#   mamba env create -f environment.yml
+#   mamba activate ki67dtc
+#
+# Then install PyTorch and the pip-only packages -- see the install section in
+# README.md (written in Chinese, with the full rationale for this split).
+#
+# NOTE: keep this file ASCII-only. conda's "explicit" spec plugin reads it with
+# the system locale encoding first, and non-ASCII bytes make it log a decode
+# error on CJK Windows before it falls back to the YAML parser.
+#
+# What belongs here: anything with compiled extensions or that links against
+# native libraries (BLAS, Qt, the JVM). Letting conda solve those together is
+# what keeps pip from overwriting a conda build and breaking the DLL graph.
+# Add conda-forge packages here; put pip-only packages in requirements.txt.
+name: ki67dtc
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.10
+
+  # --- BLAS backend (important: do not switch back to MKL) ---
+  # Pinning OpenBLAS keeps MKL out of the environment. MKL's
+  # mkl_intel_thread.dll loads libiomp5md.dll, and PyTorch ships its own DLL
+  # with that same base name. Windows loads only one module per base name per
+  # process, so whichever loses leaves torch_cpu.dll short of the symbols it
+  # imports, and torch fails to import with:
+  #   [WinError 127] Error loading "...\torch\lib\shm.dll" or one of its dependencies.
+  # OpenBLAS uses pthreads, not OpenMP, so it never enters that contest.
+  - libblas=*=*openblas
+
+  # --- PyImageJ / Java ---
+  # pyimagej cannot be installed correctly with pip; conda must provide it.
+  - openjdk=11
+  - maven
+  - pyimagej
+  - scyjava
+  - jpype1
+
+  # --- Scientific stack ---
+  # numpy must stay below 2.1 (cellpose 3.1.1.1 requires it). Pinning it here
+  # means pip sees the constraint as already satisfied when it installs
+  # cellpose, so it leaves the conda build in place instead of replacing it.
+  - numpy<2.1
+  - scipy
+  - pandas
+  - matplotlib-base
+  - scikit-image
+  - scikit-learn
+  - mahotas
+  - shapely
+  - tifffile
+  - imagecodecs
+
+  # --- GUI ---
+  - pyqt6
+
+  # --- Everything else conda-forge can provide ---
+  - openpyxl
+  - imageio
+  - tqdm
+  - natsort
+  - pyyaml
+  - xgboost
+  - lightgbm
+
+  - pip

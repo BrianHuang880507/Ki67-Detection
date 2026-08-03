@@ -38,39 +38,58 @@ Ki67 Detection是一套自動化細胞影像分析系統，用於細胞分割、
 
 ## 環境需求
 
-- Python 3.10-3.12
+- Python 3.10-3.12（`cellpose==3.1.1.1` 需要 `numpy<2.1`，尚不支援 3.13）
 - Mamba 或 Conda
-- OpenJDK 11，供 PyImageJ/Fiji 後端使用
-- NVIDIA GPU/CUDA 建議使用；目前 Cellpose 影像分割以 `gpu=True` 初始化模型
+- OpenJDK 11，供 PyImageJ/Fiji 後端使用（由 `environment.yml` 一併安裝）
+- NVIDIA GPU/CUDA 建議使用；預設以 GPU 執行 Cellpose 分割，可用 `--device cpu` 或 `分析選項 > 運算裝置` 改為 CPU。無 GPU 的機器選 GPU 時 Cellpose 會自行退回 CPU
 - 專案 Cellpose 模型，例如 `model/model_BDL6_label_new`
 - 影像資料放在 `data/input/<資料集>/`
 
-主要 Python 套件列在 [requirements.txt](requirements.txt)。`cellpose==3.1.1.1` 需要 `numpy<2.1`，目前不建議使用 Python 3.13。圖形介面入口使用 PyQt6；若環境尚未安裝，請另外安裝 `PyQt6`。
+相依套件分成兩個檔案，界線是「能不能交給 conda」：
+
+| 檔案 | 內容 |
+| --- | --- |
+| [environment.yml](environment.yml) | 含編譯擴充、會連結 BLAS / Qt / JVM 的套件，一律由 conda-forge 提供 |
+| [requirements.txt](requirements.txt) | 只放 conda-forge 無法乾淨提供的 pip 套件 |
+
+**請維持這條界線。** 用 pip 安裝 conda 已提供的套件會把 conda 版本覆蓋掉，原生函式庫因此對不起來。最典型的症狀是啟動 GUI 或匯入 Cellpose 時出現：
+
+```
+[WinError 127] Error loading "...\torch\lib\shm.dll" or one of its dependencies.
+```
+
+成因是 conda 的 MKL 與 PyTorch 各自帶了一份 `libiomp5md.dll`，而 Windows 每個行程只能載入一份同名模組。`environment.yml` 以 `libblas=*=*openblas` 排除 MKL 來根治，細節寫在該檔註解。
 
 ---
 
 ## 安裝步驟
 
 ```bash
-# 複製專案
+# 複製專案並進入目錄
 git clone https://github.com/BrianHuang880507/Ki67-Detection.git
-
-# 進入專案目錄
 cd Ki67-Detection
-
-# 建立環境，先安裝 PyImageJ 與 Java
-mamba create -n ki67 python=3.10 pyimagej openjdk=11 pip -c conda-forge -y
-mamba activate ki67
 
 # 若無 mamba
 conda install -n base -c conda-forge mamba
 
-# 安裝其餘相依套件
+# 1. 建立 conda 環境（PyImageJ、Java、科學運算套件、PyQt6 都在這一步）
+mamba env create -f environment.yml
+mamba activate ki67dtc
+
+# 2. 安裝 PyTorch，依硬體擇一
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130  # NVIDIA GPU
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu    # 純 CPU
+
+# 3. 安裝 pip-only 套件
 pip install -r requirements.txt
 
-# 如需使用圖形介面
-pip install PyQt6
+# 4. 驗證環境
+python scripts/check_env.py
 ```
+
+第 4 步會重現當初造成 `WinError 127` 的匯入順序，全部通過才算安裝完成。
+
+執行任何指令或 GUI 前請先 `mamba activate ki67dtc`。未啟用環境而直接呼叫 `python.exe` 絕對路徑時，`JAVA_HOME` 與環境的 `Library\bin` 都不會設定，PyImageJ 會無法啟動 JVM。
 
 若使用既有 Fiji 安裝，可設定 `FIJI_APP_PATH` 指向 Fiji 應用程式路徑；若未設定，程式會嘗試透過 PyImageJ 初始化 Fiji。
 
@@ -149,11 +168,12 @@ python main.py --data_folder data/input/example_data --nuc_source dapi --ki67_ba
 常用參數：
 
 - `--data_folder`：待測資料集名稱或路徑；若只給名稱，會優先搜尋 `data/input/<資料集>`。
-- `--nuc_source`：細胞核分割來源，可用 `dapi` 或 `pc`。
+- `--device`：分割使用的運算裝置，可用 `gpu` 或 `cpu`，預設 `gpu`。
+- `--nuc_source`：細胞核分割來源，可用 `dapi` 或 `pc`，預設 `pc`。
 - `--fluor_analy`：啟用螢光強度分析。
 - `--ki67`：啟用 Ki67 陽性分析。
 - `--ki67_backend`：Ki67 二值化後端，可用 `pyimagej` 或 `opencv`。
-- `--feature_backend`：特徵提取後端，可用 `pyimagej` 或 `python`。`python` 特徵提取本身不會啟動 JVM。
+- `--feature_backend`：特徵提取後端，可用 `pyimagej` 或 `python`，預設 `python`。`python` 特徵提取本身不會啟動 JVM。
 - `--clean_temp`：清理中間暫存檔。
 - `--xlsx-version`：cleaned XLSX 版本，可用 `engineer`、`biomedical` 或 `both`；CLI
   預設為 `engineer`。
@@ -218,9 +238,10 @@ python app.py
 新版主畫面採用 SegmentationUI 風格，主要操作集中在上方選單：
 
 - `檔案 > 開啟`：選擇輸入資料夾，等同於原本的輸入資料夾功能。
-- `分析選項 > 核來源`：選擇 `DAPI` 或 `PC`。
+- `分析選項 > 運算裝置`：選擇 `GPU` 或 `CPU`，預設 `GPU`。
+- `分析選項 > 核來源`：選擇 `DAPI` 或 `PC`，預設 `PC`。
 - `分析選項 > Ki67 Backend`：選擇 Ki67 二值化後端，目前提供 `PyImageJ` 與 `OpenCV`。
-- `分析選項 > 分析方法`：選擇特徵提取後端，目前提供 `PyImageJ` 與 `Python`。
+- `分析選項 > 分析方法`：選擇特徵提取後端，目前提供 `PyImageJ` 與 `Python`，預設 `Python`。
 - `分析選項 > 螢光分析`：勾選或取消螢光強度分析。
 - `分析選項 > Ki67 分析`：勾選或取消 Ki67 陽性分析。
 - `分析選項 > 清理暫存檔案`：勾選或取消分析後清理中間檔。
