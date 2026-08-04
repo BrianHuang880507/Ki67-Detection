@@ -11,6 +11,7 @@ from sklearn.dummy import DummyRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+import immunity.exp3.benchmark as benchmark_module
 from immunity.exp3.benchmark import (
     FAILURE_COLUMNS,
     FEATURE_IMPORTANCE_COLUMNS,
@@ -357,7 +358,7 @@ def test_nested_benchmark_uses_shared_splits_and_exact_result_schemas() -> None:
     assert set(by_model.index) == set(build_model_registry(make_tiny_config()))
     assert all(split_ids == expected_split_ids for split_ids in by_model)
     assert result.failures.empty
-    assert result.fold_metrics["status"].eq("success").all()
+    assert result.fold_metrics["status"].eq("ok").all()
     assert np.isfinite(result.predictions["predicted_ido_score"]).all()
     importance_features = result.feature_importance.groupby("model")["feature"].apply(
         list
@@ -442,7 +443,7 @@ def test_nonfinite_predictions_are_recorded_as_fold_failure(
     assert set(result.predictions["model"]) == {"paper_linear_3f"}
     assert result.fold_metrics.set_index("model")["status"].to_dict() == {
         "dummy_median": "failed",
-        "paper_linear_3f": "success",
+        "paper_linear_3f": "ok",
     }
     assert result.failures[["model", "exception_type"]].to_dict("records") == [
         {"model": "dummy_median", "exception_type": "ValueError"}
@@ -471,3 +472,74 @@ def test_benchmark_rejects_leaking_or_nonexact_basic_median_features(
             make_tiny_config(),
             model_names=["ridge"],
         )
+
+
+def test_importance_failure_warns_without_erasing_successful_core_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    images = make_grouped_images()
+    split = make_outer_splits(images)[:1]
+
+    def fail_importance(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        """模擬純 diagnostic importance 計算失敗。"""
+        raise RuntimeError("importance exploded")
+
+    monkeypatch.setattr(benchmark_module, "_fold_feature_importance", fail_importance)
+    with pytest.warns(
+        RuntimeWarning,
+        match=(
+            "leave_one_b_out:B4.*paper_linear_3f.*RuntimeError.*importance exploded"
+        ),
+    ):
+        result = run_nested_benchmark(
+            images,
+            {"basic_median": list(PRIMARY_FOV_FEATURES)},
+            split,
+            make_tiny_config(),
+            model_names=["paper_linear_3f"],
+        )
+
+    assert len(result.predictions) == len(split[0].test_index)
+    assert result.fold_metrics[["model", "status"]].to_dict("records") == [
+        {"model": "paper_linear_3f", "status": "ok"}
+    ]
+    assert result.hyperparameters["model"].tolist() == ["paper_linear_3f"]
+    assert result.failures.empty
+    assert result.feature_importance.empty
+
+
+@pytest.mark.parametrize("different_indices", [False, True])
+def test_benchmark_rejects_duplicate_split_id_before_fit(
+    monkeypatch: pytest.MonkeyPatch,
+    different_indices: bool,
+) -> None:
+    images = make_grouped_images()
+    first, second = make_outer_splits(images)[:2]
+    duplicate = (
+        OuterSplit(
+            validation=first.validation,
+            fold=first.fold,
+            train_index=second.train_index,
+            test_index=second.test_index,
+        )
+        if different_indices
+        else first
+    )
+    fit_calls = 0
+
+    def track_fit(self: DummyRegressor, values: object, target: object) -> object:
+        """記錄 duplicate validation 是否錯誤地等到 model fit 後才執行。"""
+        nonlocal fit_calls
+        fit_calls += 1
+        return self
+
+    monkeypatch.setattr(DummyRegressor, "fit", track_fit)
+    with pytest.raises(ValueError, match="duplicate split_id.*leave_one_b_out:B4"):
+        run_nested_benchmark(
+            images,
+            {"basic_median": list(PRIMARY_FOV_FEATURES)},
+            [first, duplicate],
+            make_tiny_config(),
+            model_names=["dummy_median"],
+        )
+    assert fit_calls == 0

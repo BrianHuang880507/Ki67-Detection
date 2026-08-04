@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -616,6 +617,7 @@ def run_nested_benchmark(
     _validate_benchmark_metadata(images)
     if not splits:
         raise ValueError("splits 不可為空")
+    _validate_unique_split_ids(splits)
 
     registry = build_model_registry(config)
     selected_names = list(registry) if model_names is None else list(model_names)
@@ -683,18 +685,27 @@ def run_nested_benchmark(
                 )
                 predicted = _finite_predictions(fitted.predict(x_test), len(testing))
                 metrics = regression_metrics(y_test, predicted)
-                fold_importance = _fold_feature_importance(
-                    fitted,
-                    spec,
-                    feature_names,
-                    x_test,
-                    y_test,
-                    split,
-                    split_id,
-                    permutation_repeats,
-                    seed,
-                    n_jobs,
+                core_prediction_rows = _prediction_records(
+                    testing, predicted, split, split_id, spec
                 )
+                core_metric_row = {
+                    **metric_base,
+                    **metrics,
+                    "observed_sd": float(np.std(y_test)),
+                    "prediction_sd": float(np.std(predicted)),
+                    "status": "ok",
+                }
+                core_hyperparameter_row = {
+                    "validation": split.validation,
+                    "fold": split.fold,
+                    "split_id": split_id,
+                    "model": model_name,
+                    "seed": seed,
+                    "best_params_json": json.dumps(
+                        best_params, sort_keys=True, separators=(",", ":")
+                    ),
+                    "inner_best_mae": inner_best_mae,
+                }
             except Exception as error:  # noqa: BLE001 - fold isolation is the contract
                 metric_rows.append(
                     {
@@ -720,32 +731,33 @@ def run_nested_benchmark(
                 )
                 continue
 
-            prediction_rows.extend(
-                _prediction_records(testing, predicted, split, split_id, spec)
-            )
-            metric_rows.append(
-                {
-                    **metric_base,
-                    **metrics,
-                    "observed_sd": float(np.std(y_test)),
-                    "prediction_sd": float(np.std(predicted)),
-                    "status": "success",
-                }
-            )
-            hyperparameter_rows.append(
-                {
-                    "validation": split.validation,
-                    "fold": split.fold,
-                    "split_id": split_id,
-                    "model": model_name,
-                    "seed": seed,
-                    "best_params_json": json.dumps(
-                        best_params, sort_keys=True, separators=(",", ":")
-                    ),
-                    "inner_best_mae": inner_best_mae,
-                }
-            )
-            importance_rows.extend(fold_importance)
+            prediction_rows.extend(core_prediction_rows)
+            metric_rows.append(core_metric_row)
+            hyperparameter_rows.append(core_hyperparameter_row)
+
+            try:
+                fold_importance = _fold_feature_importance(
+                    fitted,
+                    spec,
+                    feature_names,
+                    x_test,
+                    y_test,
+                    split,
+                    split_id,
+                    permutation_repeats,
+                    seed,
+                    n_jobs,
+                )
+            except Exception as error:  # noqa: BLE001 - diagnostic only
+                warnings.warn(
+                    "feature importance diagnostic failed for "
+                    f"split_id={split_id}, model={model_name}: "
+                    f"{type(error).__name__}: {error}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            else:
+                importance_rows.extend(fold_importance)
 
     return BenchmarkResult(
         predictions=pd.DataFrame(prediction_rows, columns=OOF_COLUMNS),
@@ -771,6 +783,16 @@ def _validate_benchmark_metadata(images: pd.DataFrame) -> None:
     missing = sorted(required - set(images.columns))
     if missing:
         raise ValueError(f"images 缺少 benchmark 必要欄位：{missing}")
+
+
+def _validate_unique_split_ids(splits: Sequence[OuterSplit]) -> None:
+    """在任何 model fit 前拒絕重複的 validation/fold identity。"""
+    seen: set[str] = set()
+    for split in splits:
+        split_id = f"{split.validation}:{split.fold}"
+        if split_id in seen:
+            raise ValueError(f"duplicate split_id: {split_id}")
+        seen.add(split_id)
 
 
 def _validate_candidate_feature_sets(
