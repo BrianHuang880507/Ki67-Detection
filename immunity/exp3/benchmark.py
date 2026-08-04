@@ -8,7 +8,7 @@ import os
 import tempfile
 import warnings
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +33,11 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
 
-from immunity.exp3.feature_sets import PRIMARY_FOV_FEATURES, validate_phase_predictors
+from immunity.exp3.feature_sets import (
+    FEATURE_SET_REGISTRY,
+    PRIMARY_FOV_FEATURES,
+    validate_phase_predictors,
+)
 
 
 _OUTER_FAMILIES = (
@@ -614,6 +618,8 @@ def run_nested_benchmark(
     splits: Sequence[OuterSplit],
     config: Mapping[str, Any],
     model_names: Sequence[str] | None = None,
+    *,
+    _feature_set_overrides: Mapping[str, str] | None = None,
 ) -> BenchmarkResult:
     """在共用 outer splits 執行 deterministic grouped nested benchmark。
 
@@ -641,6 +647,14 @@ def run_nested_benchmark(
     _validate_unique_split_ids(splits)
 
     registry = build_model_registry(config)
+    for model_name, feature_set_name in dict(
+        _feature_set_overrides or {}
+    ).items():
+        if model_name not in registry:
+            raise ValueError(f"未知 feature-set override model：{model_name}")
+        registry[model_name] = replace(
+            registry[model_name], feature_set=feature_set_name
+        )
     selected_names = list(registry) if model_names is None else list(model_names)
     if not selected_names:
         raise ValueError("model_names 不可為空")
@@ -790,6 +804,67 @@ def run_nested_benchmark(
             importance_rows, columns=FEATURE_IMPORTANCE_COLUMNS
         ),
         failures=pd.DataFrame(failure_rows, columns=FAILURE_COLUMNS),
+    )
+
+
+def run_phase_feature_set_benchmark(
+    images: pd.DataFrame,
+    feature_sets: Mapping[str, Sequence[str]],
+    splits: Sequence[OuterSplit],
+    config: Mapping[str, Any],
+    model_names: Sequence[str],
+    feature_set_name: str,
+) -> BenchmarkResult:
+    """以 secondary feature set 執行探索性 phase-only benchmark。
+
+    此 adapter 只供 Round 2 使用，保留 Round 1 的 exact ``basic_median``
+    驗證。Paper linear 的三個 predictors 不可覆寫；diagnostic models 也不屬於
+    secondary feature ablation。
+
+    Args:
+        images: 含指定 secondary predictors 的 FOV-level frame。
+        feature_sets: 實際 feature-set 名稱與 predictor columns。
+        splits: 與 Round 1 共用的 outer splits。
+        config: Nested benchmark 設定。
+        model_names: Round 1 排名前二且非 paper 的 phase candidates。
+        feature_set_name: ``FEATURE_SET_REGISTRY`` 內的 secondary set 名稱。
+
+    Returns:
+        所有結果列都保留實際 feature-set identity 的 benchmark 結果。
+
+    Raises:
+        ValueError: Model 不是可覆寫的 phase candidate，或 feature whitelist
+            不等於 authoritative registry 時拋出。
+    """
+    selected_names = [str(name) for name in model_names]
+    allowed_models = set(_PHASE_CANDIDATES) - {"paper_linear_3f"}
+    if not selected_names or len(set(selected_names)) != len(selected_names):
+        raise ValueError("Round 2 phase model names 不可為空或重複")
+    invalid_models = sorted(set(selected_names) - allowed_models)
+    if invalid_models:
+        raise ValueError(
+            "Round 2 feature override 只允許非 paper 的 phase candidates；"
+            f"不可包含 paper 或 diagnostic models：{invalid_models}"
+        )
+    if feature_set_name == "basic_median" or feature_set_name not in FEATURE_SET_REGISTRY:
+        raise ValueError("Round 2 feature set 必須是已註冊的 secondary feature set")
+    if feature_set_name not in feature_sets:
+        raise ValueError(f"feature_sets 缺少 {feature_set_name!r}")
+    actual = tuple(str(column) for column in feature_sets[feature_set_name])
+    expected = tuple(FEATURE_SET_REGISTRY[feature_set_name].predictor_columns)
+    if actual != expected:
+        raise ValueError(
+            f"feature set {feature_set_name!r} 必須精確符合 registry whitelist"
+        )
+    validate_phase_predictors(actual)
+    overrides = {name: feature_set_name for name in selected_names}
+    return run_nested_benchmark(
+        images,
+        feature_sets,
+        splits,
+        config,
+        model_names=selected_names,
+        _feature_set_overrides=overrides,
     )
 
 
@@ -1185,7 +1260,7 @@ def fit_final_phase_model(
         seed,
         n_jobs,
     )
-    config_hash = _stable_hash(config)
+    config_hash = _original_run_config_hash(config)
     manifest_hash = str(
         images.attrs.get("manifest_hash")
         or config.get("manifest_hash")
@@ -1541,6 +1616,20 @@ def _stable_hash(value: object) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _original_run_config_hash(config: Mapping[str, Any]) -> str:
+    """優先使用 orchestration 注入的原始 run config SHA-256。"""
+    declared = config.get("config_hash")
+    if declared is None:
+        return _stable_hash(config)
+    if not isinstance(declared, str) or len(declared) != 64:
+        raise ValueError("config_hash 必須是 64 字元 SHA-256")
+    try:
+        int(declared, 16)
+    except ValueError as error:
+        raise ValueError("config_hash 必須是 64 字元 SHA-256") from error
+    return declared.lower()
 
 
 def _json_compatible(value: object) -> object:

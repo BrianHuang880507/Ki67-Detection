@@ -33,7 +33,10 @@ from immunity.exp3.benchmark import (
     run_condition_adjusted_sensitivity,
     select_winner,
 )
-from immunity.exp3.feature_sets import PRIMARY_FOV_FEATURES
+from immunity.exp3.feature_sets import (
+    BASIC_MEDIAN_IQR_FOV_FEATURES,
+    PRIMARY_FOV_FEATURES,
+)
 
 
 VALIDATIONS = (
@@ -798,6 +801,30 @@ def test_final_fit_writes_auditable_bundle_inside_validated_exp3_output(
     assert metadata["feature_columns"] == list(PRIMARY_FOV_FEATURES)
 
 
+def test_final_fit_preserves_declared_original_run_config_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task 8 evidence keys 不得改寫 final artifact 的原始 run config hash。"""
+    _, output_dir = _patch_exp3_output_root(tmp_path, monkeypatch)
+    config = make_tiny_config()
+    config["eligible_phase_models"] = ["ridge"]
+    config["config_hash"] = "a" * 64
+
+    model_path = fit_final_phase_model(
+        make_grouped_images(),
+        "ridge",
+        {"basic_median": list(PRIMARY_FOV_FEATURES)},
+        config,
+        output_dir,
+    )
+
+    bundle = joblib.load(model_path)
+    metadata = json.loads((output_dir / "final_model.json").read_text("utf-8"))
+    assert bundle["config_hash"] == "a" * 64
+    assert metadata["config_hash"] == "a" * 64
+
+
 def test_final_untuned_paper_model_writes_standard_json_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1387,3 +1414,65 @@ def test_benchmark_rejects_duplicate_split_id_before_fit(
             model_names=["dummy_median"],
         )
     assert fit_calls == 0
+
+
+def test_phase_feature_set_adapter_records_actual_secondary_identity() -> None:
+    """Round 2 metrics/predictions/importance 不得偽裝成 basic_median。"""
+    images = make_grouped_images()
+    for median_column, iqr_column in zip(
+        PRIMARY_FOV_FEATURES,
+        BASIC_MEDIAN_IQR_FOV_FEATURES[len(PRIMARY_FOV_FEATURES) :],
+        strict=True,
+    ):
+        images[iqr_column] = images[median_column] / 10.0
+    splits = make_outer_splits(images)[:1]
+
+    result = benchmark_module.run_phase_feature_set_benchmark(
+        images,
+        {"basic_median_iqr": list(BASIC_MEDIAN_IQR_FOV_FEATURES)},
+        splits,
+        make_tiny_config(),
+        model_names=["ridge"],
+        feature_set_name="basic_median_iqr",
+    )
+
+    assert set(result.fold_metrics["feature_set"]) == {"basic_median_iqr"}
+    assert set(result.predictions["feature_set"]) == {"basic_median_iqr"}
+    assert set(result.feature_importance["feature_set"]) == {
+        "basic_median_iqr"
+    }
+    assert result.fold_metrics["status"].tolist() == ["ok"]
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    ["paper_linear_3f", "dummy_median", "dose_ridge"],
+)
+def test_phase_feature_set_adapter_rejects_paper_and_diagnostics(
+    model_name: str,
+) -> None:
+    """Round 2 override 僅允許非 paper 的 phase candidates。"""
+    images = make_grouped_images()
+    with pytest.raises(ValueError, match="phase|paper|diagnostic"):
+        benchmark_module.run_phase_feature_set_benchmark(
+            images,
+            {"basic_median_iqr": list(BASIC_MEDIAN_IQR_FOV_FEATURES)},
+            make_outer_splits(images)[:1],
+            make_tiny_config(),
+            model_names=[model_name],
+            feature_set_name="basic_median_iqr",
+        )
+
+
+def test_phase_feature_set_adapter_requires_exact_registered_whitelist() -> None:
+    """Round 2 override 欄位必須精確等於 authoritative registry。"""
+    images = make_grouped_images()
+    with pytest.raises(ValueError, match="registry|whitelist|feature set"):
+        benchmark_module.run_phase_feature_set_benchmark(
+            images,
+            {"basic_median_iqr": list(BASIC_MEDIAN_IQR_FOV_FEATURES[:-1])},
+            make_outer_splits(images)[:1],
+            make_tiny_config(),
+            model_names=["ridge"],
+            feature_set_name="basic_median_iqr",
+        )
