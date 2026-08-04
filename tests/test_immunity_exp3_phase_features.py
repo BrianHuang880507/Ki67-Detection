@@ -715,3 +715,111 @@ def test_extract_basic_cell_features_rejects_unexpected_mask_cache_structure(
         )
 
     assert not (tmp_path / "legacy").exists()
+
+
+@pytest.mark.parametrize(
+    ("component_name", "invalid_value"),
+    [
+        ("group_id", "."),
+        ("group_id", ".."),
+        ("group_id", " B4_P5"),
+        ("group_id", "B4_P5 "),
+        ("group_id", "B4/P5"),
+        ("group_id", "B4\\P5"),
+        ("group_id", "C:B4_P5"),
+        ("image_key", "."),
+        ("image_key", ".."),
+        ("image_key", " B4_P5_C01_F01"),
+        ("image_key", "B4_P5_C01_F01 "),
+        ("image_key", "B4/P5_C01_F01"),
+        ("image_key", "B4\\P5_C01_F01"),
+        ("image_key", "C:B4_P5_C01_F01"),
+    ],
+)
+def test_extract_basic_cell_features_rejects_unsafe_cache_components(
+    component_name: str,
+    invalid_value: str,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from immunity.exp3 import run_benchmark
+
+    output_root = tmp_path / "immunity" / "outputs" / "exp3"
+    output_dir = output_root / "test-run"
+    monkeypatch.setattr(run_benchmark, "EXP3_OUTPUT_ROOT", output_root.resolve())
+    values = {
+        "group_id": "B4_P5",
+        "image_key": "B4_P5_C01_F01",
+    }
+    values[component_name] = invalid_value
+    mask_path = (
+        output_dir
+        / "feature_cache"
+        / "masks"
+        / values["group_id"]
+        / f"{values['image_key']}.npz"
+    )
+    manifest = pd.DataFrame(
+        [
+            {
+                **values,
+                "pc_path": str(tmp_path / "phase.png"),
+                "ido_path": str(tmp_path / "ido.png"),
+            }
+        ]
+    )
+    segmentation_qc = pd.DataFrame(
+        [
+            {
+                "image_key": values["image_key"],
+                "mask_path": str(mask_path),
+                "status": "passed",
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match=component_name):
+        extract_basic_cell_features(
+            manifest,
+            segmentation_qc,
+            {"_output_dir": str(output_dir)},
+        )
+
+
+def test_mask_cache_path_rejects_resolved_parent_outside_masks_root(
+    tmp_path: Path,
+) -> None:
+    cache_dir = tmp_path / "feature_cache"
+    escaped_path = cache_dir / "escaped.npz"
+
+    with pytest.raises(ValueError, match="mask_path"):
+        phase_features._validate_exp3_mask_cache_path(
+            escaped_path,
+            cache_dir,
+            "..",
+            "escaped",
+        )
+
+
+def test_mask_cache_path_rejects_symlinked_group_outside_masks_root(
+    tmp_path: Path,
+) -> None:
+    cache_dir = tmp_path / "feature_cache"
+    masks_root = cache_dir / "masks"
+    outside = tmp_path / "outside"
+    masks_root.mkdir(parents=True)
+    outside.mkdir()
+    linked_group = masks_root / "B4_P5"
+    try:
+        linked_group.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"目前平台無法建立測試 symlink：{error}")
+    escaped_path = outside / "B4_P5_C01_F01.npz"
+
+    with pytest.raises(ValueError, match="mask_path"):
+        phase_features._validate_exp3_mask_cache_path(
+            escaped_path,
+            cache_dir,
+            "B4_P5",
+            "B4_P5_C01_F01",
+        )

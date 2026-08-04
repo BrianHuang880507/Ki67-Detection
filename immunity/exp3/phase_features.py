@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ntpath
 import os
 import tempfile
 import zipfile
@@ -743,8 +744,19 @@ def _required_cache_component(value: object, name: str) -> str:
     """驗證組成 Exp3 mask cache 路徑的必要文字值。"""
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} 必須是非空字串")
-    if Path(value).name != value:
-        raise ValueError(f"{name} 不可包含路徑分隔符")
+    if value != value.strip():
+        raise ValueError(f"{name} 不可包含前後空白")
+    if value in {".", ".."}:
+        raise ValueError(f"{name} 不可使用相對路徑 component")
+    drive, _ = ntpath.splitdrive(value)
+    if (
+        drive
+        or ":" in value
+        or "/" in value
+        or "\\" in value
+        or Path(value).name != value
+    ):
+        raise ValueError(f"{name} 不可包含路徑分隔符或 drive")
     return value
 
 
@@ -759,10 +771,18 @@ def _validate_exp3_mask_cache_path(
         raise ValueError("mask_path 必須是非空路徑")
     if isinstance(value, str) and not value.strip():
         raise ValueError("mask_path 必須是非空路徑")
+    try:
+        group_id = _required_cache_component(group_id, "group_id")
+        image_key = _required_cache_component(image_key, "image_key")
+    except ValueError as error:
+        raise ValueError(f"mask_path component 不合法：{error}") from error
     candidate = Path(value).resolve(strict=False)
+    masks_root = (cache_dir / "masks").resolve(strict=False)
     expected = (
-        cache_dir / "masks" / group_id / f"{image_key}.npz"
+        masks_root / group_id / f"{image_key}.npz"
     ).resolve(strict=False)
+    if expected.parent.parent != masks_root:
+        raise ValueError("mask_path resolved parent 必須位於 Exp3 masks root 下")
     if candidate != expected:
         raise ValueError(
             "mask_path 必須符合 Exp3 feature_cache/masks/<group_id>/"
