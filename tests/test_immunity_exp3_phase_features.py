@@ -501,8 +501,14 @@ def test_feature_extraction_rejects_mismatched_array_dimensions() -> None:
 
 def test_extract_basic_cell_features_writes_internal_cell_cache(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    from immunity.exp3 import run_benchmark
+
     image_key = "B4_P5_C01_F01"
+    output_root = tmp_path / "immunity" / "outputs" / "exp3"
+    output_dir = output_root / "test-run"
+    monkeypatch.setattr(run_benchmark, "EXP3_OUTPUT_ROOT", output_root.resolve())
     phase_path = tmp_path / "phase.png"
     ido_path = tmp_path / "ido.png"
     Image.fromarray(np.arange(100, dtype=np.uint8).reshape(10, 10)).save(phase_path)
@@ -512,7 +518,13 @@ def test_extract_basic_cell_features_writes_internal_cell_cache(
     nucleus = np.zeros((10, 10), dtype=np.int32)
     cell[2:8, 2:8] = 1
     nucleus[4:6, 4:6] = 1
-    mask_path = tmp_path / "feature_cache" / "masks" / "B4_P5" / f"{image_key}.npz"
+    mask_path = (
+        output_dir
+        / "feature_cache"
+        / "masks"
+        / "B4_P5"
+        / f"{image_key}.npz"
+    )
     mask_path.parent.mkdir(parents=True)
     np.savez(mask_path, cell_mask=cell, nucleus_mask=nucleus)
     manifest = pd.DataFrame(
@@ -540,6 +552,7 @@ def test_extract_basic_cell_features_writes_internal_cell_cache(
         manifest,
         segmentation_qc,
         {
+            "_output_dir": str(output_dir),
             "segmentation": {
                 "max_nucleus_outside_fraction": 0.05,
                 "min_cells_per_image": 1,
@@ -551,4 +564,154 @@ def test_extract_basic_cell_features_writes_internal_cell_cache(
     assert len(cells) == 1
     assert qc.loc[0, "status"] == "passed"
     assert cells.attrs["min_cells_per_image"] == 1
-    assert (tmp_path / "feature_cache" / "cell_level_basic.csv").is_file()
+    assert (
+        output_dir / "feature_cache" / "cell_level_basic.csv"
+    ).is_file()
+
+
+def test_extract_basic_cell_features_rejects_legacy_output_destination(
+    tmp_path: Path,
+) -> None:
+    manifest = pd.DataFrame(
+        columns=["image_key", "group_id", "pc_path", "ido_path"]
+    )
+    segmentation_qc = pd.DataFrame(
+        columns=["image_key", "mask_path", "status"]
+    )
+    legacy_dir = tmp_path / "legacy-results"
+
+    with pytest.raises(ValueError, match="Exp3 output"):
+        extract_basic_cell_features(
+            manifest,
+            segmentation_qc,
+            {"_output_dir": str(legacy_dir)},
+        )
+
+    assert not legacy_dir.exists()
+
+
+def test_extract_basic_cell_features_rejects_repository_root_destination() -> None:
+    from immunity.exp3.run_benchmark import PROJECT_ROOT
+
+    manifest = pd.DataFrame(
+        columns=["image_key", "group_id", "pc_path", "ido_path"]
+    )
+    segmentation_qc = pd.DataFrame(
+        columns=["image_key", "mask_path", "status"]
+    )
+
+    with pytest.raises(ValueError, match="Exp3 output"):
+        extract_basic_cell_features(
+            manifest,
+            segmentation_qc,
+            {"_output_dir": str(PROJECT_ROOT)},
+        )
+
+
+def test_extract_basic_cell_features_rejects_na_output_without_writing_cwd(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    manifest = pd.DataFrame(
+        columns=["image_key", "group_id", "pc_path", "ido_path"]
+    )
+    segmentation_qc = pd.DataFrame(
+        columns=["image_key", "mask_path", "status"]
+    )
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError, match="_output_dir"):
+        extract_basic_cell_features(
+            manifest,
+            segmentation_qc,
+            {"_output_dir": pd.NA},
+        )
+
+    assert not (tmp_path / "cell_level_basic.csv").exists()
+
+
+@pytest.mark.parametrize("invalid_mask_path", [pd.NA, "", 123])
+def test_extract_basic_cell_features_rejects_invalid_mask_cache_path(
+    invalid_mask_path: object,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from immunity.exp3 import run_benchmark
+
+    image_key = "B4_P5_C01_F01"
+    output_root = tmp_path / "immunity" / "outputs" / "exp3"
+    output_dir = output_root / "test-run"
+    monkeypatch.setattr(run_benchmark, "EXP3_OUTPUT_ROOT", output_root.resolve())
+    monkeypatch.chdir(tmp_path)
+    phase_path = tmp_path / "phase.png"
+    ido_path = tmp_path / "ido.png"
+    Image.fromarray(np.zeros((4, 4), dtype=np.uint8)).save(phase_path)
+    Image.fromarray(np.zeros((4, 4), dtype=np.uint8)).save(ido_path)
+    manifest = pd.DataFrame(
+        [
+            {
+                "image_key": image_key,
+                "group_id": "B4_P5",
+                "pc_path": str(phase_path),
+                "ido_path": str(ido_path),
+            }
+        ]
+    )
+    segmentation_qc = pd.DataFrame(
+        [
+            {
+                "image_key": image_key,
+                "mask_path": invalid_mask_path,
+                "status": "passed",
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="mask_path"):
+        extract_basic_cell_features(
+            manifest,
+            segmentation_qc,
+            {"_output_dir": str(output_dir)},
+        )
+
+    assert not (tmp_path / "cell_level_basic.csv").exists()
+
+
+def test_extract_basic_cell_features_rejects_unexpected_mask_cache_structure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from immunity.exp3 import run_benchmark
+
+    image_key = "B4_P5_C01_F01"
+    output_root = tmp_path / "immunity" / "outputs" / "exp3"
+    output_dir = output_root / "test-run"
+    monkeypatch.setattr(run_benchmark, "EXP3_OUTPUT_ROOT", output_root.resolve())
+    manifest = pd.DataFrame(
+        [
+            {
+                "image_key": image_key,
+                "group_id": "B4_P5",
+                "pc_path": str(tmp_path / "phase.png"),
+                "ido_path": str(tmp_path / "ido.png"),
+            }
+        ]
+    )
+    segmentation_qc = pd.DataFrame(
+        [
+            {
+                "image_key": image_key,
+                "mask_path": str(tmp_path / "legacy" / f"{image_key}.npz"),
+                "status": "passed",
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="mask_path"):
+        extract_basic_cell_features(
+            manifest,
+            segmentation_qc,
+            {"_output_dir": str(output_dir)},
+        )
+
+    assert not (tmp_path / "legacy").exists()

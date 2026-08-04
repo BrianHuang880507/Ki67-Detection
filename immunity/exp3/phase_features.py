@@ -18,6 +18,7 @@ from immunity.exp3.feature_sets import (
     BASIC_GEOMETRY,
     FEATURE_SET_REGISTRIES,
     PRIMARY_CELL_FEATURES,
+    _feature_cache_dir_from_output,
 )
 from ki67dtc.cell_anal import (
     _geometry_from_measurements,
@@ -604,7 +605,8 @@ def extract_basic_cell_features(
     Args:
         manifest: 含 ``image_key``、``pc_path`` 與 ``ido_path`` 的完整 manifest。
         segmentation_qc: ``cache_phase_masks`` 產生的逐影像 QC 與 mask path。
-        config: Exp3 設定，使用 ``segmentation`` 與 ``feature_sets.enabled``。
+        config: 經 ``load_config`` 驗證的 Exp3 設定；使用 ``_output_dir``、
+            ``segmentation`` 與 ``feature_sets.enabled``。
 
     Returns:
         cell-level feature 資料表，以及逐影像 feature extraction QC 表。
@@ -612,7 +614,7 @@ def extract_basic_cell_features(
     Raises:
         ValueError: 輸入欄位缺漏、image key 重複或 feature 設定不合法時拋出。
     """
-    required_manifest = {"image_key", "pc_path", "ido_path"}
+    required_manifest = {"image_key", "group_id", "pc_path", "ido_path"}
     missing_manifest = sorted(required_manifest - set(manifest.columns))
     if missing_manifest:
         raise ValueError(f"manifest 缺少欄位：{missing_manifest}")
@@ -624,6 +626,8 @@ def extract_basic_cell_features(
         raise ValueError("manifest 出現重複 image_key")
     if segmentation_qc["image_key"].duplicated().any():
         raise ValueError("segmentation_qc 出現重複 image_key")
+
+    cache_dir = _feature_cache_dir_from_output(config.get("_output_dir"))
 
     segmentation_config = _segmentation_config(config)
     max_outside = float(
@@ -647,7 +651,12 @@ def extract_basic_cell_features(
     cell_rows: list[dict[str, Any]] = []
     qc_rows: list[dict[str, Any]] = []
     for manifest_row in manifest.to_dict(orient="records"):
-        image_key = str(manifest_row["image_key"])
+        image_key = _required_cache_component(
+            manifest_row["image_key"], "image_key"
+        )
+        group_id = _required_cache_component(
+            manifest_row["group_id"], "group_id"
+        )
         empty_qc = {
             "image_key": image_key,
             "paired_cells": 0,
@@ -671,10 +680,16 @@ def extract_basic_cell_features(
                 }
             )
             continue
+        mask_path = _validate_exp3_mask_cache_path(
+            mask_qc["mask_path"],
+            cache_dir,
+            group_id,
+            image_key,
+        )
         try:
             phase = _read_grayscale_image(manifest_row["pc_path"])
             ido = _read_grayscale_image(manifest_row["ido_path"])
-            cell_mask, nucleus_mask = load_cached_masks(mask_qc["mask_path"])
+            cell_mask, nucleus_mask = load_cached_masks(mask_path)
             rows, metrics = extract_features_from_arrays(
                 image_key,
                 phase,
@@ -694,11 +709,9 @@ def extract_basic_cell_features(
     cells = pd.DataFrame(cell_rows, columns=CELL_LEVEL_COLUMNS)
     extraction_qc = pd.DataFrame(qc_rows, columns=FEATURE_EXTRACTION_QC_COLUMNS)
     cells.attrs["min_cells_per_image"] = min_cells
-    cache_dir = _resolve_feature_cache_dir(config, segmentation_qc)
-    if cache_dir is not None:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cells.to_csv(cache_dir / "cell_level_basic.csv", index=False)
-        cells.attrs["feature_cache_dir"] = str(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cells.to_csv(cache_dir / "cell_level_basic.csv", index=False)
+    cells.attrs["exp3_output_dir"] = str(cache_dir.parent)
     return cells, extraction_qc
 
 
@@ -726,23 +739,36 @@ def _read_grayscale_image(path: str | Path) -> np.ndarray:
     return np.asarray(image, dtype=np.float64)
 
 
-def _resolve_feature_cache_dir(
-    config: Mapping[str, Any],
-    segmentation_qc: pd.DataFrame,
-) -> Path | None:
-    """由明確設定或既有 mask cache 路徑取得 feature cache 根目錄。"""
-    explicit = config.get("feature_cache_dir")
-    if explicit:
-        return Path(str(explicit))
-    mask_paths = segmentation_qc.get("mask_path")
-    if mask_paths is None:
-        return None
-    usable_paths = [Path(str(value)) for value in mask_paths if str(value)]
-    if not usable_paths:
-        return None
-    candidates = [path.parent.parent.parent for path in usable_paths]
-    first = candidates[0]
-    return first if all(candidate == first for candidate in candidates) else None
+def _required_cache_component(value: object, name: str) -> str:
+    """驗證組成 Exp3 mask cache 路徑的必要文字值。"""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} 必須是非空字串")
+    if Path(value).name != value:
+        raise ValueError(f"{name} 不可包含路徑分隔符")
+    return value
+
+
+def _validate_exp3_mask_cache_path(
+    value: object,
+    cache_dir: Path,
+    group_id: str,
+    image_key: str,
+) -> Path:
+    """驗證 mask path 精確位於目前 Exp3 run 的 cache 結構。"""
+    if not isinstance(value, (str, Path)):
+        raise ValueError("mask_path 必須是非空路徑")
+    if isinstance(value, str) and not value.strip():
+        raise ValueError("mask_path 必須是非空路徑")
+    candidate = Path(value).resolve(strict=False)
+    expected = (
+        cache_dir / "masks" / group_id / f"{image_key}.npz"
+    ).resolve(strict=False)
+    if candidate != expected:
+        raise ValueError(
+            "mask_path 必須符合 Exp3 feature_cache/masks/<group_id>/"
+            "<image_key>.npz 結構"
+        )
+    return candidate
 
 
 def _segmentation_config(config: Mapping[str, Any]) -> Mapping[str, Any]:

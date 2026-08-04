@@ -8,6 +8,8 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
+from immunity.exp3.run_benchmark import resolve_exp3_output_dir
+
 
 BASIC_GEOMETRY = (
     "area",
@@ -159,7 +161,6 @@ def aggregate_fov_features(
     )
     if min_cells < 1:
         raise ValueError("min_cells_per_image 必須至少為 1")
-    cache_dir_value = cells.attrs.get("feature_cache_dir")
     grouped = {
         str(image_key): group
         for image_key, group in cells.groupby("image_key", sort=False)
@@ -199,11 +200,22 @@ def aggregate_fov_features(
         raise ValueError("FOV-level IDO_score 必須全部為有限值")
     if images["IDO_score"].nunique(dropna=True) < 2:
         raise ValueError("FOV-level IDO_score 至少需要兩個不同值")
-    if cache_dir_value:
-        cache_dir = Path(str(cache_dir_value))
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        images.to_csv(cache_dir / "image_level_basic.csv", index=False)
+    cache_dir = _feature_cache_dir_from_output(
+        cells.attrs.get("exp3_output_dir")
+    )
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    images.to_csv(cache_dir / "image_level_basic.csv", index=False)
     return images, registries
+
+
+def _feature_cache_dir_from_output(output_dir_value: object) -> Path:
+    """從已驗證的 Exp3 output dir 衍生唯一 feature cache 位置。"""
+    if not isinstance(output_dir_value, (str, Path)):
+        raise ValueError("_output_dir 必須是非空路徑")
+    if isinstance(output_dir_value, str) and not output_dir_value.strip():
+        raise ValueError("_output_dir 必須是非空路徑")
+    output_dir = resolve_exp3_output_dir(output_dir_value)
+    return output_dir / "feature_cache"
 
 
 __all__ = [

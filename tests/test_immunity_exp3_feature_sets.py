@@ -70,10 +70,16 @@ def test_primary_registry_contains_exactly_33_features() -> None:
 
 def test_aggregate_fov_features_uses_medians_only_and_writes_internal_cache(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    from immunity.exp3 import run_benchmark
+
+    output_root = tmp_path / "immunity" / "outputs" / "exp3"
+    output_dir = output_root / "test-run"
+    monkeypatch.setattr(run_benchmark, "EXP3_OUTPUT_ROOT", output_root.resolve())
     cells = _cells()
     cells.attrs["min_cells_per_image"] = 3
-    cells.attrs["feature_cache_dir"] = str(tmp_path / "feature_cache")
+    cells.attrs["exp3_output_dir"] = str(output_dir)
 
     images, registries = aggregate_fov_features(
         cells, _manifest(), ("basic_median",)
@@ -85,7 +91,21 @@ def test_aggregate_fov_features_uses_medians_only_and_writes_internal_cache(
     assert images.loc[0, "cell__area__median"] == 2.0
     assert registries == {"basic_median": list(PRIMARY_FOV_FEATURES)}
     assert not any(column.endswith("__iqr") for column in images.columns)
-    assert (tmp_path / "feature_cache" / "image_level_basic.csv").is_file()
+    assert (
+        output_dir / "feature_cache" / "image_level_basic.csv"
+    ).is_file()
+
+
+def test_aggregate_fov_features_rejects_legacy_cache_destination(
+    tmp_path: Path,
+) -> None:
+    cells = _cells()
+    cells.attrs["exp3_output_dir"] = str(tmp_path / "legacy-results")
+
+    with pytest.raises(ValueError, match="Exp3 output"):
+        aggregate_fov_features(cells, _manifest(), ("basic_median",))
+
+    assert not (tmp_path / "legacy-results").exists()
 
 
 def test_aggregate_fov_features_rejects_any_fov_below_minimum() -> None:
