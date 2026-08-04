@@ -87,6 +87,9 @@ _PHASE_CANDIDATES = (
     "extra_trees",
 )
 _RANKING_VALIDATIONS = tuple(name for name, _ in _OUTER_FAMILIES)
+_EXPECTED_OUTER_FOLD_COUNTS = dict(
+    zip(_RANKING_VALIDATIONS, (3, 3, 9, 8), strict=True)
+)
 _SENSITIVITY_VALIDATIONS = _RANKING_VALIDATIONS[:3]
 _RAW_ANALYSES = {"raw", "raw_ido", "raw_target"}
 _TARGET_LABEL = "image-level background-corrected IDO proxy"
@@ -838,6 +841,8 @@ def rank_phase_models(
     expected_splits = _configured_expected_splits(config)
     dummy_complete = _metrics_complete_for_model(
         raw_metrics, "dummy_median", expected_splits
+    ) and not _has_expected_model_failure(
+        raw_failures, "dummy_median", expected_splits
     )
     validation_summaries: dict[str, pd.DataFrame] = {}
     for validation in _RANKING_VALIDATIONS:
@@ -1247,7 +1252,7 @@ def _configured_expected_splits(
             return None
         split_ids = [str(value) for value in values]
         if (
-            not split_ids
+            len(split_ids) != _EXPECTED_OUTER_FOLD_COUNTS[validation]
             or len(split_ids) != len(set(split_ids))
             or any(
                 not split_id.startswith(f"{validation}:")
@@ -1258,6 +1263,27 @@ def _configured_expected_splits(
             return None
         expected[validation] = set(split_ids)
     return expected
+
+
+def _has_expected_model_failure(
+    failures: pd.DataFrame,
+    model: str,
+    expected_splits: Mapping[str, set[str]] | None,
+) -> bool:
+    """判斷 raw failures 是否含指定 model 的 canonical split failure。"""
+    if failures.empty or "model" not in failures.columns:
+        return False
+    rows = failures[failures["model"].astype(str).eq(model)]
+    if rows.empty:
+        return False
+    if expected_splits is None or not {"validation", "split_id"}.issubset(
+        rows.columns
+    ):
+        return True
+    return any(
+        str(row.split_id) in expected_splits.get(str(row.validation), set())
+        for row in rows.loc[:, ["validation", "split_id"]].itertuples(index=False)
+    )
 
 
 def _dummy_validation_mae(metrics: pd.DataFrame, validation: str) -> float:

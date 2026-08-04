@@ -245,6 +245,75 @@ def test_invalid_expected_fold_evidence_fails_completeness_closed() -> None:
         assert not ranking["eligible"].any()
 
 
+@pytest.mark.parametrize(
+    ("validation", "wrong_count"),
+    [
+        ("leave_one_b_out", 2),
+        ("leave_one_b_out", 4),
+        ("leave_one_passage_out", 2),
+        ("leave_one_passage_out", 4),
+        ("leave_one_group_out", 8),
+        ("leave_one_group_out", 10),
+        ("leave_one_condition_out", 7),
+        ("leave_one_condition_out", 9),
+    ],
+)
+def test_expected_fold_evidence_rejects_noncanonical_family_count(
+    validation: str, wrong_count: int
+) -> None:
+    canonical_counts = dict(zip(VALIDATIONS, (3, 3, 9, 8), strict=True))
+    canonical_counts[validation] = wrong_count
+    fold_counts = tuple(canonical_counts[name] for name in VALIDATIONS)
+    metrics, predictions = make_ranking_fixture(fold_counts)
+    config = make_tiny_config()
+    config["expected_outer_split_ids"] = {
+        family: [f"{family}:{fold}" for fold in range(1, count + 1)]
+        for family, count in canonical_counts.items()
+    }
+
+    ranking = rank_phase_models(metrics, predictions, pd.DataFrame(), config)
+
+    assert not ranking["complete_outer_folds_gate"].any()
+    assert not ranking["eligible"].any()
+    assert select_winner(ranking) is None
+
+
+def test_one_fold_per_family_evidence_cannot_produce_winner() -> None:
+    metrics, predictions = make_ranking_fixture((1, 1, 1, 1))
+    config = make_tiny_config()
+    config["expected_outer_split_ids"] = {
+        validation: [f"{validation}:1"] for validation in VALIDATIONS
+    }
+
+    ranking = rank_phase_models(metrics, predictions, pd.DataFrame(), config)
+
+    assert not ranking["complete_outer_folds_gate"].any()
+    assert not ranking["eligible"].any()
+    assert select_winner(ranking) is None
+
+
+def test_raw_dummy_failure_fails_beat_dummy_gate_despite_ok_metric() -> None:
+    metrics, predictions = make_ranking_fixture()
+    failures = pd.DataFrame(
+        [
+            {
+                "validation": "leave_one_b_out",
+                "fold": "1",
+                "split_id": "leave_one_b_out:1",
+                "model": "dummy_median",
+                "exception_type": "RuntimeError",
+                "message": "raw dummy failure evidence",
+            }
+        ]
+    )
+
+    ranking = rank_phase_models(metrics, predictions, failures, make_tiny_config())
+
+    assert not ranking["mae_beats_dummy_gate"].any()
+    assert not ranking["eligible"].any()
+    assert select_winner(ranking) is None
+
+
 def test_missing_oof_row_fails_exact_prediction_completeness() -> None:
     metrics, predictions = make_ranking_fixture()
     missing = predictions["model"].eq("ridge") & predictions["split_id"].eq(
