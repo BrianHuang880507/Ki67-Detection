@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 from PIL import Image
 
 from immunity.exp3 import phase_features
@@ -42,6 +44,30 @@ def _manifest_row(tmp_path: Path, image_key: str, group_id: str) -> dict[str, st
         "pc_path": str(pc_path),
         "ido_path": str(tmp_path / f"{image_key}-ido.jpg"),
     }
+
+
+def _corrupt_stored_npz_member(mask_path: Path, member_name: str) -> None:
+    """翻轉未壓縮 ZIP member 的資料位元，保留結構但破壞 CRC。"""
+    with zipfile.ZipFile(mask_path) as archive:
+        member = archive.getinfo(member_name)
+        assert member.compress_type == zipfile.ZIP_STORED
+    with mask_path.open("r+b") as stream:
+        stream.seek(member.header_offset)
+        local_header = stream.read(30)
+        filename_length = int.from_bytes(local_header[26:28], "little")
+        extra_length = int.from_bytes(local_header[28:30], "little")
+        last_data_byte = (
+            member.header_offset
+            + 30
+            + filename_length
+            + extra_length
+            + member.file_size
+            - 1
+        )
+        stream.seek(last_data_byte)
+        original = stream.read(1)
+        stream.seek(last_data_byte)
+        stream.write(bytes([original[0] ^ 0xFF]))
 
 
 def test_cache_phase_masks_uses_only_pc_path(tmp_path: Path) -> None:
@@ -96,6 +122,30 @@ def test_cache_phase_masks_reuses_or_replaces_cache_deterministically(
     assert replaced.loc[0, "cache_status"] == "replaced"
 
 
+def test_cache_phase_masks_replaces_crc_corrupt_cache(tmp_path: Path) -> None:
+    manifest = pd.DataFrame(
+        [_manifest_row(tmp_path, "B4_P5_C01_F03", "B4_P5")]
+    )
+    mask_path = (
+        tmp_path / "cache" / "masks" / "B4_P5" / "B4_P5_C01_F03.npz"
+    )
+    mask_path.parent.mkdir(parents=True)
+    valid = np.zeros((12, 12), dtype=np.int32)
+    np.savez(mask_path, cell_mask=valid, nucleus_mask=valid)
+    _corrupt_stored_npz_member(mask_path, "cell_mask.npy")
+    with pytest.raises(zipfile.BadZipFile, match="Bad CRC-32"):
+        load_cached_masks(mask_path)
+    replacement = FakeSegmenter()
+
+    qc = cache_phase_masks(manifest, tmp_path / "cache", {}, replacement)
+
+    assert replacement.paths == [Path(manifest.loc[0, "pc_path"])]
+    assert qc.loc[0, "cache_status"] == "replaced"
+    assert qc.loc[0, "status"] == "passed"
+    cell, nucleus = load_cached_masks(mask_path)
+    assert cell.shape == nucleus.shape == (12, 12)
+
+
 def test_cache_phase_masks_records_invalid_shape_and_continues(tmp_path: Path) -> None:
     manifest = pd.DataFrame(
         [
@@ -121,6 +171,34 @@ def test_cache_phase_masks_records_invalid_shape_and_continues(tmp_path: Path) -
     assert "相同尺寸" in qc.loc[0, "error"]
     assert qc.loc[1, "paired_cells"] == 1
     assert len(fake.paths) == 2
+
+
+def test_cache_phase_masks_records_inference_error_and_continues(tmp_path: Path) -> None:
+    manifest = pd.DataFrame(
+        [
+            _manifest_row(tmp_path, "B4_P5_C01_F06", "B4_P5"),
+            _manifest_row(tmp_path, "B4_P5_C01_F07", "B4_P5"),
+        ]
+    )
+
+    class InferenceFailingSegmenter(FakeSegmenter):
+        def segment(self, path: Path) -> tuple[np.ndarray, np.ndarray]:
+            if path.name.endswith("F06.jpg"):
+                self.paths.append(path)
+                raise RuntimeError("synthetic inference failure")
+            return super().segment(path)
+
+    fake = InferenceFailingSegmenter()
+
+    qc = cache_phase_masks(manifest, tmp_path / "cache", {}, fake)
+
+    assert qc["status"].tolist() == ["failed", "passed"]
+    assert qc.loc[0, "error"] == "synthetic inference failure"
+    assert qc.loc[1, "error"] == ""
+    assert fake.paths == [
+        Path(manifest.loc[0, "pc_path"]),
+        Path(manifest.loc[1, "pc_path"]),
+    ]
 
 
 def test_cache_phase_masks_rejects_zero_paired_cells(tmp_path: Path) -> None:
@@ -254,6 +332,44 @@ def test_pc_nucleus_reference_comparison_reports_perfect_overlap() -> None:
     assert comparison.loc[0, "matched_cell_coverage"] == 1.0
 
 
+@pytest.mark.parametrize("label_side", ["pc", "dapi", "neither"])
+def test_pc_nucleus_reference_comparison_keeps_zero_label_summary(
+    label_side: str,
+) -> None:
+    pc = np.zeros((12, 12), dtype=np.int32)
+    dapi = np.zeros((12, 12), dtype=np.int32)
+    if label_side == "pc":
+        pc[2:5, 2:5] = 1
+    elif label_side == "dapi":
+        dapi[7:10, 7:10] = 7
+
+    comparison = compare_nucleus_masks(pc, dapi)
+
+    assert len(comparison) == 1
+    assert pd.isna(comparison.loc[0, "pc_label"])
+    assert pd.isna(comparison.loc[0, "dapi_label"])
+    assert pd.isna(comparison.loc[0, "dice"])
+    assert pd.isna(comparison.loc[0, "iou"])
+    assert comparison.loc[0, "matched_cell_coverage"] == 0.0
+
+
+def test_pc_nucleus_reference_comparison_keeps_zero_overlap_summary() -> None:
+    pc = np.zeros((12, 12), dtype=np.int32)
+    dapi = np.zeros((12, 12), dtype=np.int32)
+    pc[1:4, 1:4] = 1
+    dapi[8:11, 8:11] = 7
+
+    comparison = compare_nucleus_masks(pc, dapi)
+
+    assert len(comparison) == 1
+    assert comparison.loc[0, "matched_cell_coverage"] == 0.0
+    empty_metrics = comparison.loc[
+        0,
+        ["pc_label", "dapi_label", "dice", "iou"],
+    ]
+    assert empty_metrics.isna().all()
+
+
 def test_development_validation_is_disabled_without_touching_input(
     tmp_path: Path,
 ) -> None:
@@ -298,7 +414,6 @@ def test_development_validation_uses_pc_and_dapi_models_only_after_opt_in(
         def eval(self, image: np.ndarray, **kwargs: object):
             eval_channels.append(list(kwargs["channels"]))
             mask = np.zeros(image.shape[:2], dtype=np.int32)
-            mask[2:6, 2:6] = 1
             return mask, None, None
 
     monkeypatch.setattr(models, "CellposeModel", FakeModel)
@@ -321,6 +436,9 @@ def test_development_validation_uses_pc_and_dapi_models_only_after_opt_in(
     assert eval_channels == [[0, 0], [3, 3]]
     assert result["role"].tolist() == ["development_only_dapi_reference"]
     assert result.loc[0, "image_key"] == "IFN0_TNF0_FOV01"
+    assert result.loc[0, "matched_cell_coverage"] == 0.0
+    assert pd.isna(result.loc[0, "pc_label"])
+    assert pd.isna(result.loc[0, "dapi_label"])
     validation_cache = tmp_path / "feature_cache" / "development_validation"
     assert sorted(path.name for path in validation_cache.glob("*.npz")) == [
         "IFN0_TNF0_FOV01.npz"

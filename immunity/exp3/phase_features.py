@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import zipfile
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -229,7 +230,13 @@ def cache_phase_masks(
                 try:
                     masks = load_cached_masks(mask_path)
                     cache_status = "reused"
-                except (OSError, ValueError, KeyError):
+                except (
+                    OSError,
+                    ValueError,
+                    KeyError,
+                    EOFError,
+                    zipfile.BadZipFile,
+                ):
                     #不可讀取或缺少欄位的 cache 不可重用，改以 PC 重新推論。
                     masks = None
 
@@ -285,6 +292,8 @@ def load_cached_masks(mask_path: str | Path) -> tuple[np.ndarray, np.ndarray]:
     Raises:
         KeyError: cache 缺少必要陣列時拋出。
         OSError: cache 無法讀取時拋出。
+        EOFError: cache 內容提前結束時拋出。
+        zipfile.BadZipFile: ZIP 結構或 member CRC 無效時拋出。
     """
     with np.load(Path(mask_path), allow_pickle=False) as cached:
         if "cell_mask" not in cached or "nucleus_mask" not in cached:
@@ -307,7 +316,8 @@ def compare_nucleus_masks(
 
     Returns:
         每個 IoU 大於零之配對的 Dice、IoU、面積比、Feret 長度，及相同的
-        image-level matched-cell coverage。
+        image-level matched-cell coverage。無 labels 或無 overlap 時仍回傳一列
+        coverage 為零的 sentinel summary，避免該 FOV 從開發驗證消失。
 
     Raises:
         ValueError: masks 不是二維或尺寸不一致時拋出。
@@ -316,7 +326,7 @@ def compare_nucleus_masks(
     pc_labels = _nonzero_labels(pc_array)
     dapi_labels = _nonzero_labels(dapi_array)
     if not pc_labels or not dapi_labels:
-        return pd.DataFrame(columns=NUCLEUS_COMPARISON_COLUMNS)
+        return _zero_match_summary()
 
     pc_areas = {label: int(np.count_nonzero(pc_array == label)) for label in pc_labels}
     dapi_areas = {
@@ -339,6 +349,8 @@ def compare_nucleus_masks(
         for pc_index, dapi_index in zip(pc_indices, dapi_indices)
         if ious[pc_index, dapi_index] > 0.0
     ]
+    if not matches:
+        return _zero_match_summary()
     coverage = len(matches) / max(len(pc_labels), len(dapi_labels))
     rows: list[dict[str, Any]] = []
     for pc_index, dapi_index in matches:
@@ -494,6 +506,13 @@ def _feret_length(region: np.ndarray) -> float:
     """計算二值區域的最大 Feret diameter。"""
     properties = regionprops(np.asarray(region, dtype=np.uint8))
     return float(properties[0].feret_diameter_max) if properties else 0.0
+
+
+def _zero_match_summary() -> pd.DataFrame:
+    """建立 coverage 為零且不偽造配對 metrics 的 sentinel row。"""
+    row = {column: pd.NA for column in NUCLEUS_COMPARISON_COLUMNS}
+    row["matched_cell_coverage"] = 0.0
+    return pd.DataFrame([row], columns=NUCLEUS_COMPARISON_COLUMNS)
 
 
 def _write_mask_cache(
