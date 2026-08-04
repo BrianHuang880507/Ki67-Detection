@@ -30,6 +30,7 @@ Exp3 新增九個 `B-ID × Passage` 組合：
 3. 以多種 grouped validations 的平均排名選擇 phase-only 候選模型。
 4. 使用 dose-only 與 dose＋morphology models 診斷 IFN/TNF confounding，但不允許其成為部署模型。
 5. 將 ΔMorphology 用於描述、穩定性分析與候選 feature 排序，不以九套 signatures 訓練正式模型。
+6. 將 Exp3 新特徵與 benchmark 完整隔離於 `immunity/exp3/`，不擴張既有 main/core 分析流程。
 
 ## 非目標
 
@@ -38,6 +39,8 @@ Exp3 新增九個 `B-ID × Passage` 組合：
 - 不以 9 套 ΔMorphology signatures 訓練 651-feature regression model。
 - 不使用 image-level random split 作為主要模型證據。
 - 不將 IDO proxy 稱為整體免疫抑制能力；除非未來另有 PBMC／T-cell functional assay 驗證。
+- 不修改 `main.py` 的 CLI、既有 cleaned CSV／XLSX 欄位、GUI、一般 morphology 分析輸出或
+  `ki67dtc` core feature schema 來承載 Exp3 新特徵。
 
 ## 1. Data manifest 與 QC
 
@@ -111,6 +114,38 @@ background-corrected image-level `IDO_score` target。
 
 Round 2 ablation 只使用 Round 1 的冠軍與第二名，結果標記為 exploratory，不改寫 Round 1 冠軍。
 若要讓 secondary feature set 成為正式候選，必須在新的獨立資料中預先指定並驗證。
+
+### 2.4 Exp3 feature isolation boundary
+
+Exp3 使用獨立 package 與 entry point：
+
+```text
+immunity/exp3/
+├─ manifest.py
+├─ phase_features.py
+├─ feature_sets.py
+├─ benchmark.py
+├─ reporting.py
+└─ run_benchmark.py
+```
+
+執行入口限定為 Exp3 專用命令，例如：
+
+```powershell
+python -m immunity.exp3.run_benchmark --config immunity/configs/exp3.yaml
+```
+
+邊界規則：
+
+- Exp3 可將現有 segmentation function 當成 library dependency 使用，但不得呼叫或擴張 `main.py` 的 CLI／export
+  workflow。
+- Exp3 直接讀取 raw PC／IDO paths 或自己的 intermediate cache；不得要求 main cleaned CSV 增加欄位。
+- 新增的 paper-style、Zernike、IQR 或 ΔMorphology features 只能寫入 `immunity/outputs/exp3/`。
+- Primary run 預設只計算 33 個 basic medians；66／93-feature sets 必須由 Exp3 config 明確啟用，採 lazy
+  computation，不因 import 或一般分析自動產生。
+- 不將 Exp3 feature names 加入全域 `main.py`、GUI、XLSX 或 legacy report 的 predictor lists。
+- 若需要共用純計算邏輯，先以不改變既有 public behavior 的 adapter 包裝；main/core regression tests 必須證明
+  原輸出 schema 與數值不變。
 
 ## 3. Model registry
 
@@ -268,6 +303,7 @@ immunity/outputs/exp3/
 ├─ data_manifest.csv
 ├─ pairing_qc.csv
 ├─ segmentation_qc.csv
+├─ feature_cache/
 ├─ feature_sets.json
 ├─ outer_splits.csv
 ├─ oof_predictions.csv
@@ -296,6 +332,7 @@ permutation importance 計算，並以 fold-level distribution 呈現；不得�
 ## 9. 錯誤處理
 
 - Pairing、condition mapping 或必要 metadata 缺失時，停止下游分析並輸出 QC 原因。
+- Exp3 output path 指向 main/core result directory 時直接阻擋，避免覆寫 legacy analysis artifacts。
 - 任一 model/fold 失敗時記錄 model、validation、fold、exception 與 hyperparameters。
 - 模型 fold 失敗後不得以不同 split 重試並取較佳結果。
 - Outer split manifest 必須可重現並保存，所有模型強制共用。
@@ -311,6 +348,7 @@ permutation importance 計算，並以 fold-level distribution 呈現；不得�
 3. Condition mapping 缺失時明確失敗。
 4. Feature whitelist 阻擋 IDO／dose leakage。
 5. Metrics 正確處理 constant vectors 與 `NaN`。
+6. Exp3 secondary features 不會出現在 main cleaned CSV、XLSX、GUI 或 legacy predictor schema。
 
 ### Split／leakage tests
 
@@ -362,3 +400,5 @@ Smoke test：5–15 分鐘
 6. Ranking、eligibility gate 與 no-winner 結果可由輸出檔案重算。
 7. ΔMorphology 僅作描述與候選排序，不進入本次正式 regression。
 8. `EXPERIMENT_RECORD.md` 清楚區分證據、推論、限制與下一批資料需求。
+9. 一般 `main.py` 分析在實作前後維持相同 CLI 與輸出欄位；Exp3 secondary features 只有明確執行
+   `immunity.exp3.run_benchmark` 時才會計算。
