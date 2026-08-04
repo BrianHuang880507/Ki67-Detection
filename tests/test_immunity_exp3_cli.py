@@ -58,6 +58,82 @@ REQUIRED_FIGURE_NAMES = {
 }
 
 
+def _seed_stale_generation(output: Path) -> None:
+    """預填上一世代的完整正式 artifacts 與不可移動項目。"""
+    output.mkdir(parents=True, exist_ok=True)
+    for name in REQUIRED_TABLE_NAMES:
+        (output / name).write_text("stale-generation\n", encoding="utf-8")
+    for name in (
+        "feature_sets.json",
+        "run_metadata.json",
+        "final_model.json",
+        "EXPERIMENT_RECORD.md",
+    ):
+        (output / name).write_text("stale-generation\n", encoding="utf-8")
+    (output / "figures").mkdir()
+    (output / "figures" / "stale.png").write_bytes(b"stale-generation")
+    (output / "models").mkdir()
+    (output / "models" / "stale.joblib").write_bytes(b"stale-generation")
+    (output / "feature_cache").mkdir()
+    (output / "feature_cache" / "reusable.bin").write_bytes(b"keep-cache")
+    (output / "run.log").write_text("open-log-marker\n", encoding="utf-8")
+
+
+def _assert_stale_generation_archived(output: Path) -> None:
+    """確認舊正式結果可復原，且 reusable/open artifacts 未被移動。"""
+    archives = list((output / "_generations").glob("previous-*"))
+    assert len(archives) == 1
+    archived = archives[0]
+    assert (archived / "fold_metrics.csv").read_text("utf-8") == (
+        "stale-generation\n"
+    )
+    assert (archived / "EXPERIMENT_RECORD.md").is_file()
+    assert (archived / "final_model.json").is_file()
+    assert (archived / "figures" / "stale.png").is_file()
+    assert (archived / "models" / "stale.joblib").is_file()
+    assert (output / "feature_cache" / "reusable.bin").read_bytes() == b"keep-cache"
+    assert (output / "run.log").read_text("utf-8") == "open-log-marker\n"
+
+
+def _assert_no_current_success_artifacts(output: Path) -> None:
+    """失敗世代不得在固定 root path 暴露任何成功結果。"""
+    for name in (
+        "outer_splits.csv",
+        "oof_predictions.csv",
+        "fold_metrics.csv",
+        "hyperparameters.csv",
+        "model_ranking.csv",
+        "feature_importance.csv",
+        "pc_nucleus_dapi_validation.csv",
+        "morphology_delta_signatures.csv",
+        "feature_sets.json",
+        "run_metadata.json",
+        "final_model.json",
+        "EXPERIMENT_RECORD.md",
+    ):
+        assert not (output / name).exists(), name
+    assert not (output / "models").exists()
+    assert not (output / "figures").exists()
+
+
+def _create_directory_link(link: Path, target: Path) -> None:
+    """建立測試用 directory symlink，Windows 權限不足時改用 junction。"""
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        import os
+        import subprocess
+
+        if os.name != "nt":
+            raise
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
 class SyntheticSegmenter:
     """只以檔名條件建立 deterministic synthetic masks。"""
 
@@ -168,6 +244,76 @@ def _make_synthetic_config(
     return config, SyntheticSegmenter()
 
 
+def _patch_eligible_winner_stages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[str | None]:
+    """以完整 contract 的快速 doubles 將流程推進到 eligible winner。"""
+    from immunity.exp3 import benchmark as benchmark_module
+
+    empty_result = benchmark_module.BenchmarkResult(
+        predictions=pd.DataFrame(columns=benchmark_module.OOF_COLUMNS),
+        fold_metrics=pd.DataFrame(columns=benchmark_module.FOLD_METRIC_COLUMNS),
+        hyperparameters=pd.DataFrame(columns=benchmark_module.HYPERPARAMETER_COLUMNS),
+        feature_importance=pd.DataFrame(
+            columns=benchmark_module.FEATURE_IMPORTANCE_COLUMNS
+        ),
+        failures=pd.DataFrame(columns=benchmark_module.FAILURE_COLUMNS),
+    )
+    ranking = pd.DataFrame(
+        [
+            {
+                "model": "ridge",
+                "eligible": True,
+                "winner": True,
+                "overall_rank": 1.0,
+                "worst_validation_rank": 1.0,
+                "leave_one_b_out_mae": 1.0,
+                "overall_oof_spearman": 0.8,
+                "simplicity_rank": 2.0,
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        benchmark_module,
+        "run_nested_benchmark",
+        lambda *args, **kwargs: empty_result,
+    )
+    monkeypatch.setattr(
+        benchmark_module,
+        "run_condition_adjusted_sensitivity",
+        lambda *args, **kwargs: pd.DataFrame(
+            columns=benchmark_module.FOLD_METRIC_COLUMNS
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_module,
+        "rank_phase_models",
+        lambda *args, **kwargs: ranking.copy(),
+    )
+    fitted: list[str | None] = []
+
+    def publish_fake_model(
+        images: pd.DataFrame,
+        winner: str | None,
+        feature_sets: object,
+        config: object,
+        output_dir: Path,
+    ) -> None:
+        fitted.append(winner)
+        (output_dir / "models").mkdir(exist_ok=True)
+        (output_dir / "models" / "ridge.joblib").write_bytes(b"current-model")
+        (output_dir / "final_model.json").write_text(
+            '{"winner":"ridge"}\n', encoding="utf-8"
+        )
+
+    monkeypatch.setattr(
+        benchmark_module,
+        "fit_final_phase_model",
+        publish_fake_model,
+    )
+    return fitted
+
+
 def test_exp3_output_must_stay_under_dedicated_root(tmp_path: Path) -> None:
     """Exp3 的輸出目錄只能位於專用根目錄中。"""
     allowed = resolve_exp3_output_dir("immunity/outputs/exp3/smoke")
@@ -177,6 +323,58 @@ def test_exp3_output_must_stay_under_dedicated_root(tmp_path: Path) -> None:
         resolve_exp3_output_dir("immunity/outputs/b4_p6")
     with pytest.raises(ValueError, match="immunity/outputs/exp3"):
         resolve_exp3_output_dir(tmp_path)
+
+
+def test_generation_archive_completes_preflight_before_moving_any_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """後段 target 是 junction 時，前段正式檔案也不得先被搬走。"""
+    output = (tmp_path / "output").resolve()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "marker.txt").write_text("outside\n", encoding="utf-8")
+    output.mkdir()
+    (output / "fold_metrics.csv").write_text("current\n", encoding="utf-8")
+    _create_directory_link(output / "figures", outside)
+    monkeypatch.setattr(run_module, "EXP3_OUTPUT_ROOT", output)
+
+    with pytest.raises(ValueError, match="link|junction"):
+        run_module._archive_previous_generation(output)
+
+    assert (output / "fold_metrics.csv").read_text("utf-8") == "current\n"
+    assert (outside / "marker.txt").read_text("utf-8") == "outside\n"
+    assert not list((output / "_generations").glob("previous-*"))
+
+
+def test_generation_archive_rolls_back_prior_moves_when_later_move_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Archive transaction 中途失敗時，已移動 targets 必須回復固定 root。"""
+    output = (tmp_path / "output").resolve()
+    output.mkdir()
+    (output / "data_manifest.csv").write_text("manifest\n", encoding="utf-8")
+    (output / "pairing_qc.csv").write_text("pairing\n", encoding="utf-8")
+    monkeypatch.setattr(run_module, "EXP3_OUTPUT_ROOT", output)
+    real_replace = run_module.os.replace
+    calls = 0
+
+    def fail_second_move(source: object, destination: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("synthetic archive move failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(run_module.os, "replace", fail_second_move)
+
+    with pytest.raises(OSError, match="archive move failure"):
+        run_module._archive_previous_generation(output)
+
+    assert (output / "data_manifest.csv").read_text("utf-8") == "manifest\n"
+    assert (output / "pairing_qc.csv").read_text("utf-8") == "pairing\n"
+    assert not list((output / "_generations").glob("previous-*"))
 
 
 def test_importing_exp3_does_not_expand_main_contract() -> None:
@@ -241,6 +439,95 @@ def test_empty_mapping_writes_pairing_qc_then_stops(
     assert not (output / "models").exists()
     assert not (output / "EXPERIMENT_RECORD.md").exists()
     assert not list((output / "figures").glob("*.png"))
+
+
+def test_new_run_archives_stale_generation_before_mapping_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mapping failure 只能在固定 root 留下本世代 pairing evidence。"""
+    output = (tmp_path / "output").resolve()
+    monkeypatch.setattr(run_module, "EXP3_OUTPUT_ROOT", output)
+    _seed_stale_generation(output)
+    root = tmp_path / "scan" / "B4-P5"
+    _write_synthetic_pair(root, 1, 1, 20)
+    config = _base_test_config(output)
+    config.update(
+        {
+            "datasets": [{"input_dir": str(root), "b_id": "B4", "passage": 5}],
+            "expected_totals": {"pc": 1, "ido": 1, "paired": 1},
+            "condition_mapping": {},
+        }
+    )
+
+    with pytest.raises(ValueError, match="condition mapping"):
+        run_module.run_benchmark(config)
+
+    _assert_stale_generation_archived(output)
+    _assert_no_current_success_artifacts(output)
+    assert pd.read_csv(output / "pairing_qc.csv")["status"].tolist() == ["paired"]
+
+
+def test_new_run_archives_stale_generation_before_totals_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Totals failure 不得讓上一世代 metrics/ranking/record 看似有效。"""
+    output = (tmp_path / "output").resolve()
+    monkeypatch.setattr(run_module, "EXP3_OUTPUT_ROOT", output)
+    _seed_stale_generation(output)
+    root = tmp_path / "scan" / "B4-P5"
+    _write_synthetic_pair(root, 1, 1, 20)
+    config = _base_test_config(output)
+    config.update(
+        {
+            "datasets": [{"input_dir": str(root), "b_id": "B4", "passage": 5}],
+            "expected_totals": {"pc": 2, "ido": 1, "paired": 1},
+        }
+    )
+
+    with pytest.raises(ValueError, match="expected total"):
+        run_module.run_benchmark(config)
+
+    _assert_stale_generation_archived(output)
+    _assert_no_current_success_artifacts(output)
+    assert (output / "pairing_qc.csv").is_file()
+
+
+def test_new_run_archives_stale_generation_before_segmentation_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Segmentation failure 只保留本世代 manifest 與 QC evidence。"""
+
+    class FailingSegmenter:
+        cache_signature = "failing-segmenter-v1"
+
+        def segment(self, path: Path) -> tuple[np.ndarray, np.ndarray]:
+            raise RuntimeError("synthetic segmentation failure")
+
+    output = (tmp_path / "output").resolve()
+    monkeypatch.setattr(run_module, "EXP3_OUTPUT_ROOT", output)
+    _seed_stale_generation(output)
+    root = tmp_path / "scan" / "B4-P5"
+    _write_synthetic_pair(root, 1, 1, 20)
+    config = _base_test_config(output)
+    config.update(
+        {
+            "datasets": [{"input_dir": str(root), "b_id": "B4", "passage": 5}],
+            "expected_totals": {"pc": 1, "ido": 1, "paired": 1},
+            "_segmenter": FailingSegmenter(),
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="segmentation failed"):
+        run_module.run_benchmark(config)
+
+    _assert_stale_generation_archived(output)
+    _assert_no_current_success_artifacts(output)
+    assert (output / "data_manifest.csv").is_file()
+    qc = pd.read_csv(output / "segmentation_qc.csv")
+    assert qc["error"].str.contains("synthetic segmentation failure").all()
 
 
 def test_smoke_pipeline_writes_recomputable_isolated_outputs_without_cellpose(
@@ -375,6 +662,7 @@ def test_model_failure_writes_failure_evidence_then_stops(
 
     output = (tmp_path / "output").resolve()
     monkeypatch.setattr(run_module, "EXP3_OUTPUT_ROOT", output)
+    _seed_stale_generation(output)
     config, segmenter = _make_synthetic_config(tmp_path, fovs_per_condition=1)
     config["feature_sets"]["enabled"] = ["basic_median"]
     config["_segmenter"] = segmenter
@@ -412,7 +700,107 @@ def test_model_failure_writes_failure_evidence_then_stops(
 
     failures = pd.read_csv(output / "model_failures.csv")
     assert failures["message"].tolist() == ["synthetic fold failure"]
+    _assert_stale_generation_archived(output)
+    _assert_no_current_success_artifacts(output)
     assert not (output / "EXPERIMENT_RECORD.md").exists()
+
+
+def test_round_two_failure_happens_before_final_model_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Eligible winner 不得在 Round2 成功前發布 final model。"""
+    output = (tmp_path / "output").resolve()
+    monkeypatch.setattr(run_module, "EXP3_OUTPUT_ROOT", output)
+    config, segmenter = _make_synthetic_config(tmp_path, fovs_per_condition=1)
+    config["feature_sets"]["enabled"] = ["basic_median"]
+    config["_segmenter"] = segmenter
+    fitted = _patch_eligible_winner_stages(monkeypatch)
+
+    def fail_round_two(**kwargs: object) -> object:
+        raise RuntimeError("synthetic Round 2 failure")
+
+    monkeypatch.setattr(run_module, "_run_round_two", fail_round_two)
+
+    with pytest.raises(RuntimeError, match="Round 2 failure"):
+        run_module.run_benchmark(config)
+
+    assert fitted == []
+    _assert_no_current_success_artifacts(output)
+    assert (output / "pairing_qc.csv").is_file()
+    assert (output / "data_manifest.csv").is_file()
+    assert (output / "segmentation_qc.csv").is_file()
+
+
+def test_reporting_failure_happens_before_final_model_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Result/figure 發布失敗時不得先建立 final model。"""
+    from immunity.exp3 import reporting as reporting_module
+
+    output = (tmp_path / "output").resolve()
+    monkeypatch.setattr(run_module, "EXP3_OUTPUT_ROOT", output)
+    config, segmenter = _make_synthetic_config(tmp_path, fovs_per_condition=1)
+    config["feature_sets"]["enabled"] = ["basic_median"]
+    config["_segmenter"] = segmenter
+    fitted = _patch_eligible_winner_stages(monkeypatch)
+
+    def write_current_tables(output_dir: Path, tables: object) -> list[Path]:
+        path = output_dir / "fold_metrics.csv"
+        path.write_text("current-success-table\n", encoding="utf-8")
+        return [path]
+
+    monkeypatch.setattr(reporting_module, "write_result_tables", write_current_tables)
+    monkeypatch.setattr(
+        reporting_module,
+        "write_figures",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("synthetic figure failure")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="figure failure"):
+        run_module.run_benchmark(config)
+
+    assert fitted == []
+    _assert_no_current_success_artifacts(output)
+    assert (output / "pairing_qc.csv").is_file()
+
+
+def test_record_writer_failure_quarantines_model_and_partial_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Record writer 部分失敗後不得留下 model/record 任一半成品。"""
+    from immunity.exp3 import reporting as reporting_module
+
+    output = (tmp_path / "output").resolve()
+    monkeypatch.setattr(run_module, "EXP3_OUTPUT_ROOT", output)
+    config, segmenter = _make_synthetic_config(tmp_path, fovs_per_condition=1)
+    config["feature_sets"]["enabled"] = ["basic_median"]
+    config["_segmenter"] = segmenter
+    fitted = _patch_eligible_winner_stages(monkeypatch)
+    monkeypatch.setattr(reporting_module, "write_result_tables", lambda *args: [])
+    monkeypatch.setattr(reporting_module, "write_figures", lambda *args: [])
+
+    def fail_after_partial_record(output_dir: Path, context: object) -> Path:
+        record = output_dir / "EXPERIMENT_RECORD.md"
+        record.write_text("partial-current-record\n", encoding="utf-8")
+        raise RuntimeError("synthetic record writer failure")
+
+    monkeypatch.setattr(
+        reporting_module,
+        "write_experiment_record",
+        fail_after_partial_record,
+    )
+
+    with pytest.raises(RuntimeError, match="record writer failure"):
+        run_module.run_benchmark(config)
+
+    assert fitted == ["ridge"]
+    _assert_no_current_success_artifacts(output)
+    assert list((output / "_generations").glob("failed-*"))
 
 
 @pytest.mark.parametrize(
@@ -543,6 +931,45 @@ def test_round_two_top_models_use_task8_tie_break_evidence() -> None:
     )
 
     assert selected == ["ridge", "random_forest"]
+
+
+def test_round_two_top_models_apply_quarter_rank_tie_band() -> None:
+    """Best rank 0.25 內須整體套用 Task8 tie-break，不可先取前兩個 rank。"""
+    ranking = pd.DataFrame(
+        [
+            {
+                "model": "ridge",
+                "overall_rank": 1.0,
+                "worst_validation_rank": 4.0,
+                "leave_one_b_out_mae": 0.8,
+                "overall_oof_spearman": 0.9,
+                "simplicity_rank": 2,
+            },
+            {
+                "model": "elasticnet",
+                "overall_rank": 1.1,
+                "worst_validation_rank": 2.0,
+                "leave_one_b_out_mae": 1.0,
+                "overall_oof_spearman": 0.7,
+                "simplicity_rank": 3,
+            },
+            {
+                "model": "random_forest",
+                "overall_rank": 1.15,
+                "worst_validation_rank": 3.0,
+                "leave_one_b_out_mae": 0.5,
+                "overall_oof_spearman": 0.8,
+                "simplicity_rank": 6,
+            },
+        ]
+    )
+
+    selected = run_module._round_two_top_models(
+        ranking,
+        ["ridge", "elasticnet", "random_forest"],
+    )
+
+    assert selected == ["elasticnet", "random_forest"]
 
 
 def test_config_load_failure_writes_smoke_fallback_log(

@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import platform
 import subprocess
@@ -14,6 +15,7 @@ import sys
 import tempfile
 import time
 import traceback
+import uuid
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +27,37 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 EXP3_OUTPUT_ROOT = (PROJECT_ROOT / "immunity" / "outputs" / "exp3").resolve()
+
+_FORMAL_TABLE_NAMES = (
+    "data_manifest.csv",
+    "pairing_qc.csv",
+    "segmentation_qc.csv",
+    "outer_splits.csv",
+    "oof_predictions.csv",
+    "fold_metrics.csv",
+    "hyperparameters.csv",
+    "model_ranking.csv",
+    "feature_importance.csv",
+    "model_failures.csv",
+    "condition_adjusted_metrics.csv",
+    "pc_nucleus_dapi_validation.csv",
+    "morphology_delta_signatures.csv",
+)
+_FORMAL_FILE_NAMES = (
+    *_FORMAL_TABLE_NAMES,
+    "feature_sets.json",
+    "run_metadata.json",
+    "final_model.json",
+    "EXPERIMENT_RECORD.md",
+)
+_FORMAL_DIRECTORY_NAMES = ("figures", "models")
+_FAILURE_EVIDENCE_NAMES = {
+    "data_manifest.csv",
+    "pairing_qc.csv",
+    "segmentation_qc.csv",
+    "model_failures.csv",
+    "condition_adjusted_metrics.csv",
+}
 
 
 def resolve_exp3_output_dir(path: str | Path) -> Path:
@@ -103,6 +136,35 @@ def run_benchmark(
     config: Mapping[str, Any],
     smoke_fovs_per_condition: int | None = None,
 ) -> Path:
+    """隔離舊執行世代後，執行並發布單一 Exp3 benchmark 世代。
+
+    Args:
+        config: 經 ``load_config`` 驗證的完整 Exp3 設定。
+        smoke_fovs_per_condition: 每個 group/condition 保留的 smoke FOV 數。
+
+    Returns:
+        完成本世代發布的 ``EXPERIMENT_RECORD.md`` 路徑。
+
+    Raises:
+        TypeError: ``config`` 不是 mapping 時拋出。
+        ValueError: output boundary 或輸入設定不合法時拋出。
+        RuntimeError: 任一 pipeline stage 無法完成時拋出。
+    """
+    if not isinstance(config, Mapping):
+        raise TypeError("Exp3 config 必須是 mapping")
+    output_dir = _resolve_run_output(config, smoke_fovs_per_condition)
+    _archive_previous_generation(output_dir)
+    try:
+        return _run_benchmark_generation(config, smoke_fovs_per_condition)
+    except Exception:
+        _quarantine_failed_generation(output_dir)
+        raise
+
+
+def _run_benchmark_generation(
+    config: Mapping[str, Any],
+    smoke_fovs_per_condition: int | None = None,
+) -> Path:
     """依固定 stage 順序執行 Exp3 phase-only benchmark。
 
     Args:
@@ -127,7 +189,6 @@ def run_benchmark(
     run_config = dict(config)
     run_config["_output_dir"] = str(output_dir)
     feature_cache = _prepare_child_directory(output_dir, "feature_cache")
-    _prepare_child_directory(output_dir, "figures")
 
     #延遲匯入可避免 feature/reporting modules 反向依賴 resolver 的 circular import。
     from immunity.exp3.benchmark import (
@@ -304,17 +365,6 @@ def run_benchmark(
         ranking["eligible"].fillna(False).astype(bool), "model"
     ].astype(str).tolist()
     winner = select_winner(ranking)
-    final_config = dict(evidence_config)
-    final_config["eligible_phase_models"] = eligible_phase_models
-    final_config["config_hash"] = _config_hash(config)[0]
-    final_config["manifest_hash"] = manifest_hash
-    fit_final_phase_model(
-        images,
-        winner,
-        feature_sets,
-        final_config,
-        output_dir,
-    )
 
     round_two = _run_round_two(
         images=images,
@@ -389,6 +439,17 @@ def run_benchmark(
         "morphology_delta_signatures": morphology_delta,
     }
     write_figures(output_dir, primary_artifacts)
+    final_config = dict(evidence_config)
+    final_config["eligible_phase_models"] = eligible_phase_models
+    final_config["config_hash"] = _config_hash(config)[0]
+    final_config["manifest_hash"] = manifest_hash
+    fit_final_phase_model(
+        images,
+        winner,
+        feature_sets,
+        final_config,
+        output_dir,
+    )
 
     ended_at = datetime.now(timezone.utc)
     elapsed_seconds = max(0.0, time.perf_counter() - started_clock)
@@ -569,6 +630,144 @@ def _safe_run_file(parent: Path, name: str) -> Path:
     return destination
 
 
+def _directory_identity(path: Path) -> tuple[int, int, Path]:
+    """擷取目錄 identity，供跨 preflight/move 的替換偵測。"""
+    stat = path.stat()
+    return int(stat.st_dev), int(stat.st_ino), path.resolve(strict=True)
+
+
+def _assert_directory_identity(
+    path: Path,
+    identity: tuple[int, int, Path],
+) -> None:
+    """確認目錄未在 archive transaction 期間被置換。"""
+    if _directory_identity(path) != identity:
+        raise ValueError("Exp3 archive parent 在 transaction 期間已被替換")
+
+
+def _archive_previous_generation(output_dir: Path) -> Path | None:
+    """將上一世代所有固定正式 artifacts 搬入可復原 archive。"""
+    return _archive_generation_targets(
+        output_dir,
+        (*_FORMAL_FILE_NAMES, *_FORMAL_DIRECTORY_NAMES),
+        prefix="previous",
+    )
+
+
+def _quarantine_failed_generation(output_dir: Path) -> Path | None:
+    """隔離失敗世代的成功 artifacts，只保留當次失敗/QC evidence。"""
+    names = tuple(
+        name
+        for name in (*_FORMAL_FILE_NAMES, *_FORMAL_DIRECTORY_NAMES)
+        if name not in _FAILURE_EVIDENCE_NAMES
+    )
+    return _archive_generation_targets(output_dir, names, prefix="failed")
+
+
+def _archive_generation_targets(
+    output_dir: Path,
+    names: Sequence[str],
+    *,
+    prefix: str,
+) -> Path | None:
+    """以完整 preflight、identity checks 與 rollback 搬移固定 targets。
+
+    Args:
+        output_dir: 已限制於 Exp3 專用根目錄內的本次 run root。
+        names: 僅允許直接位於 run root 的固定檔案或目錄名稱。
+        prefix: Archive child 的世代類型標記。
+
+    Returns:
+        有 targets 時回傳 archive child；否則回傳 ``None``。
+
+    Raises:
+        ValueError: 任一 target、archive root 或 parent identity 不安全時拋出。
+        OSError: 搬移失敗且 rollback 完成後重新拋出原始錯誤。
+    """
+    safe_root = _prepare_output_directory(output_dir)
+    root_identity = _directory_identity(safe_root)
+    planned: list[tuple[Path, tuple[int, int, bool]]] = []
+    for name in names:
+        if not isinstance(name, str) or Path(name).name != name or name in {".", ".."}:
+            raise ValueError("Exp3 archive target 必須是固定單層名稱")
+        target = safe_root / name
+        if target.resolve(strict=False) != target:
+            raise ValueError(f"Exp3 archive target {name!r} 不可是 link/junction")
+        if not target.exists():
+            continue
+        expected_directory = name in _FORMAL_DIRECTORY_NAMES
+        if expected_directory != target.is_dir():
+            expected = "目錄" if expected_directory else "一般檔案"
+            raise ValueError(f"Exp3 archive target {name!r} 必須是{expected}")
+        stat = target.stat()
+        planned.append(
+            (target, (int(stat.st_dev), int(stat.st_ino), expected_directory))
+        )
+
+    generations = safe_root / "_generations"
+    if generations.resolve(strict=False) != generations:
+        raise ValueError("Exp3 _generations 不可是 symlink 或 junction")
+    if generations.exists() and not generations.is_dir():
+        raise ValueError("Exp3 _generations 必須是目錄")
+    if not planned:
+        return None
+
+    _assert_directory_identity(safe_root, root_identity)
+    generations = _prepare_child_directory(safe_root, "_generations")
+    generations_identity = _directory_identity(generations)
+    archive_name = (
+        f"{prefix}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-"
+        f"{uuid.uuid4().hex[:12]}"
+    )
+    archive_dir = generations / archive_name
+    if archive_dir.resolve(strict=False) != archive_dir or archive_dir.exists():
+        raise ValueError("Exp3 archive child 路徑不安全或已存在")
+    archive_dir.mkdir(parents=False, exist_ok=False)
+    archive_identity = _directory_identity(archive_dir)
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for target, expected_identity in planned:
+            _assert_directory_identity(safe_root, root_identity)
+            _assert_directory_identity(generations, generations_identity)
+            _assert_directory_identity(archive_dir, archive_identity)
+            if not target.exists() or target.resolve(strict=False) != target:
+                raise ValueError(f"Exp3 archive target {target.name!r} 已被替換")
+            stat = target.stat()
+            actual_identity = (
+                int(stat.st_dev),
+                int(stat.st_ino),
+                target.is_dir(),
+            )
+            if actual_identity != expected_identity:
+                raise ValueError(f"Exp3 archive target {target.name!r} identity 已改變")
+            destination = archive_dir / target.name
+            if destination.resolve(strict=False) != destination or destination.exists():
+                raise ValueError("Exp3 archive destination 不安全或已存在")
+            os.replace(target, destination)
+            moved.append((target, destination))
+    except Exception as error:
+        rollback_errors: list[Exception] = []
+        for target, destination in reversed(moved):
+            try:
+                _assert_directory_identity(safe_root, root_identity)
+                _assert_directory_identity(archive_dir, archive_identity)
+                if target.exists() or not destination.exists():
+                    raise ValueError("Exp3 archive rollback target 狀態不一致")
+                os.replace(destination, target)
+            except Exception as rollback_error:  #保留原始錯誤並附加 rollback evidence。
+                rollback_errors.append(rollback_error)
+        if rollback_errors:
+            error.add_note(
+                "Exp3 archive rollback failures: "
+                + "; ".join(str(item) for item in rollback_errors)
+            )
+        raise
+    finally:
+        if archive_dir.exists() and not any(archive_dir.iterdir()):
+            archive_dir.rmdir()
+    return archive_dir
+
+
 def _write_csv_atomically(frame: pd.DataFrame, destination: Path) -> None:
     """在重新驗證 parent identity 後原子發布 early QC／manifest CSV。"""
     if not isinstance(frame, pd.DataFrame):
@@ -719,7 +918,11 @@ def _run_round_two(
     )
     if not secondary_sets:
         return empty
-    top_models = _round_two_top_models(ranking, primary_candidates)
+    top_models = _round_two_top_models(
+        ranking,
+        primary_candidates,
+        tie_threshold=float(benchmark_config.get("tie_threshold", 0.25)),
+    )
     if not top_models:
         return empty
     frames: dict[str, list[pd.DataFrame]] = {
@@ -767,6 +970,8 @@ def _run_round_two(
 def _round_two_top_models(
     ranking: pd.DataFrame,
     primary_candidates: Sequence[str],
+    *,
+    tie_threshold: float = 0.25,
 ) -> list[str]:
     """依 Task 8 完整 tie-break evidence 選取 Round 2 前兩名。"""
     required = {
@@ -793,13 +998,45 @@ def _round_two_top_models(
     ranked = ranked[ranked["overall_rank"].notna()]
     if ranked.empty:
         return []
-    ordered = ranked.sort_values(
-        numeric_columns,
-        ascending=[True, True, True, False, True],
+    threshold = float(tie_threshold)
+    if not math.isfinite(threshold) or threshold <= 0:
+        raise ValueError("Round 2 tie_threshold 必須是有限正數")
+    best_rank = float(ranked["overall_rank"].min())
+    first_band = ranked[
+        (ranked["overall_rank"] - best_rank).lt(threshold)
+    ].copy()
+    first_band["_spearman_sort"] = -first_band["overall_oof_spearman"]
+    evidence_columns = [
+        "worst_validation_rank",
+        "leave_one_b_out_mae",
+        "_spearman_sort",
+        "simplicity_rank",
+        "model",
+    ]
+    ordered_band = first_band.sort_values(
+        evidence_columns,
+        ascending=True,
         na_position="last",
         kind="stable",
     )
-    return ordered["model"].astype(str).head(2).tolist()
+    selected = ordered_band["model"].astype(str).head(2).tolist()
+    if len(selected) == 2:
+        return selected
+
+    outside = ranked[~ranked["model"].isin(first_band["model"])].copy()
+    outside["_spearman_sort"] = -outside["overall_oof_spearman"]
+    ordered_outside = outside.sort_values(
+        ["overall_rank", *evidence_columns],
+        ascending=True,
+        na_position="last",
+        kind="stable",
+    )
+    for model in ordered_outside["model"].astype(str):
+        if model not in selected:
+            selected.append(model)
+        if len(selected) == 2:
+            break
+    return selected
 
 
 def _paper_not_applicable_metrics(

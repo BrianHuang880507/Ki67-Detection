@@ -44,9 +44,10 @@ Leave-one-B-out、Leave-one-passage-out、Leave-one-B×Passage-out 與
 Leave-one-condition-out。Eligibility evidence 不完整時流程會 fail closed；沒有模型通過全部
 gate 時不會強迫發布 winner。
 
-Round 2 只比較 Round 1 overall rank 可用的前兩個 phase candidates 與明確啟用的 secondary
-sets。Round 2 結果標記為 `exploratory_round_2`，不會回流 Primary ranking、eligibility 或
-winner。
+Round 2 先取距最佳 average rank 小於 `tie_threshold`（預設 0.25）的 tie band，再依 worst
+validation rank、LOBO MAE、Spearman、模型簡潔度與名稱決定前兩個 phase candidates；不足
+兩個才從 band 外依相同完整證據補足。Round 2 只使用明確啟用的 secondary sets，結果標記為
+`exploratory_round_2`，不會回流 Primary ranking、eligibility 或 winner。
 
 ## ΔMorphology
 
@@ -60,3 +61,14 @@ winner。
 及相符的 `final_model.json`。Metadata 包含 UTC timestamps、runtime、Git 狀態、config／
 manifest SHA-256、Python／套件版本、seeds、feature sets、input counts、cache hits 與 failure
 count。
+
+## 執行世代與 cache
+
+新 run 會先把固定名稱的上一世代 tables、JSON、record、figures 與 models 搬到同一 run root
+下的 `_generations/previous-*`，不會刪除 `feature_cache/` 或移動正在寫入的 `run.log`。若本世代
+中途失敗，已產生的成功 artifacts 會進入 `_generations/failed-*`，固定 root 只保留本次可用的
+pairing、manifest、segmentation 或 model failure evidence。
+
+`feature_cache/masks/` 的 NPZ 只有在 PC bytes SHA-256、segmentation config 與
+segmenter/model signature 全部吻合時才會重用。缺少 provenance 的舊 cache 或任一證據不符時，
+流程會重新 segmentation，並在 `segmentation_qc.csv` 記錄原因與 provenance hash。

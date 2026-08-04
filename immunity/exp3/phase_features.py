@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import importlib.metadata
+import json
 import math
 import ntpath
 import os
@@ -39,6 +42,9 @@ SEGMENTATION_QC_COLUMNS = [
     "group_id",
     "mask_path",
     "cache_status",
+    "cache_reason",
+    "pc_sha256",
+    "cache_provenance_hash",
     "status",
     "error",
     "whole_cell_labels",
@@ -215,6 +221,38 @@ class PhaseSegmenter:
             pretrained_model=PC_NUC_MODEL_PATH,
         )
         self.config = dict(config)
+        self._model_paths = {
+            "whole_cell": Path(CYTO_MODEL_PATH),
+            "nucleus": Path(PC_NUC_MODEL_PATH),
+        }
+
+    def cache_signature(self) -> Mapping[str, Any]:
+        """建立 production model 版本與 pretrained weights 內容簽章。
+
+        Returns:
+            Cellpose 版本、模型類別與兩個模型檔案的 SHA-256。
+
+        Raises:
+            OSError: 任一 pretrained model 檔案無法讀取時拋出。
+        """
+        try:
+            cellpose_version = importlib.metadata.version("cellpose")
+        except importlib.metadata.PackageNotFoundError:
+            cellpose_version = "unavailable"
+        return {
+            "cellpose_version": cellpose_version,
+            "model_class": (
+                f"{type(self.cell_model).__module__}."
+                f"{type(self.cell_model).__qualname__}"
+            ),
+            "pretrained_models": {
+                name: {
+                    "path": str(path.resolve(strict=True)),
+                    "sha256": _sha256_file(path),
+                }
+                for name, path in sorted(self._model_paths.items())
+            },
+        }
 
     def segment(self, path: Path) -> tuple[np.ndarray, np.ndarray]:
         """讀取一張 PC 影像並回傳原始尺寸的配對 labels。
@@ -341,46 +379,84 @@ def cache_phase_masks(
         raise ValueError(f"manifest 缺少欄位：{sorted(missing_columns)}")
 
     segmentation_config = _segmentation_config(config)
-    active_segmenter = segmenter or PhaseSegmenter(segmentation_config)
     force = bool(segmentation_config.get("force", False))
-    cache_root = Path(cache_dir) / "masks"
+    cache_dir_path = _validate_exp3_cache_root(Path(cache_dir))
+    cache_root = cache_dir_path / "masks"
     rows: list[dict[str, Any]] = []
 
-    #明確選取三個 Primary 欄位，避免流程讀取或建構任何 DAPI 路徑。
+    #完整 preflight 必須早於 segmenter 初始化與任何 cache exists/read/write。
     primary_manifest = manifest.loc[:, ["image_key", "group_id", "pc_path"]]
-    for image_key_value, group_id_value, pc_path_value in primary_manifest.itertuples(
-        index=False,
-        name=None,
-    ):
-        image_key = str(image_key_value)
-        group_id = str(group_id_value)
-        pc_path = Path(pc_path_value)
-        mask_path = cache_root / group_id / f"{image_key}.npz"
+    cache_entries: list[tuple[str, str, Path, Path]] = []
+    for values in primary_manifest.itertuples(index=False, name=None):
+        image_key = _required_cache_component(values[0], "image_key")
+        group_id = _required_cache_component(values[1], "group_id")
+        pc_path = Path(values[2])
+        proposed = cache_root / group_id / f"{image_key}.npz"
+        mask_path = _validate_exp3_mask_cache_path(
+            proposed,
+            cache_dir_path,
+            group_id,
+            image_key,
+        )
+        cache_entries.append((image_key, group_id, pc_path, mask_path))
+
+    active_segmenter = segmenter or PhaseSegmenter(segmentation_config)
+    run_provenance = _mask_run_provenance(segmentation_config, active_segmenter)
+
+    for image_key, group_id, pc_path, mask_path in cache_entries:
         whole_cell_labels = 0
         nucleus_labels = 0
         paired_cells = 0
         cache_status = "failed"
+        cache_reason = "processing_failed"
+        pc_sha256 = ""
+        provenance_hash = ""
 
         try:
+            pc_sha256 = _sha256_file(pc_path)
+            provenance = {**run_provenance, "pc_sha256": pc_sha256}
+            provenance_json = _canonical_json(provenance)
+            provenance_hash = _sha256_text(provenance_json)
             existed = mask_path.exists()
             masks = None
             if existed and not force:
                 try:
-                    masks = load_cached_masks(mask_path)
-                    cache_status = "reused"
+                    masks, cached_provenance = _load_mask_cache_entry(mask_path)
+                    cache_reason = _cache_mismatch_reason(
+                        cached_provenance,
+                        provenance,
+                    )
+                    if cache_reason == "provenance_match":
+                        cache_status = "reused"
+                    else:
+                        masks = None
+                        cache_status = "replaced"
+                except KeyError as error:
+                    masks = None
+                    cache_status = "replaced"
+                    cache_reason = (
+                        "legacy_cache"
+                        if "provenance" in str(error)
+                        else "invalid_cache"
+                    )
                 except (
                     OSError,
                     ValueError,
-                    KeyError,
                     EOFError,
                     zipfile.BadZipFile,
                 ):
-                    #不可讀取或缺少欄位的 cache 不可重用，改以 PC 重新推論。
+                    #損毀或不可驗證的 cache 一律由相同 PC 重新產生。
                     masks = None
+                    cache_status = "replaced"
+                    cache_reason = "invalid_cache"
 
             if masks is None:
                 masks = active_segmenter.segment(pc_path)
                 cache_status = "replaced" if existed else "created"
+                if force:
+                    cache_reason = "force"
+                elif not existed:
+                    cache_reason = "cache_missing"
 
             cell_mask, nucleus_mask = _validate_mask_pair(*masks)
             whole_cell_labels = _label_count(cell_mask)
@@ -393,13 +469,20 @@ def cache_phase_masks(
                 raise ValueError("配對細胞數為 0")
 
             if cache_status != "reused":
-                _write_mask_cache(mask_path, cell_mask, nucleus_mask)
+                _write_mask_cache(
+                    mask_path,
+                    cell_mask,
+                    nucleus_mask,
+                    provenance_json,
+                    provenance_hash,
+                )
             status = "passed"
             error_text = ""
         except Exception as error:  #單張失敗必須保留 QC 並繼續處理下一張。
             status = "failed"
             error_text = str(error)
             cache_status = "failed"
+            cache_reason = "processing_failed"
 
         rows.append(
             {
@@ -407,6 +490,9 @@ def cache_phase_masks(
                 "group_id": group_id,
                 "mask_path": str(mask_path),
                 "cache_status": cache_status,
+                "cache_reason": cache_reason,
+                "pc_sha256": pc_sha256,
+                "cache_provenance_hash": provenance_hash,
                 "status": status,
                 "error": error_text,
                 "whole_cell_labels": whole_cell_labels,
@@ -873,6 +959,14 @@ def _required_cache_component(value: object, name: str) -> str:
     return value
 
 
+def _validate_exp3_cache_root(cache_dir: Path) -> Path:
+    """驗證 feature cache root 未被 symlink／junction 重新導向。"""
+    lexical = Path(os.path.abspath(cache_dir))
+    if lexical.resolve(strict=False) != lexical:
+        raise ValueError("mask_path cache root 不可透過 symlink 或 junction 改寫")
+    return lexical
+
+
 def _validate_exp3_mask_cache_path(
     value: object,
     cache_dir: Path,
@@ -890,7 +984,7 @@ def _validate_exp3_mask_cache_path(
     except ValueError as error:
         raise ValueError(f"mask_path component 不合法：{error}") from error
     candidate = Path(value).resolve(strict=False)
-    resolved_cache_dir = cache_dir.resolve(strict=False)
+    resolved_cache_dir = _validate_exp3_cache_root(cache_dir)
     masks_root = (resolved_cache_dir / "masks").resolve(strict=False)
     if masks_root.parent != resolved_cache_dir:
         raise ValueError("mask_path masks root 必須是 Exp3 feature cache 的直接子目錄")
@@ -905,6 +999,129 @@ def _validate_exp3_mask_cache_path(
             "<image_key>.npz 結構"
         )
     return candidate
+
+
+def _canonical_json(value: Any) -> str:
+    """將 cache provenance 序列化為禁止 NaN 的 canonical JSON。"""
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("mask cache provenance 必須是 strict JSON") from error
+
+
+def _sha256_text(value: str) -> str:
+    """計算 UTF-8 文字的 SHA-256。"""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    """以串流方式計算檔案內容 SHA-256。"""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _mask_run_provenance(
+    segmentation_config: Mapping[str, Any],
+    segmenter: Segmenter,
+) -> dict[str, Any]:
+    """計算每次 cache 呼叫只需建立一次的 config/model provenance。"""
+    relevant_config = {
+        str(key): value
+        for key, value in segmentation_config.items()
+        if str(key) != "force"
+    }
+    config_json = _canonical_json(relevant_config)
+    canonical_config = json.loads(config_json)
+    class_identity = f"{type(segmenter).__module__}.{type(segmenter).__qualname__}"
+    explicit_signature = getattr(segmenter, "cache_signature", None)
+    if callable(explicit_signature):
+        explicit_signature = explicit_signature()
+    signature = (
+        explicit_signature if explicit_signature is not None else class_identity
+    )
+    segmenter_evidence = {
+        "class_identity": class_identity,
+        "signature": signature,
+    }
+    signature_json = _canonical_json(segmenter_evidence)
+    return {
+        "schema_version": 1,
+        "segmentation_config": canonical_config,
+        "segmentation_config_hash": _sha256_text(config_json),
+        "segmenter": json.loads(signature_json),
+        "segmenter_signature_hash": _sha256_text(signature_json),
+    }
+
+
+def _cache_mismatch_reason(
+    cached: Mapping[str, Any],
+    current: Mapping[str, Any],
+) -> str:
+    """依可稽核欄位指出 cache 未重用的第一個原因。"""
+    if cached.get("pc_sha256") != current.get("pc_sha256"):
+        return "pc_content_changed"
+    if cached.get("segmentation_config_hash") != current.get(
+        "segmentation_config_hash"
+    ):
+        return "segmentation_config_changed"
+    if cached.get("segmenter_signature_hash") != current.get(
+        "segmenter_signature_hash"
+    ):
+        return "segmenter_signature_changed"
+    if dict(cached) != dict(current):
+        return "provenance_mismatch"
+    return "provenance_match"
+
+
+def _npz_scalar_text(cached: Any, name: str) -> str:
+    """從 allow_pickle=False 的 NPZ 讀取單一文字 scalar。"""
+    if name not in cached:
+        raise KeyError(f"mask cache 缺少 provenance 欄位：{name}")
+    value = np.asarray(cached[name])
+    if value.ndim != 0 or value.dtype.kind not in {"U", "S"}:
+        raise ValueError(f"mask cache {name} 必須是文字 scalar")
+    scalar = value.item()
+    return scalar.decode("utf-8") if isinstance(scalar, bytes) else str(scalar)
+
+
+def _load_mask_cache_entry(
+    mask_path: Path,
+) -> tuple[tuple[np.ndarray, np.ndarray], Mapping[str, Any]]:
+    """載入 masks 並嚴格驗證 canonical provenance 與內容 hash。"""
+    with np.load(mask_path, allow_pickle=False) as cached:
+        if "cell_mask" not in cached or "nucleus_mask" not in cached:
+            raise KeyError("mask cache 缺少 cell_mask 或 nucleus_mask")
+        provenance_json = _npz_scalar_text(cached, "provenance_json")
+        provenance_hash = _npz_scalar_text(cached, "provenance_hash")
+        if provenance_hash != _sha256_text(provenance_json):
+            raise ValueError("mask cache provenance hash 不符合內容")
+        try:
+            provenance = json.loads(
+                provenance_json,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError(f"不允許的 JSON constant：{value}")
+                ),
+            )
+        except (json.JSONDecodeError, ValueError) as error:
+            raise ValueError("mask cache provenance 不是 strict JSON") from error
+        if not isinstance(provenance, dict):
+            raise ValueError("mask cache provenance 必須是 JSON object")
+        if _canonical_json(provenance) != provenance_json:
+            raise ValueError("mask cache provenance 必須使用 canonical JSON")
+        masks = (
+            np.asarray(cached["cell_mask"], dtype=np.int32),
+            np.asarray(cached["nucleus_mask"], dtype=np.int32),
+        )
+    return masks, provenance
 
 
 def _segmentation_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -957,12 +1174,16 @@ def _write_mask_cache(
     mask_path: Path,
     cell_mask: np.ndarray,
     nucleus_mask: np.ndarray,
+    provenance_json: str,
+    provenance_hash: str,
 ) -> None:
     """以原子替換方式寫入單張 Primary mask cache。"""
     _write_npz_atomically(
         mask_path,
         cell_mask=cell_mask,
         nucleus_mask=nucleus_mask,
+        provenance_json=np.asarray(provenance_json),
+        provenance_hash=np.asarray(provenance_hash),
     )
 
 

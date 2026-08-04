@@ -95,6 +95,46 @@ def test_cache_phase_masks_uses_only_pc_path(tmp_path: Path) -> None:
     assert cell.shape == nucleus.shape == (12, 12)
 
 
+def test_cache_phase_masks_rejects_path_components_before_any_cache_access(
+    tmp_path: Path,
+) -> None:
+    """Traversal component 不得觸及 masks root 外的檔案。"""
+    manifest = pd.DataFrame(
+        [_manifest_row(tmp_path, "B4_P5_C01_F01", "../../../escaped")]
+    )
+    cache_dir = tmp_path / "feature_cache"
+    escaped = (cache_dir / "masks" / "../../../escaped").resolve()
+    fake = FakeSegmenter()
+
+    with pytest.raises(ValueError, match="group_id"):
+        cache_phase_masks(manifest, cache_dir, {}, fake)
+
+    assert fake.paths == []
+    assert not escaped.exists()
+
+
+def test_cache_phase_masks_rejects_linked_group_before_segmentation(
+    tmp_path: Path,
+) -> None:
+    """Group junction/symlink 不得將 cache 寫到 masks root 外。"""
+    cache_dir = tmp_path / "feature_cache"
+    masks_root = cache_dir / "masks"
+    outside = tmp_path / "outside"
+    masks_root.mkdir(parents=True)
+    outside.mkdir()
+    _create_directory_link(masks_root / "B4_P5", outside)
+    manifest = pd.DataFrame(
+        [_manifest_row(tmp_path, "B4_P5_C01_F01", "B4_P5")]
+    )
+    fake = FakeSegmenter()
+
+    with pytest.raises(ValueError, match="mask_path"):
+        cache_phase_masks(manifest, cache_dir, {}, fake)
+
+    assert fake.paths == []
+    assert not (outside / "B4_P5_C01_F01.npz").exists()
+
+
 def test_cache_phase_masks_reuses_or_replaces_cache_deterministically(
     tmp_path: Path,
 ) -> None:
@@ -122,6 +162,108 @@ def test_cache_phase_masks_reuses_or_replaces_cache_deterministically(
     )
     assert replacement.paths == [Path(manifest.loc[0, "pc_path"])]
     assert replaced.loc[0, "cache_status"] == "replaced"
+
+
+def test_cache_phase_masks_replaces_cache_when_pc_bytes_change(
+    tmp_path: Path,
+) -> None:
+    """相同 image key 的 PC 內容改變時不得重用舊 masks。"""
+    manifest = pd.DataFrame(
+        [_manifest_row(tmp_path, "B4_P5_C01_F08", "B4_P5")]
+    )
+    pc_path = Path(manifest.loc[0, "pc_path"])
+    pc_path.write_bytes(b"first")
+    cache_phase_masks(manifest, tmp_path / "cache", {}, FakeSegmenter())
+    pc_path.write_bytes(b"second")
+    replacement = FakeSegmenter()
+
+    qc = cache_phase_masks(manifest, tmp_path / "cache", {}, replacement)
+
+    assert replacement.paths == [pc_path]
+    assert qc.loc[0, "cache_status"] == "replaced"
+    assert qc.loc[0, "cache_reason"] == "pc_content_changed"
+    assert len(qc.loc[0, "pc_sha256"]) == 64
+    assert len(qc.loc[0, "cache_provenance_hash"]) == 64
+
+
+def test_cache_phase_masks_replaces_cache_when_segmentation_config_changes(
+    tmp_path: Path,
+) -> None:
+    """影響 segmentation 的 threshold 改變時不得重用舊 masks。"""
+    manifest = pd.DataFrame(
+        [_manifest_row(tmp_path, "B4_P5_C01_F09", "B4_P5")]
+    )
+    cache_phase_masks(
+        manifest,
+        tmp_path / "cache",
+        {"cellprob_threshold": 0.0},
+        FakeSegmenter(),
+    )
+    replacement = FakeSegmenter()
+
+    qc = cache_phase_masks(
+        manifest,
+        tmp_path / "cache",
+        {"cellprob_threshold": 0.5},
+        replacement,
+    )
+
+    assert replacement.paths == [Path(manifest.loc[0, "pc_path"])]
+    assert qc.loc[0, "cache_status"] == "replaced"
+    assert qc.loc[0, "cache_reason"] == "segmentation_config_changed"
+
+
+def test_cache_phase_masks_replaces_cache_when_segmenter_signature_changes(
+    tmp_path: Path,
+) -> None:
+    """Injected segmenter 的明確穩定 signature 改變時不得重用。"""
+
+    class SignedSegmenter(FakeSegmenter):
+        def __init__(self, signature: str) -> None:
+            super().__init__()
+            self.cache_signature = signature
+
+    manifest = pd.DataFrame(
+        [_manifest_row(tmp_path, "B4_P5_C01_F10", "B4_P5")]
+    )
+    cache_phase_masks(
+        manifest,
+        tmp_path / "cache",
+        {},
+        SignedSegmenter("model-v1"),
+    )
+    replacement = SignedSegmenter("model-v2")
+
+    qc = cache_phase_masks(manifest, tmp_path / "cache", {}, replacement)
+
+    assert replacement.paths == [Path(manifest.loc[0, "pc_path"])]
+    assert qc.loc[0, "cache_status"] == "replaced"
+    assert qc.loc[0, "cache_reason"] == "segmenter_signature_changed"
+
+
+def test_cache_phase_masks_replaces_legacy_cache_without_provenance(
+    tmp_path: Path,
+) -> None:
+    """沒有 provenance 的 legacy NPZ 不可視為可重用 cache。"""
+    manifest = pd.DataFrame(
+        [_manifest_row(tmp_path, "B4_P5_C01_F11", "B4_P5")]
+    )
+    mask_path = (
+        tmp_path / "cache" / "masks" / "B4_P5" / "B4_P5_C01_F11.npz"
+    )
+    mask_path.parent.mkdir(parents=True)
+    labels = np.zeros((12, 12), dtype=np.int32)
+    labels[2:10, 2:10] = 1
+    np.savez(mask_path, cell_mask=labels, nucleus_mask=labels)
+    replacement = FakeSegmenter()
+
+    qc = cache_phase_masks(manifest, tmp_path / "cache", {}, replacement)
+
+    assert replacement.paths == [Path(manifest.loc[0, "pc_path"])]
+    assert qc.loc[0, "cache_status"] == "replaced"
+    assert qc.loc[0, "cache_reason"] == "legacy_cache"
+    with np.load(mask_path, allow_pickle=False) as cached:
+        assert {"provenance_json", "provenance_hash"} <= set(cached.files)
 
 
 def test_cache_phase_masks_replaces_crc_corrupt_cache(tmp_path: Path) -> None:
