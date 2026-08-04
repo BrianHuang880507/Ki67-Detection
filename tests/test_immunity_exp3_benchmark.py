@@ -314,6 +314,38 @@ def test_raw_dummy_failure_fails_beat_dummy_gate_despite_ok_metric() -> None:
     assert select_winner(ranking) is None
 
 
+@pytest.mark.parametrize(
+    ("validation", "split_id"),
+    [
+        ("leave_one_b_out", "leave_one_b_out:99"),
+        ("malformed", "not-a-split"),
+        (pd.NA, pd.NA),
+    ],
+)
+def test_any_raw_dummy_failure_identity_fails_beat_dummy_gate(
+    validation: object, split_id: object
+) -> None:
+    metrics, predictions = make_ranking_fixture()
+    failures = pd.DataFrame(
+        [
+            {
+                "validation": validation,
+                "fold": "unknown",
+                "split_id": split_id,
+                "model": "dummy_median",
+                "exception_type": "RuntimeError",
+                "message": "raw dummy failure with unusable identity",
+            }
+        ]
+    )
+
+    ranking = rank_phase_models(metrics, predictions, failures, make_tiny_config())
+
+    assert not ranking["mae_beats_dummy_gate"].any()
+    assert not ranking["eligible"].any()
+    assert select_winner(ranking) is None
+
+
 def test_missing_oof_row_fails_exact_prediction_completeness() -> None:
     metrics, predictions = make_ranking_fixture()
     missing = predictions["model"].eq("ridge") & predictions["split_id"].eq(

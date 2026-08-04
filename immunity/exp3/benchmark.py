@@ -841,9 +841,7 @@ def rank_phase_models(
     expected_splits = _configured_expected_splits(config)
     dummy_complete = _metrics_complete_for_model(
         raw_metrics, "dummy_median", expected_splits
-    ) and not _has_expected_model_failure(
-        raw_failures, "dummy_median", expected_splits
-    )
+    ) and not _has_raw_model_failure(raw_failures, "dummy_median")
     validation_summaries: dict[str, pd.DataFrame] = {}
     for validation in _RANKING_VALIDATIONS:
         family = ok_metrics[ok_metrics["validation"].eq(validation)]
@@ -1265,25 +1263,11 @@ def _configured_expected_splits(
     return expected
 
 
-def _has_expected_model_failure(
-    failures: pd.DataFrame,
-    model: str,
-    expected_splits: Mapping[str, set[str]] | None,
-) -> bool:
-    """判斷 raw failures 是否含指定 model 的 canonical split failure。"""
+def _has_raw_model_failure(failures: pd.DataFrame, model: str) -> bool:
+    """判斷 raw failures 是否含指定 model 的任何 failure。"""
     if failures.empty or "model" not in failures.columns:
         return False
-    rows = failures[failures["model"].astype(str).eq(model)]
-    if rows.empty:
-        return False
-    if expected_splits is None or not {"validation", "split_id"}.issubset(
-        rows.columns
-    ):
-        return True
-    return any(
-        str(row.split_id) in expected_splits.get(str(row.validation), set())
-        for row in rows.loc[:, ["validation", "split_id"]].itertuples(index=False)
-    )
+    return bool(failures["model"].astype(str).eq(model).any())
 
 
 def _dummy_validation_mae(metrics: pd.DataFrame, validation: str) -> float:
