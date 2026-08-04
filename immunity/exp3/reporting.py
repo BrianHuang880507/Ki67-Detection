@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
+import warnings
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +74,24 @@ _SEQUENTIAL = LinearSegmentedColormap.from_list(
 )
 
 
+@dataclass(frozen=True)
+class _DirectoryIdentity:
+    """發布期間用來偵測 parent directory 被置換的 snapshot。"""
+
+    path: Path
+    resolved: Path
+    device: int
+    inode: int
+
+
+@dataclass
+class _StagedArtifact:
+    """尚未發布的同層暫存檔與 final destination。"""
+
+    temporary: Path
+    destination: Path
+
+
 def write_result_tables(
     output_dir: Path, tables: Mapping[str, pd.DataFrame]
 ) -> None:
@@ -103,9 +124,17 @@ def write_result_tables(
         raise TypeError(f"結果表必須是 pandas DataFrame：{invalid}")
 
     safe_output = _prepare_output_dir(output_dir)
-    for name in REQUIRED_TABLES:
-        destination = _safe_child(safe_output, name, kind="file")
-        _write_csv_atomically(tables[name], destination)
+    identity = _snapshot_directory(safe_output)
+    destinations = _preflight_files(safe_output, REQUIRED_TABLES, identity)
+    staged: list[_StagedArtifact] = []
+    try:
+        for name, destination in zip(REQUIRED_TABLES, destinations, strict=True):
+            staged.append(
+                _StagedArtifact(_stage_csv(tables[name], destination), destination)
+            )
+        _publish_staged(staged, identity)
+    finally:
+        _cleanup_staged(staged)
 
 
 def write_figures(output_dir: Path, artifacts: Mapping[str, Any]) -> list[Path]:
@@ -131,6 +160,8 @@ def write_figures(output_dir: Path, artifacts: Mapping[str, Any]) -> list[Path]:
         raise TypeError("artifacts 必須是 mapping")
     safe_output = _prepare_output_dir(output_dir)
     figures_dir = _prepare_child_directory(safe_output, "figures")
+    identity = _snapshot_directory(figures_dir)
+    destinations = _preflight_files(figures_dir, REQUIRED_FIGURES, identity)
     builders = (
         _rank_heatmap,
         _mae_distributions,
@@ -141,24 +172,30 @@ def write_figures(output_dir: Path, artifacts: Mapping[str, Any]) -> list[Path]:
         _delta_heatmap,
         _delta_pca,
     )
-    paths: list[Path] = []
-    for name, builder in zip(REQUIRED_FIGURES, builders, strict=True):
-        destination = _safe_child(figures_dir, name, kind="file")
-        figure = builder(artifacts)
-        try:
-            _save_figure_atomically(figure, destination)
-        finally:
-            plt.close(figure)
-        paths.append(destination)
-    return paths
+    staged: list[_StagedArtifact] = []
+    try:
+        for name, builder, destination in zip(
+            REQUIRED_FIGURES, builders, destinations, strict=True
+        ):
+            figure = _safe_build_figure(builder, artifacts, name)
+            try:
+                staged.append(
+                    _StagedArtifact(_stage_figure(figure, destination), destination)
+                )
+            finally:
+                plt.close(figure)
+        _publish_staged(staged, identity)
+    finally:
+        _cleanup_staged(staged)
+    return destinations
 
 
 def write_experiment_record(output_dir: Path, context: Mapping[str, Any]) -> Path:
     """建立 answer-first、可稽核的 Exp3 技術實驗記錄。
 
     記錄固定保留 brief 指定的十段順序，並將描述性、診斷性與 predictive
-    證據分開。`metadata` 會同步寫成 strict `run_metadata.json`；若 context
-    明確提供 `feature_sets`，也會同步寫成 strict `feature_sets.json`。
+    證據分開。`metadata` 會同步寫成 strict `run_metadata.json`；formal
+    `feature_sets.json` 只由 feature aggregation 擁有，本函式最多驗證既有內容。
 
     Args:
         output_dir: `immunity/outputs/exp3` 下的單次實驗目錄。
@@ -183,22 +220,26 @@ def write_experiment_record(output_dir: Path, context: Mapping[str, Any]) -> Pat
 
     #先序列化可確保 NaN/Infinity 在任何 final file 建立前就被拒絕。
     metadata_text = _strict_json_text(metadata, "run_metadata.json")
-    feature_sets_text = (
-        _strict_json_text(feature_sets, "feature_sets.json")
-        if feature_sets is not None
-        else None
-    )
     record_text = _build_experiment_record(context)
 
     safe_output = _prepare_output_dir(output_dir)
-    metadata_path = _safe_child(safe_output, "run_metadata.json", kind="file")
-    _write_text_atomically(metadata_text, metadata_path)
-    if feature_sets_text is not None:
-        feature_sets_path = _safe_child(safe_output, "feature_sets.json", kind="file")
-        _write_text_atomically(feature_sets_text, feature_sets_path)
-    record_path = _safe_child(safe_output, "EXPERIMENT_RECORD.md", kind="file")
-    _write_text_atomically(record_text, record_path)
-    return record_path
+    identity = _snapshot_directory(safe_output)
+    if feature_sets is not None:
+        _validate_existing_feature_registry(safe_output, feature_sets, identity)
+    names = ("run_metadata.json", "EXPERIMENT_RECORD.md")
+    destinations = _preflight_files(safe_output, names, identity)
+    staged: list[_StagedArtifact] = []
+    try:
+        for text, destination in zip(
+            (metadata_text, record_text), destinations, strict=True
+        ):
+            staged.append(
+                _StagedArtifact(_stage_text(text, destination), destination)
+            )
+        _publish_staged(staged, identity)
+    finally:
+        _cleanup_staged(staged)
+    return destinations[1]
 
 
 def _prepare_output_dir(output_dir: Path) -> Path:
@@ -219,6 +260,38 @@ def _prepare_child_directory(parent: Path, name: str) -> Path:
     return directory
 
 
+def _snapshot_directory(path: Path) -> _DirectoryIdentity:
+    """記錄 parent identity；用於合理偵測 Windows path replacement。"""
+    resolved = path.resolve(strict=True)
+    stat = path.stat()
+    return _DirectoryIdentity(path, resolved, int(stat.st_dev), int(stat.st_ino))
+
+
+def _assert_directory_identity(identity: _DirectoryIdentity) -> None:
+    """確認 parent 自 preflight 後未被 symlink/junction 或新目錄置換。"""
+    try:
+        resolved = identity.path.resolve(strict=True)
+        stat = identity.path.stat()
+    except OSError as error:
+        raise ValueError("輸出 parent 在發布期間消失或被置換") from error
+    if (
+        resolved != identity.resolved
+        or int(stat.st_dev) != identity.device
+        or int(stat.st_ino) != identity.inode
+    ):
+        raise ValueError("輸出 parent 在發布期間被置換")
+
+
+def _preflight_files(
+    parent: Path, names: Sequence[str], identity: _DirectoryIdentity
+) -> list[Path]:
+    """在 first publish 前驗證完整 final destination set。"""
+    _assert_directory_identity(identity)
+    destinations = [_safe_child(parent, name, kind="file") for name in names]
+    _assert_directory_identity(identity)
+    return destinations
+
+
 def _safe_child(parent: Path, name: str, *, kind: str) -> Path:
     """拒絕 child path 經 symlink 或 junction 改寫目的地。"""
     expected = parent / name
@@ -232,8 +305,8 @@ def _safe_child(parent: Path, name: str, *, kind: str) -> Path:
     return expected
 
 
-def _write_csv_atomically(frame: pd.DataFrame, destination: Path) -> None:
-    """在 final 同層寫完 CSV 後才原子替換。"""
+def _stage_csv(frame: pd.DataFrame, destination: Path) -> Path:
+    """在 final 同層完成 CSV 暫存，但不發布。"""
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -247,15 +320,15 @@ def _write_csv_atomically(frame: pd.DataFrame, destination: Path) -> None:
         ) as temporary:
             temporary_path = Path(temporary.name)
             frame.to_csv(temporary, index=False)
-        _validate_before_replace(destination)
-        os.replace(temporary_path, destination)
-    finally:
+        return temporary_path
+    except Exception:
         if temporary_path is not None and temporary_path.exists():
             temporary_path.unlink()
+        raise
 
 
-def _write_text_atomically(text: str, destination: Path) -> None:
-    """在 final 同層寫完 UTF-8 文字後才原子替換。"""
+def _stage_text(text: str, destination: Path) -> Path:
+    """在 final 同層完成 UTF-8 暫存，但不發布。"""
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -269,15 +342,15 @@ def _write_text_atomically(text: str, destination: Path) -> None:
         ) as temporary:
             temporary_path = Path(temporary.name)
             temporary.write(text)
-        _validate_before_replace(destination)
-        os.replace(temporary_path, destination)
-    finally:
+        return temporary_path
+    except Exception:
         if temporary_path is not None and temporary_path.exists():
             temporary_path.unlink()
+        raise
 
 
-def _save_figure_atomically(figure: Figure, destination: Path) -> None:
-    """將 PNG 完整寫入同層暫存檔後才原子替換。"""
+def _stage_figure(figure: Figure, destination: Path) -> Path:
+    """將 PNG 完整寫入同層暫存檔，但不發布。"""
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -294,26 +367,120 @@ def _save_figure_atomically(figure: Figure, destination: Path) -> None:
             dpi=160,
             facecolor=_BACKGROUND,
             bbox_inches="tight",
-            metadata={"Software": "Ki67-Detection Exp3 reporting"},
+            metadata={
+                "Software": "Ki67-Detection Exp3 reporting",
+                "Title": _figure_title(figure),
+            },
         )
         if temporary_path.stat().st_size == 0:
             raise OSError(f"figure {destination.name!r} 暫存檔為空")
-        _validate_before_replace(destination)
-        os.replace(temporary_path, destination)
-    finally:
+        return temporary_path
+    except Exception:
         if temporary_path is not None and temporary_path.exists():
             temporary_path.unlink()
+        raise
 
 
-def _validate_before_replace(destination: Path) -> None:
-    """replace 前重驗 parent 與 final destination，降低 link 置換風險。"""
-    parent = destination.parent
-    if parent.resolve(strict=False) != parent or not parent.is_dir():
-        raise ValueError("輸出 parent 不可透過 symlink 或 junction 逸出")
-    if destination.resolve(strict=False) != destination:
-        raise ValueError("final output 不可透過 symlink 或 junction 逸出")
-    if destination.exists() and not destination.is_file():
-        raise ValueError("final output 必須是一般檔案")
+def _publish_staged(
+    staged: Sequence[_StagedArtifact], identity: _DirectoryIdentity
+) -> None:
+    """以完整 preflight、backup 與 rollback 發布同一 artifact bundle。"""
+    if not staged:
+        return
+    names = [item.destination.name for item in staged]
+    _preflight_files(identity.path, names, identity)
+    backups: dict[Path, Path] = {}
+    published: list[_StagedArtifact] = []
+    try:
+        for item in staged:
+            if item.destination.exists():
+                backup = _reserve_sibling(item.destination, ".backup")
+                shutil.copy2(item.destination, backup)
+                backups[item.destination] = backup
+        _preflight_files(identity.path, names, identity)
+        for item in staged:
+            _assert_directory_identity(identity)
+            _safe_child(identity.path, item.destination.name, kind="file")
+            os.replace(item.temporary, item.destination)
+            published.append(item)
+        _assert_directory_identity(identity)
+    except Exception:
+        rollback_errors: list[Exception] = []
+        for item in reversed(published):
+            try:
+                backup = backups.pop(item.destination, None)
+                if backup is not None and backup.exists():
+                    os.replace(backup, item.destination)
+                elif item.destination.exists() and item.destination.is_file():
+                    item.destination.unlink()
+            except Exception as rollback_error:  # pragma: no cover - catastrophic OS failure
+                rollback_errors.append(rollback_error)
+        if rollback_errors:
+            raise RuntimeError("artifact publication rollback failed") from rollback_errors[0]
+        raise
+    finally:
+        for backup in backups.values():
+            if backup.exists():
+                backup.unlink()
+
+
+def _reserve_sibling(destination: Path, suffix: str) -> Path:
+    """保留同層唯一暫存路徑，讓 backup/stage 不跨 filesystem。"""
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{destination.name}.",
+        suffix=suffix,
+        dir=destination.parent,
+        delete=False,
+    ) as temporary:
+        return Path(temporary.name)
+
+
+def _cleanup_staged(staged: Sequence[_StagedArtifact]) -> None:
+    """清除尚未被 replace 消耗的 staged files。"""
+    for item in staged:
+        if item.temporary.exists():
+            item.temporary.unlink()
+
+
+def _validate_existing_feature_registry(
+    output_dir: Path,
+    expected: Mapping[str, Any],
+    identity: _DirectoryIdentity,
+) -> None:
+    """只驗證 feature aggregation 擁有的 formal registry，絕不寫入。"""
+    _assert_directory_identity(identity)
+    path = _safe_child(output_dir, "feature_sets.json", kind="file")
+    if not path.is_file():
+        raise ValueError("feature_sets.json 不存在；reporting 不可建立 formal registry")
+    try:
+        actual = json.loads(
+            path.read_text(encoding="utf-8"),
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"non-finite constant {value}")
+            ),
+        )
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError(f"feature_sets.json 不是 strict JSON registry：{error}") from error
+    if not isinstance(actual, Mapping) or dict(actual) != dict(expected):
+        raise ValueError("feature_sets.json registry mismatch")
+    _assert_directory_identity(identity)
+
+
+def _figure_title(figure: Figure) -> str:
+    """產生 PNG metadata title，包含 visible insufficient-data cue。"""
+    parts: list[str] = []
+    if figure._suptitle is not None:
+        parts.append(figure._suptitle.get_text())
+    for axis in figure.axes:
+        title = axis.get_title(loc="left") or axis.get_title()
+        if title and title not in parts:
+            parts.append(title)
+        parts.extend(
+            text.get_text()
+            for text in axis.texts
+            if "Insufficient" in text.get_text()
+        )
+    return "\n".join(parts) or "Exp3 figure"
 
 
 def _strict_json_text(payload: Mapping[str, Any], name: str) -> str:
@@ -379,6 +546,47 @@ def _placeholder(axis: Any, title: str, message: str) -> None:
     _style_axis(axis)
 
 
+def _safe_build_figure(
+    builder: Any, artifacts: Mapping[str, Any], filename: str
+) -> Figure:
+    """將 malformed inputs 降級成 placeholder，並關閉 builder 洩漏的 figures。"""
+    before = set(plt.get_fignums())
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            with np.errstate(all="ignore"):
+                figure = builder(artifacts)
+        if not isinstance(figure, Figure):
+            raise TypeError("figure builder 必須回傳 matplotlib Figure")
+    except Exception:
+        for number in set(plt.get_fignums()) - before:
+            plt.close(number)
+        figure, axis = _new_figure()
+        _placeholder(
+            axis,
+            _figure_label(filename),
+            "Insufficient data — malformed or non-finite inputs.",
+        )
+        return figure
+    for number in set(plt.get_fignums()) - before - {figure.number}:
+        plt.close(number)
+    return figure
+
+
+def _figure_label(filename: str) -> str:
+    """提供 malformed-data placeholder 的固定 neutral title。"""
+    return {
+        "model_validation_rank_heatmap.png": "Model rank by validation family",
+        "fold_mae_distributions.png": "Outer-fold MAE distributions",
+        "observed_vs_predicted.png": "Observed vs predicted IDO proxy",
+        "diagnostic_model_comparison.png": "Diagnostic model MAE comparison",
+        "feature_importance_stability.png": "Feature importance stability",
+        "residuals_by_b_passage_condition.png": "OOF residuals by B-ID, passage, and condition",
+        "morphology_delta_heatmap.png": "ΔMorphology signature heatmap",
+        "morphology_delta_pca.png": "ΔMorphology PCA",
+    }[filename]
+
+
 def _rank_heatmap(artifacts: Mapping[str, Any]) -> Figure:
     """繪製 model × validation rank matrix。"""
     ranking = _candidate_ranking(artifacts)
@@ -430,18 +638,22 @@ def _rank_heatmap(artifacts: Mapping[str, Any]) -> Figure:
 
 def _mae_distributions(artifacts: Mapping[str, Any]) -> Figure:
     """繪製各模型 outer-fold MAE 分布。"""
-    metrics = _frame(artifacts, "fold_metrics")
+    metrics = _explicit_role_rows(_frame(artifacts, "fold_metrics"), "candidate")
     figure, axis = _new_figure(width=10, height=6)
     if metrics.empty or not {"model", "mae"}.issubset(metrics):
         _placeholder(axis, "Outer-fold MAE distributions", "Insufficient fold-level MAE data.")
         return figure
-    clean = metrics.assign(mae=pd.to_numeric(metrics["mae"], errors="coerce")).dropna(
+    clean = metrics.assign(mae=_finite_numeric(metrics["mae"])).dropna(
         subset=["model", "mae"]
     )
     groups = [group for _, group in clean.groupby("model", sort=True)]
     labels = [str(name) for name in sorted(clean["model"].astype(str).unique())]
     if not groups:
-        _placeholder(axis, "Outer-fold MAE distributions", "No finite fold-level MAE values.")
+        _placeholder(
+            axis,
+            "Outer-fold MAE distributions",
+            "Insufficient data — no finite fold-level MAE values.",
+        )
         return figure
     box = axis.boxplot(
         [group["mae"].to_numpy(float) for group in groups],
@@ -472,8 +684,18 @@ def _observed_vs_predicted(artifacts: Mapping[str, Any]) -> Figure:
     ranking = _candidate_ranking(artifacts)
     winner = artifacts.get("winner")
     no_winner = winner in {None, ""} or artifacts.get("status") == "no_eligible_phase_only_model"
-    selected = str(winner) if not no_winner else _best_ranked_model(ranking)
-    label = "Exploratory — ineligible" if no_winner else "Eligible model"
+    selected = (
+        _best_ineligible_model(ranking)
+        if no_winner
+        else _validated_winner(artifacts)
+    )
+    label = (
+        "Exploratory — ineligible"
+        if no_winner and selected is not None
+        else "Eligible model"
+        if selected is not None
+        else "Insufficient selection evidence"
+    )
     title = f"Observed vs predicted IDO proxy — {selected or 'model unavailable'}\n{label}"
     figure, axis = _new_figure(width=7.2, height=6.5)
     required = {"model", "observed_ido_score", "predicted_ido_score"}
@@ -481,11 +703,11 @@ def _observed_vs_predicted(artifacts: Mapping[str, Any]) -> Figure:
         _placeholder(axis, title, "Insufficient OOF prediction data.")
         return figure
     selected_rows = predictions[predictions["model"].astype(str).eq(selected)].copy()
-    selected_rows["observed_ido_score"] = pd.to_numeric(
-        selected_rows["observed_ido_score"], errors="coerce"
+    selected_rows["observed_ido_score"] = _finite_numeric(
+        selected_rows["observed_ido_score"]
     )
-    selected_rows["predicted_ido_score"] = pd.to_numeric(
-        selected_rows["predicted_ido_score"], errors="coerce"
+    selected_rows["predicted_ido_score"] = _finite_numeric(
+        selected_rows["predicted_ido_score"]
     )
     selected_rows = selected_rows.dropna(
         subset=["observed_ido_score", "predicted_ido_score"]
@@ -534,8 +756,9 @@ def _diagnostic_comparison(artifacts: Mapping[str, Any]) -> Figure:
     if metrics.empty or not {"model", "mae"}.issubset(metrics):
         _placeholder(axis, "Diagnostic model MAE comparison", "Insufficient diagnostic MAE data.")
         return figure
-    clean = metrics[metrics["model"].astype(str).isin(expected)].copy()
-    clean["mae"] = pd.to_numeric(clean["mae"], errors="coerce")
+    clean = _explicit_role_rows(metrics, "diagnostic")
+    clean = clean[clean["model"].astype(str).isin(expected)].copy()
+    clean["mae"] = _finite_numeric(clean["mae"])
     summary = clean.dropna(subset=["mae"]).groupby("model")["mae"].median().reindex(expected)
     available = summary.dropna()
     if available.empty:
@@ -589,7 +812,7 @@ def _importance_stability(artifacts: Mapping[str, Any]) -> Figure:
     clean = importance.copy()
     if selected is not None and "model" in clean:
         clean = clean[clean["model"].astype(str).eq(selected)]
-    clean["importance"] = pd.to_numeric(clean["importance"], errors="coerce")
+    clean["importance"] = _finite_numeric(clean["importance"])
     clean = clean.dropna(subset=["feature", "importance"])
     if clean.empty:
         _placeholder(axis, "Feature importance stability", "No finite feature importance values.")
@@ -647,11 +870,11 @@ def _residual_comparison(artifacts: Mapping[str, Any]) -> Figure:
     if selected is not None and "model" in clean:
         clean = clean[clean["model"].astype(str).eq(selected)]
     if "residual" not in clean:
-        clean["residual"] = pd.to_numeric(clean["observed_ido_score"], errors="coerce") - pd.to_numeric(
-            clean["predicted_ido_score"], errors="coerce"
+        clean["residual"] = _finite_numeric(clean["observed_ido_score"]) - _finite_numeric(
+            clean["predicted_ido_score"]
         )
     else:
-        clean["residual"] = pd.to_numeric(clean["residual"], errors="coerce")
+        clean["residual"] = _finite_numeric(clean["residual"])
     clean = clean.dropna(subset=["residual"])
     dimensions = (("b_id", "B-ID"), ("passage", "Passage"), ("condition", "Condition"))
     plotted = False
@@ -699,7 +922,7 @@ def _delta_heatmap(artifacts: Mapping[str, Any]) -> Figure:
         _placeholder(axis, "ΔMorphology signature heatmap", "Insufficient descriptive signature data.")
         return figure
     clean = deltas.copy()
-    clean[value_column] = pd.to_numeric(clean[value_column], errors="coerce")
+    clean[value_column] = _finite_numeric(clean[value_column])
     if "contrast" not in clean:
         clean["contrast"] = "all contrasts"
     clean["row_label"] = clean["group_id"].astype(str) + " | " + clean["contrast"].astype(str)
@@ -748,7 +971,7 @@ def _delta_pca(artifacts: Mapping[str, Any]) -> Figure:
         _placeholder(axis, "ΔMorphology PCA", "Insufficient descriptive signature data.")
         return figure
     clean = deltas.copy()
-    clean[value_column] = pd.to_numeric(clean[value_column], errors="coerce")
+    clean[value_column] = _finite_numeric(clean[value_column])
     if "contrast" not in clean:
         clean["contrast"] = "all contrasts"
     clean["dimension"] = clean["contrast"].astype(str) + " | " + clean["feature"].astype(str)
@@ -798,17 +1021,69 @@ def _first_present(frame: pd.DataFrame, names: Sequence[str]) -> str | None:
     return next((name for name in names if name in frame), None)
 
 
+def _finite_numeric(values: pd.Series) -> pd.Series:
+    """將 numeric-like values 正規化，並把 ±Inf 視為 unavailable。"""
+    return pd.to_numeric(values, errors="coerce").replace(
+        [np.inf, -np.inf], np.nan
+    )
+
+
+def _explicit_role_rows(frame: pd.DataFrame, role: str) -> pd.DataFrame:
+    """只保留明確 role rows；缺少 role evidence 時 fail closed。"""
+    if frame.empty or "role" not in frame:
+        return pd.DataFrame(columns=frame.columns)
+    roles = frame["role"].astype("string").str.strip().str.lower()
+    return frame[roles.eq(role).fillna(False)].copy()
+
+
 def _best_ranked_model(ranking: pd.DataFrame) -> str | None:
     """取得 no-winner 圖可使用的最佳 ineligible candidate 名稱。"""
     if ranking.empty or "model" not in ranking:
         return None
     rank_column = _first_present(ranking, ("overall_rank", "average_rank", "selection_order"))
     if rank_column is None:
-        return str(ranking.iloc[0]["model"])
+        return None
     ordered = ranking.assign(
-        _report_rank=pd.to_numeric(ranking[rank_column], errors="coerce")
-    ).sort_values(["_report_rank", "model"], na_position="last", kind="mergesort")
+        _report_rank=_finite_numeric(ranking[rank_column])
+    ).dropna(subset=["_report_rank"])
+    ordered = ordered.sort_values(
+        ["_report_rank", "model"], na_position="last", kind="mergesort"
+    )
     return str(ordered.iloc[0]["model"]) if not ordered.empty else None
+
+
+def _explicit_eligibility_rows(
+    ranking: pd.DataFrame, *, eligible: bool
+) -> pd.DataFrame:
+    """只接受 literal bool/np.bool_ eligibility evidence。"""
+    if ranking.empty or "eligible" not in ranking:
+        return pd.DataFrame(columns=ranking.columns)
+    mask = ranking["eligible"].map(
+        lambda value: isinstance(value, (bool, np.bool_))
+        and bool(value) is eligible
+    )
+    return ranking[mask].copy()
+
+
+def _best_ineligible_model(ranking: pd.DataFrame) -> str | None:
+    """只從明確 ineligible 且具有有限 rank 的 candidates 選 exploratory row。"""
+    return _best_ranked_model(
+        _explicit_eligibility_rows(ranking, eligible=False)
+    )
+
+
+def _validated_winner(artifacts: Mapping[str, Any]) -> str | None:
+    """確認 provided winner 同時有 candidate role 與 explicit eligible evidence。"""
+    winner = artifacts.get("winner")
+    if winner is None or not str(winner).strip():
+        return None
+    candidate = str(winner)
+    ranking = _explicit_eligibility_rows(
+        _candidate_ranking(artifacts), eligible=True
+    )
+    if ranking.empty or "model" not in ranking:
+        return None
+    return candidate if ranking["model"].astype(str).eq(candidate).any() else None
 
 
 def _candidate_ranking(artifacts: Mapping[str, Any]) -> pd.DataFrame:
@@ -844,13 +1119,8 @@ def _selected_model(
     artifacts: Mapping[str, Any], frame: pd.DataFrame
 ) -> str | None:
     """選擇 winner 或最佳 ranked candidate，並確認該表確實有此模型。"""
-    winner = artifacts.get("winner")
     ranking = _candidate_ranking(artifacts)
-    candidate = (
-        str(winner)
-        if winner is not None and str(winner).strip()
-        else _best_ranked_model(ranking)
-    )
+    candidate = _validated_winner(artifacts) or _best_ineligible_model(ranking)
     if "model" not in frame or frame.empty:
         return candidate
     available = frame["model"].dropna().astype(str)
@@ -872,8 +1142,8 @@ def _human_validation(value: str) -> str:
 def _build_experiment_record(context: Mapping[str, Any]) -> str:
     """組合固定十段的 reader-facing Markdown。"""
     status = str(context.get("status", "unknown"))
-    winner = context.get("winner")
-    no_winner = winner in {None, ""} or status == "no_eligible_phase_only_model"
+    winner = _validated_winner(context)
+    no_winner = winner is None or status == "no_eligible_phase_only_model"
     conclusion = (
         "沒有符合門檻的 phase-only 模型；本次不發布 winner。"
         if no_winner
@@ -885,7 +1155,9 @@ def _build_experiment_record(context: Mapping[str, Any]) -> str:
     exclusions = _string_list(context.get("exclusions"))
     segmentation_rate = _format_rate(context.get("segmentation_pass_rate"))
     ranking = _context_frame(context, "ranking", "model_ranking")
-    metrics = _context_frame(context, "fold_metrics")
+    metrics = _explicit_role_rows(
+        _context_frame(context, "fold_metrics"), "candidate"
+    )
     adjusted = _context_frame(context, "condition_adjusted_metrics")
     metadata = context.get("metadata", {})
     limitations = _string_list(context.get("limitations"))
