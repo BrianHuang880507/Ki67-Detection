@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import ntpath
 import os
 import tempfile
@@ -17,14 +18,19 @@ from skimage.measure import regionprops
 
 from immunity.exp3.feature_sets import (
     BASIC_GEOMETRY,
-    FEATURE_SET_REGISTRIES,
+    FEATURE_SET_REGISTRY,
+    PAPER_STYLE_EXTRA_FEATURES,
     PRIMARY_CELL_FEATURES,
     _feature_cache_dir_from_output,
+    _safe_output_file,
+    _validate_feature_set_specs,
+    _write_csv_atomically,
 )
 from ki67dtc.cell_anal import (
     _geometry_from_measurements,
     _measure_roi_with_python,
     _safe_divide,
+    _zernike_feature_values_python,
 )
 from ki67dtc.paired_overlay import find_paired_labels
 
@@ -78,6 +84,107 @@ CELL_LEVEL_COLUMNS = [
     *PRIMARY_CELL_FEATURES,
     "IDO_score",
 ]
+
+
+def paper_style_extras(
+    phase: np.ndarray,
+    cell_mask: np.ndarray,
+    nucleus_mask: np.ndarray,
+) -> dict[str, float]:
+    """計算 opt-in paper-style label-free 近似特徵。
+
+    Args:
+        phase: 二維 phase-contrast 影像。
+        cell_mask: 單顆 whole-cell 布林遮罩。
+        nucleus_mask: 與 cell 配對的單顆 nucleus 布林遮罩。
+
+    Returns:
+        60 個 paper-style 額外 cell-level 特徵。
+
+    Raises:
+        ValueError: 影像與遮罩尺寸不一致，或遮罩沒有有效 cell/cytoplasm 時拋出。
+    """
+    phase_array = np.asarray(phase, dtype=np.float64)
+    cell_array = np.asarray(cell_mask, dtype=bool)
+    nucleus_array = np.asarray(nucleus_mask, dtype=bool)
+    if any(array.ndim != 2 for array in (phase_array, cell_array, nucleus_array)):
+        raise ValueError("phase、cell_mask 與 nucleus_mask 都必須是二維陣列")
+    if len({array.shape for array in (phase_array, cell_array, nucleus_array)}) != 1:
+        raise ValueError("phase、cell_mask 與 nucleus_mask 必須具有相同尺寸")
+    cytoplasm_array = cell_array & ~nucleus_array
+    if not np.any(cell_array) or not np.any(cytoplasm_array):
+        raise ValueError("paper-style features 需要非空 cell 與 cytoplasm")
+
+    cell_measurements = _measure_roi_with_python(phase_array, cell_array)
+    nucleus_measurements = _measure_roi_with_python(phase_array, nucleus_array)
+    cytoplasm_measurements = _measure_roi_with_python(
+        phase_array, cytoplasm_array
+    )
+    cell_zernike = _zernike_feature_values_python(phase_array, cell_array)
+    nucleus_zernike = _zernike_feature_values_python(phase_array, nucleus_array)
+    if len(cell_zernike) != 25 or len(nucleus_zernike) != 25:
+        raise ValueError("paper-style Zernike helper 必須各回傳 25 個 moments")
+
+    cell_area = float(cell_measurements["area"])
+    centroid_distance = math.hypot(
+        float(nucleus_measurements["x_centroid"])
+        - float(cell_measurements["x_centroid"]),
+        float(nucleus_measurements["y_centroid"])
+        - float(cell_measurements["y_centroid"]),
+    )
+    equivalent_cell_radius = (
+        math.sqrt(cell_area / math.pi)
+        if np.isfinite(cell_area) and cell_area > 0
+        else np.nan
+    )
+    values = {
+        **{
+            f"cell__zernike_{index:02d}": float(value)
+            for index, value in enumerate(cell_zernike)
+        },
+        **{
+            f"nucleus__zernike_{index:02d}": float(value)
+            for index, value in enumerate(nucleus_zernike)
+        },
+        "nucleus_cytoplasm_mean_ratio": _safe_divide(
+            float(nucleus_measurements["mean"]),
+            float(cytoplasm_measurements["mean"]),
+        ),
+        "nucleus_cytoplasm_intden_ratio": _safe_divide(
+            float(nucleus_measurements["intden"]),
+            float(cytoplasm_measurements["intden"]),
+        ),
+        "nucleus_cytoplasm_raw_intden_ratio": _safe_divide(
+            float(nucleus_measurements["raw_intden"]),
+            float(cytoplasm_measurements["raw_intden"]),
+        ),
+        "nucleus_cell_intden_ratio": _safe_divide(
+            float(nucleus_measurements["intden"]),
+            float(cell_measurements["intden"]),
+        ),
+        "nucleus_cytoplasm_entropy_difference": _finite_difference(
+            float(nucleus_measurements["entropy"]),
+            float(cytoplasm_measurements["entropy"]),
+        ),
+        "nucleus_cytoplasm_cv_difference": _finite_difference(
+            float(nucleus_measurements["cv"]),
+            float(cytoplasm_measurements["cv"]),
+        ),
+        "nucleus_centroid_offset": _safe_divide(
+            centroid_distance, equivalent_cell_radius
+        ),
+        "cell__phase_intensity_cv": float(cell_measurements["cv"]),
+        "nucleus__phase_intensity_cv": float(nucleus_measurements["cv"]),
+        "cytoplasm__phase_intensity_cv": float(cytoplasm_measurements["cv"]),
+    }
+    return {name: float(values[name]) for name in PAPER_STYLE_EXTRA_FEATURES}
+
+
+def _finite_difference(left: float, right: float) -> float:
+    """只在兩側皆為有限值時回傳差值。"""
+    if not np.isfinite(left) or not np.isfinite(right):
+        return np.nan
+    return float(left - right)
 
 
 class Segmenter(Protocol):
@@ -528,10 +635,7 @@ def extract_features_from_arrays(
         ValueError: 陣列不是相同尺寸的二維資料、閾值不合法、feature set 未註冊，
             或影像沒有可用的 whole-cell 外背景時拋出。
     """
-    enabled = tuple(str(name) for name in enabled_feature_sets)
-    unknown = [name for name in enabled if name not in FEATURE_SET_REGISTRIES]
-    if unknown:
-        raise ValueError(f"未註冊的 phase-only feature set：{unknown}")
+    enabled = _validate_feature_set_specs(enabled_feature_sets)
     if not 0.0 <= float(max_nucleus_outside_fraction) <= 1.0:
         raise ValueError("max_nucleus_outside_fraction 必須介於 0 與 1")
 
@@ -571,19 +675,26 @@ def extract_features_from_arrays(
             excluded_empty += 1
             continue
         ido_score = float(np.mean(ido_array[true_cytoplasm]) - background_median)
-        rows.append(
-            {
-                "image_key": str(image_key),
-                "cell_label": int(cell_label),
-                "nucleus_label": int(nucleus_label),
-                **_geometry_values(phase_array, cell_region, "cell"),
-                **_geometry_values(phase_array, nucleus_region, "nucleus"),
-                "nucleus_cytoplasm_area_ratio": _safe_divide(
-                    float(nucleus_area), float(cytoplasm_area)
-                ),
-                "IDO_score": ido_score,
-            }
-        )
+        row = {
+            "image_key": str(image_key),
+            "cell_label": int(cell_label),
+            "nucleus_label": int(nucleus_label),
+            **_geometry_values(phase_array, cell_region, "cell"),
+            **_geometry_values(phase_array, nucleus_region, "nucleus"),
+            "nucleus_cytoplasm_area_ratio": _safe_divide(
+                float(nucleus_area), float(cytoplasm_area)
+            ),
+            "IDO_score": ido_score,
+        }
+        if "paper_style_median" in enabled:
+            row.update(
+                paper_style_extras(
+                    phase_array,
+                    cell_region,
+                    nucleus_region,
+                )
+            )
+        rows.append(row)
 
     qc = {
         "image_key": str(image_key),
@@ -641,10 +752,7 @@ def extract_basic_cell_features(
         if isinstance(feature_config, Mapping)
         else ("basic_median",)
     )
-    enabled_names = tuple(str(name) for name in enabled)
-    unknown = [name for name in enabled_names if name not in FEATURE_SET_REGISTRIES]
-    if unknown:
-        raise ValueError(f"未註冊的 phase-only feature set：{unknown}")
+    enabled_names = _validate_feature_set_specs(enabled)
 
     qc_by_key = segmentation_qc.set_index(
         segmentation_qc["image_key"].astype(str), drop=False
@@ -707,11 +815,17 @@ def extract_basic_cell_features(
                 {**empty_qc, "status": "failed", "error": str(error)}
             )
 
-    cells = pd.DataFrame(cell_rows, columns=CELL_LEVEL_COLUMNS)
+    cell_level_columns = list(CELL_LEVEL_COLUMNS)
+    if "paper_style_median" in enabled_names:
+        cell_level_columns[-1:-1] = list(PAPER_STYLE_EXTRA_FEATURES)
+    cells = pd.DataFrame(cell_rows, columns=cell_level_columns)
     extraction_qc = pd.DataFrame(qc_rows, columns=FEATURE_EXTRACTION_QC_COLUMNS)
     cells.attrs["min_cells_per_image"] = min_cells
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cells.to_csv(cache_dir / "cell_level_basic.csv", index=False)
+    _write_csv_atomically(
+        cells.loc[:, CELL_LEVEL_COLUMNS],
+        _safe_output_file(cache_dir, "cell_level_basic.csv"),
+    )
     cells.attrs["exp3_output_dir"] = str(cache_dir.parent)
     return cells, extraction_qc
 
@@ -897,5 +1011,6 @@ __all__ = [
     "extract_basic_cell_features",
     "extract_features_from_arrays",
     "load_cached_masks",
+    "paper_style_extras",
     "run_development_nucleus_validation",
 ]
