@@ -916,17 +916,28 @@ def _delta_heatmap(artifacts: Mapping[str, Any]) -> Figure:
     """繪製 descriptive ΔMorphology signature matrix。"""
     deltas = _frame(artifacts, "morphology_delta_signatures", "morphology_deltas")
     figure, axis = _new_figure(width=10, height=10)
-    value_column = _first_present(deltas, ("scaled_delta", "delta", "value"))
-    required = {"group_id", "feature"}
-    if deltas.empty or value_column is None or not required.issubset(deltas):
+    required = {
+        "group_id",
+        "contrast_id",
+        "feature",
+        "delta_scaled_by_global_iqr",
+    }
+    if deltas.empty or not required.issubset(deltas):
         _placeholder(axis, "ΔMorphology signature heatmap", "Insufficient descriptive signature data.")
         return figure
     clean = deltas.copy()
-    clean[value_column] = _finite_numeric(clean[value_column])
-    if "contrast" not in clean:
-        clean["contrast"] = "all contrasts"
-    clean["row_label"] = clean["group_id"].astype(str) + " | " + clean["contrast"].astype(str)
-    pivot = clean.pivot_table(index="row_label", columns="feature", values=value_column, aggfunc="mean")
+    clean["delta_scaled_by_global_iqr"] = _finite_numeric(
+        clean["delta_scaled_by_global_iqr"]
+    )
+    clean["row_label"] = (
+        clean["group_id"].astype(str) + " | " + clean["contrast_id"].astype(str)
+    )
+    pivot = clean.pivot_table(
+        index="row_label",
+        columns="feature",
+        values="delta_scaled_by_global_iqr",
+        aggfunc="mean",
+    )
     if pivot.empty or not np.isfinite(pivot.to_numpy(float)).any():
         _placeholder(axis, "ΔMorphology signature heatmap", "No finite descriptive deltas.")
         return figure
@@ -966,16 +977,28 @@ def _delta_pca(artifacts: Mapping[str, Any]) -> Figure:
     """以 SVD 建立九個 biological-group signature 的 descriptive PCA。"""
     deltas = _frame(artifacts, "morphology_delta_signatures", "morphology_deltas")
     figure, axis = _new_figure(width=8, height=6.5)
-    value_column = _first_present(deltas, ("scaled_delta", "delta", "value"))
-    if deltas.empty or value_column is None or not {"group_id", "feature"}.issubset(deltas):
+    required = {
+        "group_id",
+        "contrast_id",
+        "feature",
+        "delta_scaled_by_global_iqr",
+    }
+    if deltas.empty or not required.issubset(deltas):
         _placeholder(axis, "ΔMorphology PCA", "Insufficient descriptive signature data.")
         return figure
     clean = deltas.copy()
-    clean[value_column] = _finite_numeric(clean[value_column])
-    if "contrast" not in clean:
-        clean["contrast"] = "all contrasts"
-    clean["dimension"] = clean["contrast"].astype(str) + " | " + clean["feature"].astype(str)
-    matrix = clean.pivot_table(index="group_id", columns="dimension", values=value_column, aggfunc="mean")
+    clean["delta_scaled_by_global_iqr"] = _finite_numeric(
+        clean["delta_scaled_by_global_iqr"]
+    )
+    clean["dimension"] = (
+        clean["contrast_id"].astype(str) + " | " + clean["feature"].astype(str)
+    )
+    matrix = clean.pivot_table(
+        index="group_id",
+        columns="dimension",
+        values="delta_scaled_by_global_iqr",
+        aggfunc="mean",
+    )
     matrix = matrix.dropna(axis=1, how="all").fillna(0.0)
     if matrix.shape[0] < 2 or matrix.shape[1] < 2:
         _placeholder(

@@ -15,6 +15,8 @@ import pytest
 from PIL import Image
 
 import immunity.exp3.run_benchmark as run_module
+import immunity.exp3.reporting as reporting
+from immunity.exp3.feature_sets import calculate_delta_signatures
 from immunity.exp3.reporting import (
     REQUIRED_FIGURES,
     REQUIRED_TABLES,
@@ -163,19 +165,6 @@ def _figure_artifacts() -> dict[str, object]:
             for feature_index, feature in enumerate(("area", "perimeter", "solidity"))
         ]
     )
-    deltas = pd.DataFrame(
-        [
-            {
-                "group_id": f"B{group + 4}-P{group % 3 + 5}",
-                "contrast": f"C{contrast + 2:02d}-C01",
-                "feature": feature,
-                "scaled_delta": np.sin(group + contrast + feature_index),
-            }
-            for group in range(9)
-            for contrast in range(7)
-            for feature_index, feature in enumerate(("area", "perimeter", "solidity"))
-        ]
-    )
     return {
         "status": "no_eligible_phase_only_model",
         "winner": None,
@@ -183,8 +172,59 @@ def _figure_artifacts() -> dict[str, object]:
         "fold_metrics": fold_metrics,
         "oof_predictions": predictions,
         "feature_importance": importance,
-        "morphology_delta_signatures": deltas,
+        "morphology_delta_signatures": _authoritative_delta_signatures(),
     }
+
+
+def _authoritative_delta_signatures() -> pd.DataFrame:
+    """透過正式 producer 建立九組、七 contrasts 的報表整合資料。"""
+    conditions = (
+        (0.0, 0.0),
+        (25.0, 0.0),
+        (50.0, 0.0),
+        (100.0, 0.0),
+        (0.0, 25.0),
+        (0.0, 50.0),
+        (25.0, 25.0),
+        (25.0, 50.0),
+    )
+    features = (
+        "cell__area__median",
+        "cell__perimeter__median",
+        "cell__solidity__median",
+    )
+    images = pd.DataFrame(
+        [
+            {
+                "group_id": f"{b_id}_P{passage}",
+                "ifn_dose": ifn,
+                "tnf_dose": tnf,
+                **{
+                    feature: float(
+                        (group_index + 1) * (feature_index + 2)
+                        + condition_index * (feature_index + 1)
+                        + group_index * condition_index * 0.1
+                    )
+                    for feature_index, feature in enumerate(features)
+                },
+            }
+            for group_index, (b_id, passage) in enumerate(
+                (
+                    ("B4", 5),
+                    ("B4", 6),
+                    ("B4", 7),
+                    ("B7", 5),
+                    ("B7", 6),
+                    ("B7", 7),
+                    ("B8", 5),
+                    ("B8", 6),
+                    ("B8", 7),
+                )
+            )
+            for condition_index, (ifn, tnf) in enumerate(conditions)
+        ]
+    )
+    return calculate_delta_signatures(images, features)
 
 
 def _create_directory_link(link: Path, target: Path) -> None:
@@ -454,6 +494,59 @@ def test_figure_writer_creates_eight_nonempty_pngs_and_closes_figures(
     assert plt.get_fignums() == []
 
 
+def test_authoritative_delta_producer_drives_heatmap_and_pca(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """正式 ΔMorphology schema 必須實際驅動 heatmap 與 PCA 的維度和標籤。"""
+    _, output = _allowed_output(tmp_path, monkeypatch)
+    deltas = _authoritative_delta_signatures()
+    artifacts = _figure_artifacts()
+    artifacts["morphology_delta_signatures"] = deltas
+
+    assert {"contrast_id", "delta_scaled_by_global_iqr"}.issubset(deltas)
+    assert deltas["group_id"].nunique() == 9
+    assert deltas["contrast_id"].nunique() == 7
+    assert deltas.groupby(["group_id", "contrast_id"]).size().eq(3).all()
+
+    write_figures(output, artifacts)
+
+    heatmap_path = output / "figures" / "morphology_delta_heatmap.png"
+    pca_path = output / "figures" / "morphology_delta_pca.png"
+    assert "Insufficient" not in _png_title(heatmap_path)
+    assert "63 group-contrast rows" in _png_title(heatmap_path)
+    assert "Insufficient" not in _png_title(pca_path)
+    assert "n=9 biological groups" in _png_title(pca_path)
+
+    heatmap = reporting._delta_heatmap(artifacts)
+    pca = reporting._delta_pca(artifacts)
+    try:
+        heatmap_axis = heatmap.axes[0]
+        assert heatmap_axis.images[0].get_array().shape == (63, 3)
+        assert {label.get_text() for label in heatmap_axis.get_xticklabels()} == {
+            "cell__area__median",
+            "cell__perimeter__median",
+            "cell__solidity__median",
+        }
+        assert "B4_P5 | IFN25_vs_0_at_TNF0" in {
+            label.get_text() for label in heatmap_axis.get_yticklabels()
+        }
+        assert {text.get_text() for text in pca.axes[0].texts} == {
+            "B4_P5",
+            "B4_P6",
+            "B4_P7",
+            "B7_P5",
+            "B7_P6",
+            "B7_P7",
+            "B8_P5",
+            "B8_P6",
+            "B8_P7",
+        }
+    finally:
+        plt.close(heatmap)
+        plt.close(pca)
+    assert plt.get_fignums() == []
+
+
 def test_figure_writer_preflights_every_destination_before_first_publish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -484,7 +577,7 @@ def test_malformed_nonfinite_frames_emit_eight_placeholders_without_warnings(
     artifacts = _figure_artifacts()
     artifacts["morphology_delta_signatures"] = artifacts[
         "morphology_delta_signatures"
-    ].assign(scaled_delta=np.inf)
+    ].assign(delta_scaled_by_global_iqr=np.inf)
     artifacts["fold_metrics"] = artifacts["fold_metrics"].assign(mae=np.inf)
 
     with warnings.catch_warnings():
