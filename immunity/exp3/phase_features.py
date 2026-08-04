@@ -14,6 +14,18 @@ import pandas as pd
 from scipy.optimize import linear_sum_assignment
 from skimage.measure import regionprops
 
+from immunity.exp3.feature_sets import (
+    BASIC_GEOMETRY,
+    FEATURE_SET_REGISTRIES,
+    PRIMARY_CELL_FEATURES,
+)
+from ki67dtc.cell_anal import (
+    _geometry_from_measurements,
+    _measure_roi_with_python,
+    _safe_divide,
+)
+from ki67dtc.paired_overlay import find_paired_labels
+
 
 SEGMENTATION_QC_COLUMNS = [
     "image_key",
@@ -45,6 +57,24 @@ DEVELOPMENT_VALIDATION_COLUMNS = [
     "mask_path",
     *NUCLEUS_COMPARISON_COLUMNS,
     "role",
+]
+
+FEATURE_EXTRACTION_QC_COLUMNS = [
+    "image_key",
+    "status",
+    "error",
+    "paired_cells",
+    "kept_full_cells",
+    "excluded_nucleus_outside",
+    "excluded_empty_cytoplasm",
+    "background_median",
+]
+CELL_LEVEL_COLUMNS = [
+    "image_key",
+    "cell_label",
+    "nucleus_label",
+    *PRIMARY_CELL_FEATURES,
+    "IDO_score",
 ]
 
 
@@ -469,6 +499,252 @@ def run_development_nucleus_validation(
     return pd.DataFrame(rows, columns=DEVELOPMENT_VALIDATION_COLUMNS)
 
 
+def extract_features_from_arrays(
+    image_key: str,
+    phase: np.ndarray,
+    ido: np.ndarray,
+    cell_mask: np.ndarray,
+    nucleus_mask: np.ndarray,
+    max_nucleus_outside_fraction: float,
+    enabled_feature_sets: Sequence[str] = ("basic_median",),
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """從單張 synthetic 或實際影像陣列擷取 Primary features 與 IDO target。
+
+    Args:
+        image_key: 影像唯一識別碼。
+        phase: 二維 phase-contrast 影像。
+        ido: 與 phase 對齊的二維 IDO 影像。
+        cell_mask: whole-cell label mask。
+        nucleus_mask: PC nucleus label mask。
+        max_nucleus_outside_fraction: nucleus 可落在配對 whole-cell 外的最大比例。
+        enabled_feature_sets: 已啟用的 feature-set 名稱。
+
+    Returns:
+        通過 QC 的 cell rows，以及記錄配對、排除與背景值的 QC 字典。
+
+    Raises:
+        ValueError: 陣列不是相同尺寸的二維資料、閾值不合法、feature set 未註冊，
+            或影像沒有可用的 whole-cell 外背景時拋出。
+    """
+    enabled = tuple(str(name) for name in enabled_feature_sets)
+    unknown = [name for name in enabled if name not in FEATURE_SET_REGISTRIES]
+    if unknown:
+        raise ValueError(f"未註冊的 phase-only feature set：{unknown}")
+    if not 0.0 <= float(max_nucleus_outside_fraction) <= 1.0:
+        raise ValueError("max_nucleus_outside_fraction 必須介於 0 與 1")
+
+    phase_array = np.asarray(phase)
+    ido_array = np.asarray(ido, dtype=np.float64)
+    cell_array, nucleus_array = _validate_mask_pair(cell_mask, nucleus_mask)
+    arrays = (phase_array, ido_array, cell_array, nucleus_array)
+    if any(array.ndim != 2 for array in arrays):
+        raise ValueError("phase、IDO 與 masks 都必須是二維陣列")
+    if len({array.shape for array in arrays}) != 1:
+        raise ValueError("phase、IDO 與 masks 必須具有相同尺寸")
+
+    background_values = ido_array[(cell_array == 0) & np.isfinite(ido_array)]
+    if background_values.size == 0:
+        raise ValueError("IDO 影像沒有可計算 median 的 whole-cell 外背景")
+    background_median = float(np.median(background_values))
+    pairs = find_paired_labels(cell_array, nucleus_array)
+    rows: list[dict[str, Any]] = []
+    excluded_outside = 0
+    excluded_empty = 0
+
+    for cell_label, nucleus_label in pairs:
+        cell_region = cell_array == cell_label
+        nucleus_region = nucleus_array == nucleus_label
+        nucleus_area = int(np.count_nonzero(nucleus_region))
+        outside_area = int(np.count_nonzero(nucleus_region & ~cell_region))
+        outside_fraction = _safe_divide(float(outside_area), float(nucleus_area))
+        if not np.isfinite(outside_fraction) or (
+            outside_fraction > float(max_nucleus_outside_fraction)
+        ):
+            excluded_outside += 1
+            continue
+
+        true_cytoplasm = cell_region & ~nucleus_region
+        cytoplasm_area = int(np.count_nonzero(true_cytoplasm))
+        if cytoplasm_area == 0:
+            excluded_empty += 1
+            continue
+        ido_score = float(np.mean(ido_array[true_cytoplasm]) - background_median)
+        rows.append(
+            {
+                "image_key": str(image_key),
+                "cell_label": int(cell_label),
+                "nucleus_label": int(nucleus_label),
+                **_geometry_values(phase_array, cell_region, "cell"),
+                **_geometry_values(phase_array, nucleus_region, "nucleus"),
+                "nucleus_cytoplasm_area_ratio": _safe_divide(
+                    float(nucleus_area), float(cytoplasm_area)
+                ),
+                "IDO_score": ido_score,
+            }
+        )
+
+    qc = {
+        "image_key": str(image_key),
+        "paired_cells": len(pairs),
+        "kept_full_cells": len(rows),
+        "excluded_nucleus_outside": excluded_outside,
+        "excluded_empty_cytoplasm": excluded_empty,
+        "background_median": background_median,
+    }
+    return rows, qc
+
+
+def extract_basic_cell_features(
+    manifest: pd.DataFrame,
+    segmentation_qc: pd.DataFrame,
+    config: Mapping[str, Any],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """從通過 segmentation QC 的影像建立 Exp3 Primary cell-level cache。
+
+    Args:
+        manifest: 含 ``image_key``、``pc_path`` 與 ``ido_path`` 的完整 manifest。
+        segmentation_qc: ``cache_phase_masks`` 產生的逐影像 QC 與 mask path。
+        config: Exp3 設定，使用 ``segmentation`` 與 ``feature_sets.enabled``。
+
+    Returns:
+        cell-level feature 資料表，以及逐影像 feature extraction QC 表。
+
+    Raises:
+        ValueError: 輸入欄位缺漏、image key 重複或 feature 設定不合法時拋出。
+    """
+    required_manifest = {"image_key", "pc_path", "ido_path"}
+    missing_manifest = sorted(required_manifest - set(manifest.columns))
+    if missing_manifest:
+        raise ValueError(f"manifest 缺少欄位：{missing_manifest}")
+    required_qc = {"image_key", "mask_path", "status"}
+    missing_qc = sorted(required_qc - set(segmentation_qc.columns))
+    if missing_qc:
+        raise ValueError(f"segmentation_qc 缺少欄位：{missing_qc}")
+    if manifest["image_key"].duplicated().any():
+        raise ValueError("manifest 出現重複 image_key")
+    if segmentation_qc["image_key"].duplicated().any():
+        raise ValueError("segmentation_qc 出現重複 image_key")
+
+    segmentation_config = _segmentation_config(config)
+    max_outside = float(
+        segmentation_config.get("max_nucleus_outside_fraction", 0.05)
+    )
+    min_cells = int(segmentation_config.get("min_cells_per_image", 3))
+    feature_config = config.get("feature_sets", {})
+    enabled = (
+        feature_config.get("enabled", ("basic_median",))
+        if isinstance(feature_config, Mapping)
+        else ("basic_median",)
+    )
+    enabled_names = tuple(str(name) for name in enabled)
+    unknown = [name for name in enabled_names if name not in FEATURE_SET_REGISTRIES]
+    if unknown:
+        raise ValueError(f"未註冊的 phase-only feature set：{unknown}")
+
+    qc_by_key = segmentation_qc.set_index(
+        segmentation_qc["image_key"].astype(str), drop=False
+    )
+    cell_rows: list[dict[str, Any]] = []
+    qc_rows: list[dict[str, Any]] = []
+    for manifest_row in manifest.to_dict(orient="records"):
+        image_key = str(manifest_row["image_key"])
+        empty_qc = {
+            "image_key": image_key,
+            "paired_cells": 0,
+            "kept_full_cells": 0,
+            "excluded_nucleus_outside": 0,
+            "excluded_empty_cytoplasm": 0,
+            "background_median": np.nan,
+        }
+        if image_key not in qc_by_key.index:
+            qc_rows.append(
+                {**empty_qc, "status": "failed", "error": "缺少 segmentation QC"}
+            )
+            continue
+        mask_qc = qc_by_key.loc[image_key]
+        if str(mask_qc["status"]) != "passed":
+            qc_rows.append(
+                {
+                    **empty_qc,
+                    "status": "failed",
+                    "error": str(mask_qc.get("error", "segmentation 未通過")),
+                }
+            )
+            continue
+        try:
+            phase = _read_grayscale_image(manifest_row["pc_path"])
+            ido = _read_grayscale_image(manifest_row["ido_path"])
+            cell_mask, nucleus_mask = load_cached_masks(mask_qc["mask_path"])
+            rows, metrics = extract_features_from_arrays(
+                image_key,
+                phase,
+                ido,
+                cell_mask,
+                nucleus_mask,
+                max_outside,
+                enabled_names,
+            )
+            cell_rows.extend(rows)
+            qc_rows.append({**metrics, "status": "passed", "error": ""})
+        except Exception as error:  #逐圖記錄失敗，讓後續 minimum-cell gate 統一阻擋。
+            qc_rows.append(
+                {**empty_qc, "status": "failed", "error": str(error)}
+            )
+
+    cells = pd.DataFrame(cell_rows, columns=CELL_LEVEL_COLUMNS)
+    extraction_qc = pd.DataFrame(qc_rows, columns=FEATURE_EXTRACTION_QC_COLUMNS)
+    cells.attrs["min_cells_per_image"] = min_cells
+    cache_dir = _resolve_feature_cache_dir(config, segmentation_qc)
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cells.to_csv(cache_dir / "cell_level_basic.csv", index=False)
+        cells.attrs["feature_cache_dir"] = str(cache_dir)
+    return cells, extraction_qc
+
+
+def _geometry_values(
+    signal: np.ndarray,
+    mask: np.ndarray,
+    prefix: str,
+) -> dict[str, float]:
+    """將既有 geometry helper 限縮成 Primary 指定的 16 欄。"""
+    measured = _geometry_from_measurements(
+        _measure_roi_with_python(signal, mask)
+    )
+    return {
+        f"{prefix}__{name}": float(measured[name]) for name in BASIC_GEOMETRY
+    }
+
+
+def _read_grayscale_image(path: str | Path) -> np.ndarray:
+    """讀取單張影像為二維浮點灰階陣列。"""
+    image_path = Path(path)
+    encoded = np.fromfile(image_path, dtype=np.uint8)
+    image = cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        raise ValueError(f"無法讀取影像：{image_path}")
+    return np.asarray(image, dtype=np.float64)
+
+
+def _resolve_feature_cache_dir(
+    config: Mapping[str, Any],
+    segmentation_qc: pd.DataFrame,
+) -> Path | None:
+    """由明確設定或既有 mask cache 路徑取得 feature cache 根目錄。"""
+    explicit = config.get("feature_cache_dir")
+    if explicit:
+        return Path(str(explicit))
+    mask_paths = segmentation_qc.get("mask_path")
+    if mask_paths is None:
+        return None
+    usable_paths = [Path(str(value)) for value in mask_paths if str(value)]
+    if not usable_paths:
+        return None
+    candidates = [path.parent.parent.parent for path in usable_paths]
+    first = candidates[0]
+    return first if all(candidate == first for candidate in candidates) else None
+
+
 def _segmentation_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
     """取得直接或巢狀的 segmentation 設定。"""
     nested = config.get("segmentation")
@@ -561,12 +837,16 @@ def _write_npz_atomically(mask_path: Path, **arrays: np.ndarray) -> None:
 
 
 __all__ = [
+    "CELL_LEVEL_COLUMNS",
     "DEVELOPMENT_VALIDATION_COLUMNS",
+    "FEATURE_EXTRACTION_QC_COLUMNS",
     "NUCLEUS_COMPARISON_COLUMNS",
     "SEGMENTATION_QC_COLUMNS",
     "PhaseSegmenter",
     "cache_phase_masks",
     "compare_nucleus_masks",
+    "extract_basic_cell_features",
+    "extract_features_from_arrays",
     "load_cached_masks",
     "run_development_nucleus_validation",
 ]

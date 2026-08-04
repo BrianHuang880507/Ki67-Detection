@@ -13,6 +13,8 @@ from immunity.exp3.phase_features import (
     PhaseSegmenter,
     cache_phase_masks,
     compare_nucleus_masks,
+    extract_basic_cell_features,
+    extract_features_from_arrays,
     load_cached_masks,
     run_development_nucleus_validation,
 )
@@ -443,3 +445,110 @@ def test_development_validation_uses_pc_and_dapi_models_only_after_opt_in(
     assert sorted(path.name for path in validation_cache.glob("*.npz")) == [
         "IFN0_TNF0_FOV01.npz"
     ]
+
+
+def test_feature_extraction_uses_true_cytoplasm_for_ido_target() -> None:
+    phase = np.arange(100, dtype=float).reshape(10, 10)
+    ido = np.full((10, 10), 5.0)
+    cell = np.zeros((10, 10), dtype=np.int32)
+    nucleus = np.zeros((10, 10), dtype=np.int32)
+    cell[2:8, 2:8] = 1
+    nucleus[4:6, 4:6] = 1
+    ido[cell == 1] = 20.0
+    ido[nucleus == 1] = 100.0
+
+    rows, qc = extract_features_from_arrays(
+        "img", phase, ido, cell, nucleus, 0.05
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["IDO_score"] == pytest.approx(15.0)
+    assert rows[0]["nucleus_cytoplasm_area_ratio"] == pytest.approx(4 / 32)
+    assert qc["kept_full_cells"] == 1
+
+
+def test_feature_extraction_records_outside_nucleus_and_empty_cytoplasm() -> None:
+    phase = np.ones((12, 12), dtype=float)
+    ido = np.zeros((12, 12), dtype=float)
+    cell = np.zeros((12, 12), dtype=np.int32)
+    nucleus = np.zeros((12, 12), dtype=np.int32)
+
+    cell[2:7, 2:7] = 1
+    nucleus[3:5, 3:5] = 1
+    nucleus[9, 9] = 1
+    cell[8, 2] = 2
+    nucleus[8, 2] = 2
+
+    rows, qc = extract_features_from_arrays(
+        "img", phase, ido, cell, nucleus, 0.05
+    )
+
+    assert rows == []
+    assert qc["paired_cells"] == 2
+    assert qc["excluded_nucleus_outside"] == 1
+    assert qc["excluded_empty_cytoplasm"] == 1
+    assert qc["kept_full_cells"] == 0
+
+
+def test_feature_extraction_rejects_mismatched_array_dimensions() -> None:
+    phase = np.zeros((8, 8), dtype=float)
+    ido = np.zeros((8, 7), dtype=float)
+    mask = np.zeros((8, 8), dtype=np.int32)
+
+    with pytest.raises(ValueError, match="相同尺寸"):
+        extract_features_from_arrays("img", phase, ido, mask, mask, 0.05)
+
+
+def test_extract_basic_cell_features_writes_internal_cell_cache(
+    tmp_path: Path,
+) -> None:
+    image_key = "B4_P5_C01_F01"
+    phase_path = tmp_path / "phase.png"
+    ido_path = tmp_path / "ido.png"
+    Image.fromarray(np.arange(100, dtype=np.uint8).reshape(10, 10)).save(phase_path)
+    Image.fromarray(np.full((10, 10), 5, dtype=np.uint8)).save(ido_path)
+
+    cell = np.zeros((10, 10), dtype=np.int32)
+    nucleus = np.zeros((10, 10), dtype=np.int32)
+    cell[2:8, 2:8] = 1
+    nucleus[4:6, 4:6] = 1
+    mask_path = tmp_path / "feature_cache" / "masks" / "B4_P5" / f"{image_key}.npz"
+    mask_path.parent.mkdir(parents=True)
+    np.savez(mask_path, cell_mask=cell, nucleus_mask=nucleus)
+    manifest = pd.DataFrame(
+        [
+            {
+                "image_key": image_key,
+                "b_id": "B4",
+                "passage": 5,
+                "group_id": "B4_P5",
+                "condition_index": 1,
+                "condition": "control",
+                "ifn_dose": 0.0,
+                "tnf_dose": 0.0,
+                "fov": 1,
+                "pc_path": str(phase_path),
+                "ido_path": str(ido_path),
+            }
+        ]
+    )
+    segmentation_qc = pd.DataFrame(
+        [{"image_key": image_key, "mask_path": str(mask_path), "status": "passed"}]
+    )
+
+    cells, qc = extract_basic_cell_features(
+        manifest,
+        segmentation_qc,
+        {
+            "segmentation": {
+                "max_nucleus_outside_fraction": 0.05,
+                "min_cells_per_image": 1,
+            },
+            "feature_sets": {"enabled": ["basic_median"]},
+        },
+    )
+
+    assert len(cells) == 1
+    assert qc.loc[0, "status"] == "passed"
+    assert cells.attrs["min_cells_per_image"] == 1
+    assert (tmp_path / "feature_cache" / "cell_level_basic.csv").is_file()
