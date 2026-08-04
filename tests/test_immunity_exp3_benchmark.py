@@ -1,18 +1,31 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
 
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.compose import TransformedTargetRegressor
+from sklearn.dummy import DummyRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from immunity.exp3.benchmark import (
+    FAILURE_COLUMNS,
+    FEATURE_IMPORTANCE_COLUMNS,
+    FOLD_METRIC_COLUMNS,
+    HYPERPARAMETER_COLUMNS,
+    OOF_COLUMNS,
     OuterSplit,
+    build_model_registry,
     make_inner_splits,
     make_outer_splits,
     outer_split_manifest,
     regression_metrics,
+    run_nested_benchmark,
 )
+from immunity.exp3.feature_sets import PRIMARY_FOV_FEATURES
 
 
 def make_grouped_images() -> pd.DataFrame:
@@ -23,9 +36,7 @@ def make_grouped_images() -> pd.DataFrame:
             for condition_index in range(1, 9):
                 rows.append(
                     {
-                        "image_key": (
-                            f"{b_id}_P{passage}_C{condition_index:02d}_F01"
-                        ),
+                        "image_key": (f"{b_id}_P{passage}_C{condition_index:02d}_F01"),
                         "b_id": b_id,
                         "passage": passage,
                         "group_id": f"{b_id}_P{passage}",
@@ -34,16 +45,43 @@ def make_grouped_images() -> pd.DataFrame:
                         "ifn_dose": float(condition_index - 1),
                         "tnf_dose": 0.0,
                         "fov": 1,
-                        "IDO_score": (
-                            b_index + passage / 10 + condition_index / 20
-                        ),
+                        "IDO_score": (b_index + passage / 10 + condition_index / 20),
                     }
                 )
-    return pd.DataFrame(rows)
+    images = pd.DataFrame(rows)
+    morphology = {
+        feature: (
+            np.arange(len(images), dtype=float) / 10
+            + feature_index
+            + images["condition_index"].to_numpy(dtype=float) / 100
+        )
+        for feature_index, feature in enumerate(PRIMARY_FOV_FEATURES)
+    }
+    return pd.concat([images, pd.DataFrame(morphology)], axis=1)
 
 
-def test_outer_splits_have_expected_counts_disjoint_groups_and_full_coverage(
-) -> None:
+def make_tiny_config() -> dict[str, object]:
+    """建立可快速執行且維持正式搜尋 contract 的測試設定。"""
+    return {
+        "seed": 42,
+        "inner_splits": 2,
+        "max_hyperparameter_candidates": 1,
+        "n_jobs": 1,
+        "permutation_repeats": 2,
+        "tree_estimators": 10,
+        "simplicity_order": [
+            "paper_linear_3f",
+            "ridge",
+            "elasticnet",
+            "rbf_svr",
+            "hist_gradient_boosting",
+            "random_forest",
+            "extra_trees",
+        ],
+    }
+
+
+def test_outer_splits_have_expected_counts_disjoint_groups_and_full_coverage() -> None:
     images = make_grouped_images()
 
     splits = make_outer_splits(images)
@@ -139,10 +177,12 @@ def test_outer_split_manifest_preserves_positional_rows_and_metadata() -> None:
     assert manifest["image_key"].tolist() == images["image_key"].tolist()
     assert manifest["role"].tolist() == ["train", "test", "train", "test"]
     pd.testing.assert_frame_equal(
-        manifest.loc[:, ["image_key", "b_id", "passage", "group_id"]]
-        .reset_index(drop=True),
-        images.loc[:, ["image_key", "b_id", "passage", "group_id"]]
-        .reset_index(drop=True),
+        manifest.loc[:, ["image_key", "b_id", "passage", "group_id"]].reset_index(
+            drop=True
+        ),
+        images.loc[:, ["image_key", "b_id", "passage", "group_id"]].reset_index(
+            drop=True
+        ),
     )
 
 
@@ -152,9 +192,7 @@ def test_outer_splits_reject_missing_or_ambiguous_grouping_metadata() -> None:
     with pytest.raises(ValueError, match="缺少.*group_id"):
         make_outer_splits(images.drop(columns="group_id"))
     with pytest.raises(ValueError, match="image_key.*重複"):
-        make_outer_splits(
-            pd.concat([images, images.iloc[[0]]], ignore_index=True)
-        )
+        make_outer_splits(pd.concat([images, images.iloc[[0]]], ignore_index=True))
     images.loc[0, "b_id"] = None
     with pytest.raises(ValueError, match="b_id.*空值"):
         make_outer_splits(images)
@@ -239,3 +277,197 @@ def test_metrics_reject_empty_unequal_or_nonfinite_predictions(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         regression_metrics(observed, predicted)
+
+
+def test_registry_contains_exactly_seven_candidates_and_three_diagnostics() -> None:
+    registry = build_model_registry(make_tiny_config())
+
+    assert set(registry) == {
+        "paper_linear_3f",
+        "ridge",
+        "elasticnet",
+        "rbf_svr",
+        "random_forest",
+        "extra_trees",
+        "hist_gradient_boosting",
+        "dummy_median",
+        "dose_ridge",
+        "dose_plus_morphology_ridge",
+    }
+    assert {name for name, spec in registry.items() if spec.role == "candidate"} == {
+        "paper_linear_3f",
+        "ridge",
+        "elasticnet",
+        "rbf_svr",
+        "random_forest",
+        "extra_trees",
+        "hist_gradient_boosting",
+    }
+    assert {name for name, spec in registry.items() if spec.role == "diagnostic"} == {
+        "dummy_median",
+        "dose_ridge",
+        "dose_plus_morphology_ridge",
+    }
+
+
+def test_registry_keeps_preprocessing_and_target_scaling_inside_estimators() -> None:
+    registry = build_model_registry(make_tiny_config())
+
+    assert isinstance(registry["dummy_median"].estimator_factory(9), DummyRegressor)
+    for name, spec in registry.items():
+        if name == "dummy_median":
+            continue
+        estimator = spec.estimator_factory(9)
+        assert isinstance(estimator, TransformedTargetRegressor)
+        assert isinstance(estimator.transformer, StandardScaler)
+        assert isinstance(estimator.regressor, Pipeline)
+        assert estimator.regressor.named_steps["imputer"].strategy == "median"
+        assert estimator.regressor.named_steps["imputer"].keep_empty_features
+        assert ("scaler" in estimator.regressor.named_steps) is spec.scaled
+
+    assert registry["paper_linear_3f"].parameters == {}
+    assert registry["dummy_median"].parameters == {}
+    assert set(registry["ridge"].parameters) == {"regressor__model__alpha"}
+    assert registry["dose_ridge"].parameters == registry["ridge"].parameters
+    default_forest = build_model_registry({})["random_forest"].estimator_factory(9)
+    assert default_forest.regressor.named_steps["model"].n_estimators == 400
+    assert default_forest.regressor.named_steps["model"].random_state == 9
+    elasticnet = registry["elasticnet"].estimator_factory(9)
+    assert elasticnet.regressor.named_steps["model"].max_iter == 50000
+
+
+def test_nested_benchmark_uses_shared_splits_and_exact_result_schemas() -> None:
+    images = make_grouped_images()
+    splits = make_outer_splits(images)
+
+    result = run_nested_benchmark(
+        images,
+        {"basic_median": list(PRIMARY_FOV_FEATURES)},
+        splits,
+        make_tiny_config(),
+    )
+
+    assert result.predictions.columns.tolist() == OOF_COLUMNS
+    assert result.fold_metrics.columns.tolist() == FOLD_METRIC_COLUMNS
+    assert result.hyperparameters.columns.tolist() == HYPERPARAMETER_COLUMNS
+    assert result.feature_importance.columns.tolist() == FEATURE_IMPORTANCE_COLUMNS
+    assert result.failures.columns.tolist() == FAILURE_COLUMNS
+    expected_split_ids = {f"{split.validation}:{split.fold}" for split in splits}
+    by_model = result.fold_metrics.groupby("model")["split_id"].apply(set)
+    assert set(by_model.index) == set(build_model_registry(make_tiny_config()))
+    assert all(split_ids == expected_split_ids for split_ids in by_model)
+    assert result.failures.empty
+    assert result.fold_metrics["status"].eq("success").all()
+    assert np.isfinite(result.predictions["predicted_ido_score"]).all()
+    importance_features = result.feature_importance.groupby("model")["feature"].apply(
+        list
+    )
+    assert set(importance_features["paper_linear_3f"]) == {
+        "cell__perimeter__median",
+        "nucleus_cytoplasm_area_ratio__median",
+        "cell__feret_length__median",
+    }
+    assert set(importance_features["dose_ridge"]) == {
+        "ifn_dose",
+        "tnf_dose",
+        "ifn_x_tnf",
+    }
+    assert set(importance_features["dose_plus_morphology_ridge"]) == {
+        "ifn_dose",
+        "tnf_dose",
+        "ifn_x_tnf",
+        *PRIMARY_FOV_FEATURES,
+    }
+
+
+def test_nested_tuning_and_importance_are_deterministic_fold_diagnostics() -> None:
+    images = make_grouped_images()
+    splits = make_outer_splits(images)[:1]
+    model_names = ["paper_linear_3f", "ridge", "rbf_svr", "random_forest"]
+
+    first = run_nested_benchmark(
+        images,
+        {"basic_median": list(PRIMARY_FOV_FEATURES)},
+        splits,
+        make_tiny_config(),
+        model_names=model_names,
+    )
+    second = run_nested_benchmark(
+        images,
+        {"basic_median": list(PRIMARY_FOV_FEATURES)},
+        splits,
+        make_tiny_config(),
+        model_names=model_names,
+    )
+
+    pd.testing.assert_frame_equal(first.hyperparameters, second.hyperparameters)
+    assert first.hyperparameters["best_params_json"].map(json.loads).map(dict).map(
+        bool
+    ).tolist() == [
+        False,
+        True,
+        True,
+        True,
+    ]
+    importance_types = first.feature_importance.groupby("model")[
+        "importance_type"
+    ].unique()
+    assert importance_types["paper_linear_3f"].tolist() == ["standardized_coefficient"]
+    assert importance_types["ridge"].tolist() == ["standardized_coefficient"]
+    assert importance_types["rbf_svr"].tolist() == ["outer_test_permutation_diagnostic"]
+    assert importance_types["random_forest"].tolist() == [
+        "outer_test_permutation_diagnostic"
+    ]
+
+
+def test_nonfinite_predictions_are_recorded_as_fold_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    images = make_grouped_images()
+    split = make_outer_splits(images)[:1]
+
+    def predict_nonfinite(self: DummyRegressor, values: object) -> np.ndarray:
+        """模擬 estimator 回傳非有限預測。"""
+        return np.full(len(values), np.nan)
+
+    monkeypatch.setattr(DummyRegressor, "predict", predict_nonfinite)
+    result = run_nested_benchmark(
+        images,
+        {"basic_median": list(PRIMARY_FOV_FEATURES)},
+        split,
+        make_tiny_config(),
+        model_names=["dummy_median", "paper_linear_3f"],
+    )
+
+    assert set(result.predictions["model"]) == {"paper_linear_3f"}
+    assert result.fold_metrics.set_index("model")["status"].to_dict() == {
+        "dummy_median": "failed",
+        "paper_linear_3f": "success",
+    }
+    assert result.failures[["model", "exception_type"]].to_dict("records") == [
+        {"model": "dummy_median", "exception_type": "ValueError"}
+    ]
+    assert "有限" in result.failures.iloc[0]["message"]
+
+
+@pytest.mark.parametrize(
+    "predictors",
+    [
+        ["IDO_score"],
+        list(PRIMARY_FOV_FEATURES[:-1]),
+        [*PRIMARY_FOV_FEATURES[:-1], "ifn_dose"],
+    ],
+)
+def test_benchmark_rejects_leaking_or_nonexact_basic_median_features(
+    predictors: list[str],
+) -> None:
+    images = make_grouped_images()
+
+    with pytest.raises(ValueError, match="basic_median.*33.*phase-only"):
+        run_nested_benchmark(
+            images,
+            {"basic_median": predictors},
+            make_outer_splits(images)[:1],
+            make_tiny_config(),
+            model_names=["ridge"],
+        )
