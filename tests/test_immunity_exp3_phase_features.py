@@ -801,6 +801,24 @@ def test_mask_cache_path_rejects_resolved_parent_outside_masks_root(
         )
 
 
+def _create_directory_link(link: Path, target: Path) -> None:
+    """建立測試用 directory symlink，Windows 權限不足時改用 junction。"""
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        import os
+        import subprocess
+
+        if os.name != "nt":
+            raise
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
 def test_mask_cache_path_rejects_symlinked_group_outside_masks_root(
     tmp_path: Path,
 ) -> None:
@@ -810,11 +828,29 @@ def test_mask_cache_path_rejects_symlinked_group_outside_masks_root(
     masks_root.mkdir(parents=True)
     outside.mkdir()
     linked_group = masks_root / "B4_P5"
-    try:
-        linked_group.symlink_to(outside, target_is_directory=True)
-    except OSError as error:
-        pytest.skip(f"目前平台無法建立測試 symlink：{error}")
+    _create_directory_link(linked_group, outside)
     escaped_path = outside / "B4_P5_C01_F01.npz"
+
+    with pytest.raises(ValueError, match="mask_path"):
+        phase_features._validate_exp3_mask_cache_path(
+            escaped_path,
+            cache_dir,
+            "B4_P5",
+            "B4_P5_C01_F01",
+        )
+
+
+def test_mask_cache_path_rejects_masks_root_linked_outside_cache(
+    tmp_path: Path,
+) -> None:
+    cache_dir = tmp_path / "feature_cache"
+    outside = tmp_path / "outside-masks"
+    cache_dir.mkdir()
+    outside.mkdir()
+    _create_directory_link(cache_dir / "masks", outside)
+    group_dir = outside / "B4_P5"
+    group_dir.mkdir()
+    escaped_path = group_dir / "B4_P5_C01_F01.npz"
 
     with pytest.raises(ValueError, match="mask_path"):
         phase_features._validate_exp3_mask_cache_path(

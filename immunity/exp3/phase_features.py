@@ -777,7 +777,10 @@ def _validate_exp3_mask_cache_path(
     except ValueError as error:
         raise ValueError(f"mask_path component 不合法：{error}") from error
     candidate = Path(value).resolve(strict=False)
-    masks_root = (cache_dir / "masks").resolve(strict=False)
+    resolved_cache_dir = cache_dir.resolve(strict=False)
+    masks_root = (resolved_cache_dir / "masks").resolve(strict=False)
+    if masks_root.parent != resolved_cache_dir:
+        raise ValueError("mask_path masks root 必須是 Exp3 feature cache 的直接子目錄")
     expected = (
         masks_root / group_id / f"{image_key}.npz"
     ).resolve(strict=False)
