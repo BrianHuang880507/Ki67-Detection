@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 import pytest
@@ -20,13 +22,35 @@ from immunity.exp3.benchmark import (
     OOF_COLUMNS,
     OuterSplit,
     build_model_registry,
+    condition_adjust_targets,
+    fit_final_phase_model,
     make_inner_splits,
     make_outer_splits,
     outer_split_manifest,
     regression_metrics,
+    rank_phase_models,
     run_nested_benchmark,
+    run_condition_adjusted_sensitivity,
+    select_winner,
 )
 from immunity.exp3.feature_sets import PRIMARY_FOV_FEATURES
+
+
+VALIDATIONS = (
+    "leave_one_b_out",
+    "leave_one_passage_out",
+    "leave_one_group_out",
+    "leave_one_condition_out",
+)
+CANDIDATE_MODELS = (
+    "paper_linear_3f",
+    "ridge",
+    "elasticnet",
+    "rbf_svr",
+    "hist_gradient_boosting",
+    "random_forest",
+    "extra_trees",
+)
 
 
 def make_grouped_images() -> pd.DataFrame:
@@ -80,6 +104,461 @@ def make_tiny_config() -> dict[str, object]:
             "extra_trees",
         ],
     }
+
+
+def make_ranking_fixture(
+    fold_counts: tuple[int, int, int, int] = (1, 1, 1, 1),
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """建立七個 candidates 與 Dummy 都通過基本完整性的 ranking fixture。"""
+    metric_rows: list[dict[str, object]] = []
+    prediction_rows: list[dict[str, object]] = []
+    counts = dict(zip(VALIDATIONS, fold_counts, strict=True))
+    for validation, fold_count in counts.items():
+        for fold in range(1, fold_count + 1):
+            for model_index, model in enumerate((*CANDIDATE_MODELS, "dummy_median")):
+                candidate = model != "dummy_median"
+                mae = 0.5 + model_index / 10 if candidate else 2.0
+                metric_rows.append(
+                    {
+                        "validation": validation,
+                        "fold": str(fold),
+                        "split_id": f"{validation}:{fold}",
+                        "model": model,
+                        "role": "candidate" if candidate else "diagnostic",
+                        "feature_set": (
+                            "paper_linear_3f"
+                            if model == "paper_linear_3f"
+                            else "basic_median" if candidate else "none"
+                        ),
+                        "mae": mae,
+                        "rmse": mae,
+                        "r2": 0.2 if candidate else -0.1,
+                        "spearman": 0.5 if candidate else 0.0,
+                        "observed_sd": 1.0,
+                        "prediction_sd": 0.8 if candidate else 0.0,
+                        "status": "ok",
+                    }
+                )
+                predicted = [0.1, 1.0, 1.9] if candidate else [1.0, 1.0, 1.0]
+                for observed, prediction in zip([0.0, 1.0, 2.0], predicted, strict=True):
+                    prediction_rows.append(
+                        {
+                            "validation": validation,
+                            "fold": str(fold),
+                            "split_id": f"{validation}:{fold}",
+                            "model": model,
+                            "observed_ido_score": observed,
+                            "predicted_ido_score": prediction,
+                        }
+                    )
+    return pd.DataFrame(metric_rows), pd.DataFrame(prediction_rows)
+
+
+def test_ranking_contains_only_seven_candidates_with_equal_validation_weights() -> None:
+    metrics, predictions = make_ranking_fixture((3, 3, 9, 8))
+
+    ranking = rank_phase_models(metrics, predictions, pd.DataFrame(), make_tiny_config())
+
+    assert ranking["model"].tolist() == list(CANDIDATE_MODELS)
+    assert "dummy_median" not in set(ranking["model"])
+    for validation in VALIDATIONS:
+        assert ranking[f"{validation}_weight"].eq(0.25).all()
+    paper = ranking.set_index("model").loc["paper_linear_3f"]
+    assert paper["average_rank"] == pytest.approx(1.0)
+    assert paper["overall_rank"] == paper["average_rank"]
+    assert paper["eligible"]
+    assert paper["winner"]
+    assert select_winner(ranking) == "paper_linear_3f"
+
+
+def test_five_eligibility_gates_are_individually_auditable() -> None:
+    metrics, predictions = make_ranking_fixture()
+    bad_model = metrics["model"].eq("ridge")
+    metrics.loc[bad_model, ["mae", "rmse"]] = 3.0
+    metrics.loc[bad_model, "r2"] = -0.5
+    constant = predictions["model"].eq("ridge") & predictions["validation"].eq(
+        "leave_one_group_out"
+    )
+    predictions.loc[constant, "predicted_ido_score"] = 1.0
+    missing = metrics["model"].eq("extra_trees") & metrics["validation"].eq(
+        "leave_one_condition_out"
+    )
+    metrics = metrics.loc[~missing].copy()
+    config = make_tiny_config()
+    config["feature_sets"] = {
+        "basic_median": [*PRIMARY_FOV_FEATURES[:-1], "IDO_score"]
+    }
+
+    ranking = rank_phase_models(metrics, predictions, pd.DataFrame(), config)
+    by_model = ranking.set_index("model")
+
+    ridge = by_model.loc["ridge"]
+    assert not ridge["mae_beats_dummy_gate"]
+    assert not ridge["positive_r2_gate"]
+    assert ridge["complete_outer_folds_gate"]
+    assert not ridge["phase_only_feature_gate"]
+    assert not ridge["prediction_sd_gate"]
+    assert not ridge["leave_one_group_out_prediction_sd_gate"]
+    assert len(json.loads(ridge["ineligibility_reasons_json"])) == 4
+    assert by_model.loc["paper_linear_3f", "phase_only_feature_gate"]
+    assert not by_model.loc["extra_trees", "complete_outer_folds_gate"]
+
+
+def test_failed_outer_fold_is_ineligible_even_when_metric_values_exist() -> None:
+    metrics, predictions = make_ranking_fixture()
+    failed = metrics["model"].eq("ridge") & metrics["validation"].eq(
+        "leave_one_b_out"
+    )
+    metrics.loc[failed, "status"] = "failed"
+    failures = metrics.loc[failed, ["validation", "fold", "split_id", "model"]].copy()
+    failures["exception_type"] = "RuntimeError"
+    failures["message"] = "synthetic"
+    missing_predictions = predictions["model"].eq("elasticnet") & predictions[
+        "validation"
+    ].eq("leave_one_passage_out")
+    predictions = predictions.loc[~missing_predictions].copy()
+
+    ranking = rank_phase_models(metrics, predictions, failures, make_tiny_config())
+
+    ridge = ranking.set_index("model").loc["ridge"]
+    assert not ridge["complete_outer_folds_gate"]
+    assert not ridge["eligible"]
+    assert "failed_or_missing_outer_folds" in json.loads(
+        ridge["ineligibility_reasons_json"]
+    )
+    assert not ranking.set_index("model").loc[
+        "elasticnet", "complete_outer_folds_gate"
+    ]
+
+
+def test_no_eligible_model_does_not_force_a_winner() -> None:
+    metrics, predictions = make_ranking_fixture()
+    candidate = metrics["role"].eq("candidate")
+    metrics.loc[candidate, ["mae", "rmse"]] = 3.0
+    metrics.loc[candidate, "r2"] = -0.5
+    predictions.loc[
+        predictions["model"].isin(CANDIDATE_MODELS), "predicted_ido_score"
+    ] = 1.0
+
+    ranking = rank_phase_models(metrics, predictions, pd.DataFrame(), make_tiny_config())
+
+    assert not ranking["eligible"].any()
+    assert ranking["winner"].eq(False).all()
+    assert select_winner(ranking) is None
+
+
+def test_tie_within_quarter_rank_uses_worst_validation_rank_first() -> None:
+    metrics, predictions = make_ranking_fixture()
+    patterns = {
+        "paper_linear_3f": [0.5, 0.5, 0.5, 0.7],
+        "ridge": [0.6, 0.6, 0.6, 0.5],
+        "elasticnet": [0.7, 0.7, 0.7, 0.6],
+    }
+    for model, values in patterns.items():
+        for validation, mae in zip(VALIDATIONS, values, strict=True):
+            selected = metrics["model"].eq(model) & metrics["validation"].eq(validation)
+            metrics.loc[selected, ["mae", "rmse"]] = mae
+
+    ranking = rank_phase_models(metrics, predictions, pd.DataFrame(), make_tiny_config())
+    by_model = ranking.set_index("model")
+
+    assert by_model.loc["paper_linear_3f", "average_rank"] == pytest.approx(1.5)
+    assert by_model.loc["ridge", "average_rank"] == pytest.approx(1.75)
+    assert by_model.loc["paper_linear_3f", "worst_validation_rank"] == 3.0
+    assert by_model.loc["ridge", "worst_validation_rank"] == 2.0
+    assert by_model.loc["ridge", "tied_with_best"]
+    assert select_winner(ranking) == "ridge"
+
+
+def test_tie_break_audit_uses_lobo_then_spearman_then_simplicity() -> None:
+    metrics, predictions = make_ranking_fixture()
+    rank_patterns = {
+        "paper_linear_3f": [0.5, 0.6, 0.5, 0.6],
+        "ridge": [0.6, 0.5, 0.6, 0.5],
+    }
+    for model, values in rank_patterns.items():
+        for validation, mae in zip(VALIDATIONS, values, strict=True):
+            selected = metrics["model"].eq(model) & metrics["validation"].eq(validation)
+            metrics.loc[selected, ["mae", "rmse"]] = mae
+    paper_predictions = predictions["model"].eq("paper_linear_3f")
+    predictions.loc[paper_predictions, "predicted_ido_score"] = np.tile(
+        [0.0, 2.0, 1.0], paper_predictions.sum() // 3
+    )
+
+    lobo_ranking = rank_phase_models(
+        metrics, predictions, pd.DataFrame(), make_tiny_config()
+    )
+    assert select_winner(lobo_ranking) == "paper_linear_3f"
+    audit = lobo_ranking.set_index("model")
+    assert audit.loc["paper_linear_3f", "leave_one_b_out_mae"] < audit.loc[
+        "ridge", "leave_one_b_out_mae"
+    ]
+    assert audit.loc["paper_linear_3f", "overall_oof_spearman"] < audit.loc[
+        "ridge", "overall_oof_spearman"
+    ]
+
+    equal = metrics["model"].isin(["paper_linear_3f", "ridge"])
+    metrics.loc[equal, ["mae", "rmse"]] = 0.5
+    spearman_ranking = rank_phase_models(
+        metrics, predictions, pd.DataFrame(), make_tiny_config()
+    )
+    assert select_winner(spearman_ranking) == "ridge"
+
+    predictions.loc[paper_predictions, "predicted_ido_score"] = np.tile(
+        [0.1, 1.0, 1.9], paper_predictions.sum() // 3
+    )
+    simplicity_ranking = rank_phase_models(
+        metrics, predictions, pd.DataFrame(), make_tiny_config()
+    )
+    assert select_winner(simplicity_ranking) == "paper_linear_3f"
+    assert simplicity_ranking.set_index("model").loc[
+        "paper_linear_3f", "simplicity_rank"
+    ] == 0
+
+
+def test_condition_adjustment_uses_outer_training_means_only() -> None:
+    training = pd.DataFrame(
+        {
+            "condition_index": [1, 1, 2, 2],
+            "IDO_score": [1.0, 3.0, 10.0, 14.0],
+        }
+    )
+    testing = pd.DataFrame(
+        {"condition_index": [1, 2], "IDO_score": [5.0, 20.0]}
+    )
+
+    train_residual, test_residual = condition_adjust_targets(training, testing)
+
+    assert train_residual.groupby(training["condition_index"]).mean().abs().max() < 1e-12
+    np.testing.assert_allclose(test_residual, [3.0, 8.0])
+    shifted_test = testing.copy()
+    shifted_test["IDO_score"] += 1000.0
+    _, shifted_residual = condition_adjust_targets(training, shifted_test)
+    np.testing.assert_allclose(shifted_residual, test_residual + 1000.0)
+
+
+def test_condition_adjustment_rejects_condition_absent_from_outer_training() -> None:
+    training = pd.DataFrame({"condition_index": [1, 1], "IDO_score": [1.0, 3.0]})
+    testing = pd.DataFrame({"condition_index": [2], "IDO_score": [5.0]})
+
+    with pytest.raises(ValueError, match="outer training.*condition"):
+        condition_adjust_targets(training, testing)
+
+
+def test_condition_sensitivity_runs_three_non_loco_families_without_ranking_input() -> None:
+    images = make_grouped_images()
+    all_splits = make_outer_splits(images)
+    splits = [
+        next(split for split in all_splits if split.validation == validation)
+        for validation in VALIDATIONS
+    ]
+
+    metrics = run_condition_adjusted_sensitivity(
+        images,
+        {"basic_median": list(PRIMARY_FOV_FEATURES)},
+        splits,
+        make_tiny_config(),
+        ["paper_linear_3f"],
+    )
+
+    assert set(metrics["validation"]) == set(VALIDATIONS[:3])
+    assert "leave_one_condition_out" not in set(metrics["validation"])
+    assert metrics["analysis"].eq("training_condition_mean_residual").all()
+    assert metrics["model"].eq("paper_linear_3f").all()
+    assert metrics["status"].eq("ok").all()
+
+    raw_metrics, predictions = make_ranking_fixture()
+    raw_metrics["analysis"] = "raw_ido"
+    sensitivity_rows = raw_metrics[
+        raw_metrics["model"].eq("paper_linear_3f")
+        & raw_metrics["validation"].eq("leave_one_b_out")
+    ].copy()
+    sensitivity_rows["analysis"] = "training_condition_mean_residual"
+    sensitivity_rows[["mae", "rmse"]] = 0.0
+    combined = pd.concat([raw_metrics, sensitivity_rows, sensitivity_rows], ignore_index=True)
+    ranking = rank_phase_models(combined, predictions, pd.DataFrame(), make_tiny_config())
+    assert ranking.set_index("model").loc[
+        "paper_linear_3f", "leave_one_b_out_mae"
+    ] == pytest.approx(0.5)
+
+
+def _patch_exp3_output_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path]:
+    """將 production output guard 指向測試專用 Exp3 根目錄。"""
+    from immunity.exp3 import run_benchmark
+
+    output_root = tmp_path / "immunity" / "outputs" / "exp3"
+    output_dir = output_root / "test-run"
+    monkeypatch.setattr(run_benchmark, "EXP3_OUTPUT_ROOT", output_root.resolve())
+    return output_root, output_dir
+
+
+def _create_directory_link(link: Path, target: Path) -> None:
+    """建立測試用 directory symlink，Windows 權限不足時改用 junction。"""
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        import os
+        import subprocess
+
+        if os.name != "nt":
+            raise
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_no_winner_creates_no_final_model_or_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_root, output_dir = _patch_exp3_output_root(tmp_path, monkeypatch)
+
+    result = fit_final_phase_model(
+        make_grouped_images(),
+        None,
+        {"basic_median": list(PRIMARY_FOV_FEATURES)},
+        make_tiny_config(),
+        output_dir,
+    )
+
+    assert result is None
+    assert not output_root.exists()
+
+
+@pytest.mark.parametrize(
+    "winner",
+    ["dummy_median", "dose_ridge", "dose_plus_morphology_ridge", "unknown"],
+)
+def test_final_fit_rejects_diagnostics_and_non_candidates_before_writing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    winner: str,
+) -> None:
+    output_root, output_dir = _patch_exp3_output_root(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="eligible phase-only candidate"):
+        fit_final_phase_model(
+            make_grouped_images(),
+            winner,
+            {"basic_median": list(PRIMARY_FOV_FEATURES)},
+            make_tiny_config(),
+            output_dir,
+        )
+
+    assert not output_root.exists()
+
+
+def test_final_fit_requires_declared_eligibility_and_exact_phase_whitelist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_root, output_dir = _patch_exp3_output_root(tmp_path, monkeypatch)
+    config = make_tiny_config()
+    config["eligible_phase_models"] = ["paper_linear_3f"]
+
+    with pytest.raises(ValueError, match="eligible phase-only candidate"):
+        fit_final_phase_model(
+            make_grouped_images(),
+            "ridge",
+            {"basic_median": list(PRIMARY_FOV_FEATURES)},
+            config,
+            output_dir,
+        )
+    with pytest.raises(ValueError, match="精確 33 個 PRIMARY phase-only"):
+        fit_final_phase_model(
+            make_grouped_images(),
+            "ridge",
+            {"basic_median": [*PRIMARY_FOV_FEATURES[:-1], "delta_IDO_score"]},
+            make_tiny_config(),
+            output_dir,
+        )
+
+    assert not output_root.exists()
+
+
+def test_final_fit_writes_auditable_bundle_inside_validated_exp3_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, output_dir = _patch_exp3_output_root(tmp_path, monkeypatch)
+    images = make_grouped_images()
+    images.attrs["manifest_hash"] = "synthetic-manifest-hash"
+    config = make_tiny_config()
+    config["eligible_phase_models"] = ["ridge"]
+
+    model_path = fit_final_phase_model(
+        images,
+        "ridge",
+        {"basic_median": list(PRIMARY_FOV_FEATURES)},
+        config,
+        output_dir,
+    )
+
+    assert model_path == output_dir / "models" / "ridge.joblib"
+    bundle = joblib.load(model_path)
+    assert isinstance(bundle["pipeline"], TransformedTargetRegressor)
+    assert bundle["model"] == "ridge"
+    assert bundle["feature_columns"] == list(PRIMARY_FOV_FEATURES)
+    assert bundle["target"] == "image-level background-corrected IDO proxy"
+    assert bundle["manifest_hash"] == "synthetic-manifest-hash"
+    assert len(bundle["config_hash"]) == 64
+    assert bundle["training_scope"] == "all_fov_rows_grouped_inner_tuning"
+    metadata = json.loads((output_dir / "final_model.json").read_text("utf-8"))
+    assert metadata["model"] == "ridge"
+    assert metadata["model_path"] == "models/ridge.joblib"
+    assert metadata["best_params"]
+    assert metadata["feature_columns"] == list(PRIMARY_FOV_FEATURES)
+
+
+def test_final_untuned_paper_model_writes_standard_json_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, output_dir = _patch_exp3_output_root(tmp_path, monkeypatch)
+    config = make_tiny_config()
+    config["eligible_phase_models"] = ["paper_linear_3f"]
+
+    model_path = fit_final_phase_model(
+        make_grouped_images(),
+        "paper_linear_3f",
+        {"basic_median": list(PRIMARY_FOV_FEATURES)},
+        config,
+        output_dir,
+    )
+
+    bundle = joblib.load(model_path)
+    assert bundle["feature_columns"] == [
+        "cell__perimeter__median",
+        "nucleus_cytoplasm_area_ratio__median",
+        "cell__feret_length__median",
+    ]
+    metadata = json.loads((output_dir / "final_model.json").read_text("utf-8"))
+    assert metadata["best_params"] == {}
+    assert metadata["inner_best_mae"] is None
+
+
+def test_final_fit_rejects_paths_outside_exp3_and_linked_model_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, output_dir = _patch_exp3_output_root(tmp_path, monkeypatch)
+    images = make_grouped_images()
+    feature_sets = {"basic_median": list(PRIMARY_FOV_FEATURES)}
+    config = make_tiny_config()
+    config["eligible_phase_models"] = ["ridge"]
+
+    with pytest.raises(ValueError, match="Exp3 output"):
+        fit_final_phase_model(images, "ridge", feature_sets, config, tmp_path / "legacy")
+
+    output_dir.mkdir(parents=True)
+    outside = tmp_path / "outside-models"
+    outside.mkdir()
+    _create_directory_link(output_dir / "models", outside)
+    with pytest.raises(ValueError, match="symlink|junction"):
+        fit_final_phase_model(images, "ridge", feature_sets, config, output_dir)
+
+    assert not any(outside.iterdir())
+    assert not (output_dir / "final_model.json").exists()
 
 
 def test_outer_splits_have_expected_counts_disjoint_groups_and_full_coverage() -> None:
