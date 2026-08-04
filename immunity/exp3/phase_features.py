@@ -18,7 +18,6 @@ from skimage.measure import regionprops
 
 from immunity.exp3.feature_sets import (
     BASIC_GEOMETRY,
-    FEATURE_SET_REGISTRY,
     PAPER_STYLE_EXTRA_FEATURES,
     PRIMARY_CELL_FEATURES,
     _feature_cache_dir_from_output,

@@ -304,6 +304,100 @@ def test_delta_emits_seven_contrasts_for_each_of_nine_groups() -> None:
     assert delta.groupby("group_id").size().eq(7).all()
 
 
+def test_delta_zero_global_iqr_and_zero_delta_scales_to_zero() -> None:
+    conditions = (
+        (0.0, 0.0),
+        (25.0, 0.0),
+        (50.0, 0.0),
+        (100.0, 0.0),
+        (0.0, 25.0),
+        (0.0, 50.0),
+        (25.0, 25.0),
+        (25.0, 50.0),
+    )
+    images = pd.DataFrame(
+        [
+            {
+                "group_id": "B4_P5",
+                "ifn_dose": ifn,
+                "tnf_dose": tnf,
+                "cell__area__median": 5.0,
+            }
+            for ifn, tnf in conditions
+        ]
+    )
+
+    delta = calculate_delta_signatures(images, ["cell__area__median"])
+
+    assert delta["global_iqr"].eq(0.0).all()
+    assert delta["delta_raw"].eq(0.0).all()
+    assert delta["delta_scaled_by_global_iqr"].eq(0.0).all()
+
+
+def test_delta_nonzero_delta_with_zero_global_iqr_is_fatal() -> None:
+    conditions = (
+        (0.0, 0.0),
+        (25.0, 0.0),
+        (50.0, 0.0),
+        (100.0, 0.0),
+        (0.0, 25.0),
+        (0.0, 50.0),
+        (25.0, 25.0),
+        (25.0, 50.0),
+    )
+    images = pd.DataFrame(
+        [
+            {
+                "group_id": "B4_P5",
+                "ifn_dose": ifn,
+                "tnf_dose": tnf,
+                "cell__area__median": 1.0 if index == 7 else 0.0,
+            }
+            for index, (ifn, tnf) in enumerate(conditions)
+        ]
+    )
+
+    with pytest.raises(ValueError, match="global IQR.*cell__area__median"):
+        calculate_delta_signatures(images, ["cell__area__median"])
+
+
+def test_delta_rejects_empty_images() -> None:
+    images = pd.DataFrame(
+        columns=["group_id", "ifn_dose", "tnf_dose", "cell__area__median"]
+    )
+
+    with pytest.raises(ValueError, match="images 不可為空"):
+        calculate_delta_signatures(images, ["cell__area__median"])
+
+
+@pytest.mark.parametrize("group_id", [None, "", "   "])
+def test_delta_rejects_null_or_blank_group_id(group_id: object) -> None:
+    conditions = (
+        (0.0, 0.0),
+        (25.0, 0.0),
+        (50.0, 0.0),
+        (100.0, 0.0),
+        (0.0, 25.0),
+        (0.0, 50.0),
+        (25.0, 25.0),
+        (25.0, 50.0),
+    )
+    images = pd.DataFrame(
+        [
+            {
+                "group_id": group_id,
+                "ifn_dose": ifn,
+                "tnf_dose": tnf,
+                "cell__area__median": float(index),
+            }
+            for index, (ifn, tnf) in enumerate(conditions)
+        ]
+    )
+
+    with pytest.raises(ValueError, match="group_id.*空"):
+        calculate_delta_signatures(images, ["cell__area__median"])
+
+
 def test_aggregate_fov_features_uses_medians_only_and_writes_internal_cache(
     tmp_path: Path,
     monkeypatch,

@@ -196,7 +196,8 @@ def calculate_delta_signatures(
         每個群組、contrast 與 feature 一列的長格式描述表。
 
     Raises:
-        ValueError: 輸入欄位缺漏、feature 不合法，或任一群組缺少預定條件時拋出。
+        ValueError: 輸入為空、欄位或 ``group_id`` 不合法、任一群組缺少預定條件，
+            或 delta/global-IQR scaling 無法得到有限值時拋出。
     """
     features = tuple(str(column) for column in feature_columns)
     if not features:
@@ -208,11 +209,21 @@ def calculate_delta_signatures(
     missing = sorted(required - set(images.columns))
     if missing:
         raise ValueError(f"ΔMorphology 輸入缺少欄位：{missing}")
+    if images.empty:
+        raise ValueError("ΔMorphology images 不可為空")
+    group_ids = images["group_id"].astype("string")
+    if (group_ids.isna() | group_ids.fillna("").str.strip().eq("")).any():
+        raise ValueError("ΔMorphology group_id 不可為 null 或空白")
 
     global_iqrs = {
         feature: _finite_iqr(images[feature].to_numpy(dtype=float))
         for feature in features
     }
+    for feature, global_iqr in global_iqrs.items():
+        if not np.isfinite(global_iqr):
+            raise ValueError(
+                f"ΔMorphology global IQR 必須是有限值；feature={feature!r}"
+            )
     rows: list[dict[str, object]] = []
     for group_id, group in images.groupby("group_id", sort=False):
         condition_rows = {
@@ -243,7 +254,25 @@ def calculate_delta_signatures(
                         "必須是有限值"
                     )
                 delta_raw = treated_median - control_median
+                if not np.isfinite(delta_raw):
+                    raise ValueError(
+                        f"group_id {group_id!r} 的 {feature!r} delta 必須是有限值"
+                    )
                 global_iqr = global_iqrs[feature]
+                if global_iqr == 0.0:
+                    if delta_raw != 0.0:
+                        raise ValueError(
+                            "ΔMorphology global IQR 為 0，"
+                            f"feature {feature!r} 的非零 delta 無法縮放"
+                        )
+                    scaled_delta = 0.0
+                else:
+                    scaled_delta = delta_raw / global_iqr
+                    if not np.isfinite(scaled_delta):
+                        raise ValueError(
+                            f"group_id {group_id!r} 的 {feature!r} "
+                            "scaled delta 必須是有限值"
+                        )
                 rows.append(
                     {
                         "group_id": str(group_id),
@@ -253,11 +282,7 @@ def calculate_delta_signatures(
                         "treated_median": treated_median,
                         "delta_raw": delta_raw,
                         "global_iqr": global_iqr,
-                        "delta_scaled_by_global_iqr": (
-                            delta_raw / global_iqr
-                            if np.isfinite(global_iqr) and global_iqr > 0.0
-                            else np.nan
-                        ),
+                        "delta_scaled_by_global_iqr": scaled_delta,
                         "comparison_type": "group_level_unpaired",
                     }
                 )
