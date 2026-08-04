@@ -802,7 +802,8 @@ def rank_phase_models(
         fold_metrics: Outer-fold metrics；condition-adjusted rows 會被排除。
         predictions: Raw-target outer-test OOF predictions。
         failures: Outer-fold failure records。
-        config: 含 ``simplicity_order``，並可含 ``feature_sets`` 的設定。
+        config: 含 ``simplicity_order``、actual ``feature_sets`` 與 canonical
+            ``expected_outer_split_ids`` 的設定。
 
     Returns:
         每個 phase-only candidate 一列的可稽核 ranking，包含五項 eligibility
@@ -827,15 +828,17 @@ def rank_phase_models(
 
     raw_metrics = _raw_analysis_rows(fold_metrics)
     raw_predictions = _raw_analysis_rows(predictions)
-    raw_metrics = _with_split_ids(raw_metrics)
-    raw_predictions = _with_split_ids(raw_predictions)
+    raw_failures = _raw_analysis_rows(failures)
+    oof_evidence_available = {"split_id", "n_test"}.issubset(
+        raw_metrics.columns
+    ) and {"split_id", "image_key"}.issubset(raw_predictions.columns)
     candidate_metrics = raw_metrics[raw_metrics["model"].isin(_PHASE_CANDIDATES)]
     ok_metrics = candidate_metrics[candidate_metrics["status"].eq("ok")]
 
-    expected_splits = {
-        validation: _expected_validation_splits(raw_metrics, validation)
-        for validation in _RANKING_VALIDATIONS
-    }
+    expected_splits = _configured_expected_splits(config)
+    dummy_complete = _metrics_complete_for_model(
+        raw_metrics, "dummy_median", expected_splits
+    )
     validation_summaries: dict[str, pd.DataFrame] = {}
     for validation in _RANKING_VALIDATIONS:
         family = ok_metrics[ok_metrics["validation"].eq(validation)]
@@ -860,6 +863,17 @@ def rank_phase_models(
         mae_wins = 0
         positive_r2 = 0
         prediction_sd_checks: list[bool] = []
+        validated_predictions = {
+            validation: _validated_oof_predictions(
+                raw_metrics,
+                raw_predictions,
+                model,
+                validation,
+                expected_splits,
+                oof_evidence_available,
+            )
+            for validation in _RANKING_VALIDATIONS
+        }
         for validation in _RANKING_VALIDATIONS:
             summary = validation_summaries[validation]
             if model in summary.index:
@@ -877,7 +891,7 @@ def rank_phase_models(
                 positive_r2 += 1
 
             observed_sd, prediction_sd, prediction_gate = _prediction_sd_check(
-                raw_predictions, model, validation
+                validated_predictions[validation]
             )
             prediction_sd_checks.append(prediction_gate)
             row.update(
@@ -898,11 +912,11 @@ def rank_phase_models(
             dtype=float,
         )
         complete_gate = _complete_outer_folds_gate(
-            raw_metrics, raw_predictions, failures, model, expected_splits
+            raw_failures, model, validated_predictions
         )
         feature_gate = _phase_feature_gate(model, raw_metrics, config)
         gates = {
-            "mae_beats_dummy_gate": mae_wins >= 3,
+            "mae_beats_dummy_gate": dummy_complete and mae_wins >= 3,
             "positive_r2_gate": positive_r2 >= 2,
             "complete_outer_folds_gate": complete_gate,
             "phase_only_feature_gate": feature_gate,
@@ -937,7 +951,7 @@ def rank_phase_models(
                 ),
                 "leave_one_b_out_mae": row["leave_one_b_out_mae"],
                 "overall_oof_spearman": _overall_oof_spearman(
-                    raw_predictions, model
+                    validated_predictions
                 ),
                 "simplicity_rank": simplicity[model],
                 "tie_threshold": 0.25,
@@ -1111,7 +1125,7 @@ def fit_final_phase_model(
         images: 全部 image-level FOV rows。
         winner: ``select_winner`` 回傳的 candidate name；``None`` 表示 no winner。
         feature_sets: Exact phase-only feature whitelist mapping。
-        config: Deterministic tuning 設定；可含 ``eligible_phase_models``。
+        config: Deterministic tuning 設定；必須含合法 ``eligible_phase_models``。
         output_dir: 已驗證的 ``immunity/outputs/exp3`` 內部目錄。
 
     Returns:
@@ -1125,9 +1139,9 @@ def fit_final_phase_model(
     registry = build_model_registry(config)
     if winner not in _PHASE_CANDIDATES or registry[winner].role != "candidate":
         raise ValueError("winner 必須是 eligible phase-only candidate")
-    declared_eligible = config.get("eligible_phase_models")
-    if declared_eligible is not None and winner not in list(declared_eligible):
-        raise ValueError("winner 必須是 eligible phase-only candidate")
+    declared_eligible = _validated_eligible_phase_models(config)
+    if winner not in declared_eligible:
+        raise ValueError("eligible_phase_models 不包含指定 winner")
     _validate_images(images)
     _validate_benchmark_metadata(images)
     _validate_candidate_feature_sets(feature_sets, [winner], registry)
@@ -1198,9 +1212,14 @@ def fit_final_phase_model(
 
     safe_output_dir.mkdir(parents=True, exist_ok=True)
     model_dir.mkdir(parents=False, exist_ok=True)
-    _assert_unlinked_final_path(model_dir, safe_output_dir / "models")
-    _write_joblib_atomically(bundle, model_path)
-    _write_json_atomically(metadata, metadata_path)
+    _publish_final_artifact_pair(
+        bundle,
+        metadata,
+        safe_output_dir,
+        model_dir,
+        model_path,
+        metadata_path,
+    )
     return model_path
 
 
@@ -1212,21 +1231,33 @@ def _raw_analysis_rows(frame: pd.DataFrame) -> pd.DataFrame:
     return frame[analysis.isna() | analysis.astype(str).isin(_RAW_ANALYSES)].copy()
 
 
-def _with_split_ids(metrics: pd.DataFrame) -> pd.DataFrame:
-    """在 fixture 未提供 split_id 時建立可稽核 identity。"""
-    if "split_id" in metrics.columns:
-        return metrics.copy()
-    if "fold" not in metrics.columns:
-        raise ValueError("ranking input 必須提供 split_id 或 fold")
-    result = metrics.copy()
-    result["split_id"] = result["validation"].astype(str) + ":" + result["fold"].astype(str)
-    return result
-
-
-def _expected_validation_splits(metrics: pd.DataFrame, validation: str) -> set[str]:
-    """以所有 model rows 的 union 定義該 validation 預期 outer folds。"""
-    family = metrics[metrics["validation"].eq(validation)]
-    return set(family["split_id"].astype(str))
+def _configured_expected_splits(
+    config: Mapping[str, Any],
+) -> dict[str, set[str]] | None:
+    """驗證 config 提供的 canonical outer split identities。"""
+    configured = config.get("expected_outer_split_ids")
+    if not isinstance(configured, Mapping):
+        return None
+    if set(configured) != set(_RANKING_VALIDATIONS):
+        return None
+    expected: dict[str, set[str]] = {}
+    for validation in _RANKING_VALIDATIONS:
+        values = configured[validation]
+        if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+            return None
+        split_ids = [str(value) for value in values]
+        if (
+            not split_ids
+            or len(split_ids) != len(set(split_ids))
+            or any(
+                not split_id.startswith(f"{validation}:")
+                or split_id == f"{validation}:"
+                for split_id in split_ids
+            )
+        ):
+            return None
+        expected[validation] = set(split_ids)
+    return expected
 
 
 def _dummy_validation_mae(metrics: pd.DataFrame, validation: str) -> float:
@@ -1241,20 +1272,19 @@ def _dummy_validation_mae(metrics: pd.DataFrame, validation: str) -> float:
 
 
 def _prediction_sd_check(
-    predictions: pd.DataFrame,
-    model: str,
-    validation: str,
+    predictions: pd.DataFrame | None,
 ) -> tuple[float, float, bool]:
     """計算單一 validation 的 OOF SD 與 5% non-degeneration gate。"""
-    rows = predictions[
-        predictions["model"].eq(model) & predictions["validation"].eq(validation)
-    ]
-    observed = pd.to_numeric(rows["observed_ido_score"], errors="coerce").to_numpy(
+    if predictions is None:
+        return np.nan, np.nan, False
+    observed = pd.to_numeric(
+        predictions["observed_ido_score"], errors="coerce"
+    ).to_numpy(
         dtype=float
     )
-    predicted = pd.to_numeric(rows["predicted_ido_score"], errors="coerce").to_numpy(
-        dtype=float
-    )
+    predicted = pd.to_numeric(
+        predictions["predicted_ido_score"], errors="coerce"
+    ).to_numpy(dtype=float)
     if (
         observed.size == 0
         or predicted.size != observed.size
@@ -1268,35 +1298,98 @@ def _prediction_sd_check(
 
 
 def _complete_outer_folds_gate(
-    metrics: pd.DataFrame,
-    predictions: pd.DataFrame,
     failures: pd.DataFrame,
     model: str,
-    expected_splits: Mapping[str, set[str]],
+    validated_predictions: Mapping[str, pd.DataFrame | None],
 ) -> bool:
-    """拒絕任何 failed、duplicated 或 missing outer fold。"""
-    model_rows = metrics[metrics["model"].eq(model)]
+    """拒絕 raw failure 或任何 metric/OOF evidence 不完整的 candidate。"""
     if not failures.empty and "model" in failures.columns:
         if failures["model"].astype(str).eq(model).any():
             return False
+    return all(
+        validated_predictions.get(validation) is not None
+        for validation in _RANKING_VALIDATIONS
+    )
+
+
+def _metrics_complete_for_model(
+    metrics: pd.DataFrame,
+    model: str,
+    expected_splits: Mapping[str, set[str]] | None,
+) -> bool:
+    """驗證 model 每個 canonical split 恰有一列 successful metric。"""
+    if expected_splits is None or not {"split_id", "n_test"}.issubset(metrics.columns):
+        return False
     for validation in _RANKING_VALIDATIONS:
-        expected = expected_splits[validation]
-        rows = model_rows[model_rows["validation"].eq(validation)]
-        actual = set(rows["split_id"].astype(str))
-        prediction_rows = predictions[
-            predictions["model"].eq(model)
-            & predictions["validation"].eq(validation)
-        ]
-        predicted_splits = set(prediction_rows["split_id"].astype(str))
-        if (
-            not expected
-            or actual != expected
-            or predicted_splits != expected
-            or len(rows) != len(expected)
-            or not rows["status"].eq("ok").all()
+        if not _metric_rows_complete_for_validation(
+            metrics, model, validation, expected_splits[validation]
         ):
             return False
     return True
+
+
+def _metric_rows_complete_for_validation(
+    metrics: pd.DataFrame,
+    model: str,
+    validation: str,
+    expected: set[str],
+) -> bool:
+    """驗證單一 model/validation 的 metric identity、status 與 n_test。"""
+    rows = metrics[
+        metrics["model"].eq(model) & metrics["validation"].eq(validation)
+    ]
+    split_ids = rows["split_id"].astype(str)
+    n_test = pd.to_numeric(rows["n_test"], errors="coerce").to_numpy(dtype=float)
+    return bool(
+        len(rows) == len(expected)
+        and not split_ids.duplicated().any()
+        and set(split_ids) == expected
+        and rows["status"].eq("ok").all()
+        and np.isfinite(n_test).all()
+        and np.all(n_test >= 1)
+        and np.all(n_test == np.floor(n_test))
+    )
+
+
+def _validated_oof_predictions(
+    metrics: pd.DataFrame,
+    predictions: pd.DataFrame,
+    model: str,
+    validation: str,
+    expected_splits: Mapping[str, set[str]] | None,
+    evidence_available: bool,
+) -> pd.DataFrame | None:
+    """只在逐 split OOF identity 與 n_test 完整時回傳可用 predictions。"""
+    if not evidence_available or expected_splits is None:
+        return None
+    expected = expected_splits[validation]
+    if not _metric_rows_complete_for_validation(
+        metrics, model, validation, expected
+    ):
+        return None
+    metric_rows = metrics[
+        metrics["model"].eq(model) & metrics["validation"].eq(validation)
+    ].set_index("split_id")
+    rows = predictions[
+        predictions["model"].eq(model)
+        & predictions["validation"].eq(validation)
+    ].copy()
+    if rows.empty or rows[["split_id", "image_key"]].isna().any().any():
+        return None
+    rows["split_id"] = rows["split_id"].astype(str)
+    rows["image_key"] = rows["image_key"].astype(str)
+    if (
+        set(rows["split_id"]) != expected
+        or rows["image_key"].str.strip().eq("").any()
+        or rows.duplicated(["split_id", "image_key"]).any()
+    ):
+        return None
+    for split_id in expected:
+        prediction_count = int(rows["split_id"].eq(split_id).sum())
+        n_test = int(metric_rows.loc[split_id, "n_test"])
+        if prediction_count != n_test:
+            return None
+    return rows
 
 
 def _phase_feature_gate(
@@ -1312,16 +1405,21 @@ def _phase_feature_gate(
         if identities and identities != {expected_set}:
             return False
     configured = config.get("feature_sets")
-    if configured is not None and not isinstance(configured, Mapping):
+    if not isinstance(configured, Mapping):
+        return False
+    basic_columns = configured.get("basic_median")
+    if not isinstance(basic_columns, Sequence) or isinstance(
+        basic_columns, (str, bytes)
+    ):
+        return False
+    if tuple(str(column) for column in basic_columns) != tuple(PRIMARY_FOV_FEATURES):
         return False
     if model == "paper_linear_3f":
         columns = (
             configured[expected_set]
-            if configured is not None and expected_set in configured
+            if expected_set in configured
             else _PAPER_FEATURES
         )
-    elif configured is None:
-        columns = PRIMARY_FOV_FEATURES
     elif expected_set in configured:
         columns = configured[expected_set]
     else:
@@ -1331,9 +1429,23 @@ def _phase_feature_gate(
     return tuple(columns) == tuple(expected)
 
 
-def _overall_oof_spearman(predictions: pd.DataFrame, model: str) -> float:
+def _overall_oof_spearman(
+    validated_predictions: Mapping[str, pd.DataFrame | None],
+) -> float:
     """計算四 validation raw OOF predictions 的整體 Spearman。"""
-    rows = predictions[predictions["model"].eq(model)]
+    if any(
+        validated_predictions.get(validation) is None
+        for validation in _RANKING_VALIDATIONS
+    ):
+        return np.nan
+    rows = pd.concat(
+        [
+            validated_predictions[validation]
+            for validation in _RANKING_VALIDATIONS
+            if validated_predictions[validation] is not None
+        ],
+        ignore_index=True,
+    )
     observed = pd.to_numeric(rows["observed_ido_score"], errors="coerce").to_numpy(
         dtype=float
     )
@@ -1350,6 +1462,19 @@ def _overall_oof_spearman(predictions: pd.DataFrame, model: str) -> float:
     ):
         return np.nan
     return float(spearmanr(observed, predicted).statistic)
+
+
+def _validated_eligible_phase_models(config: Mapping[str, Any]) -> tuple[str, ...]:
+    """驗證 final fit 所需的非空且不重複 eligible candidate evidence。"""
+    value = config.get("eligible_phase_models")
+    if not isinstance(value, list) or not value:
+        raise ValueError("eligible_phase_models 必須是非空 model name list")
+    names = [str(name) for name in value]
+    if len(names) != len(set(names)):
+        raise ValueError("eligible_phase_models 不可重複")
+    if any(name not in _PHASE_CANDIDATES for name in names):
+        raise ValueError("eligible_phase_models 只能包含 phase-only candidates")
+    return tuple(names)
 
 
 def _simplicity_ranks(config: Mapping[str, Any]) -> dict[str, int]:
@@ -1435,46 +1560,145 @@ def _image_manifest_hash(images: pd.DataFrame) -> str:
     return _stable_hash(records)
 
 
-def _write_joblib_atomically(bundle: Mapping[str, Any], path: Path) -> None:
-    """在 validated model directory 內原子寫入 joblib bundle。"""
+def _publish_final_artifact_pair(
+    bundle: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+    output_dir: Path,
+    model_dir: Path,
+    model_path: Path,
+    metadata_path: Path,
+) -> None:
+    """以可 rollback transaction 同步發布 final model 與 metadata。"""
+    temporary_model: Path | None = None
+    temporary_metadata: Path | None = None
+    backups: dict[Path, Path] = {}
+    published: set[Path] = set()
+    try:
+        temporary_model = _stage_joblib_bundle(bundle, model_dir)
+        temporary_metadata = _stage_json_metadata(metadata, output_dir)
+        _validate_final_publish_paths(
+            output_dir, model_dir, model_path, metadata_path
+        )
+
+        for final_path in (model_path, metadata_path):
+            if final_path.exists():
+                backup = _reserve_backup_path(final_path)
+                os.replace(final_path, backup)
+                backups[final_path] = backup
+
+        os.replace(temporary_model, model_path)
+        temporary_model = None
+        published.add(model_path)
+        os.replace(temporary_metadata, metadata_path)
+        temporary_metadata = None
+        published.add(metadata_path)
+    except Exception:
+        for final_path in published:
+            if final_path.exists():
+                final_path.unlink()
+        for final_path, backup in reversed(list(backups.items())):
+            if final_path.exists():
+                final_path.unlink()
+            if backup.exists():
+                os.replace(backup, final_path)
+        raise
+    finally:
+        for temporary_path in (temporary_model, temporary_metadata):
+            if temporary_path is not None and temporary_path.exists():
+                temporary_path.unlink()
+        for backup in backups.values():
+            if backup.exists():
+                backup.unlink()
+
+
+def _stage_joblib_bundle(bundle: Mapping[str, Any], directory: Path) -> Path:
+    """完整寫入並回讀驗證尚未發布的 joblib bundle。"""
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
-            suffix=".joblib", dir=path.parent, delete=False
+            prefix=".final-model-",
+            suffix=".joblib.tmp",
+            dir=directory,
+            delete=False,
         ) as temporary:
             temporary_path = Path(temporary.name)
         joblib.dump(dict(bundle), temporary_path)
-        os.replace(temporary_path, path)
-    finally:
+        loaded = joblib.load(temporary_path)
+        if not isinstance(loaded, Mapping) or loaded.get("model") != bundle.get("model"):
+            raise ValueError("staged final model bundle 驗證失敗")
+        return temporary_path
+    except Exception:
         if temporary_path is not None and temporary_path.exists():
             temporary_path.unlink()
+        raise
 
 
-def _write_json_atomically(payload: Mapping[str, Any], path: Path) -> None:
-    """在 validated output directory 內原子寫入 UTF-8 JSON metadata。"""
+def _stage_json_metadata(payload: Mapping[str, Any], directory: Path) -> Path:
+    """完整寫入並回讀驗證尚未發布的標準 JSON metadata。"""
     temporary_path: Path | None = None
+    normalized = _json_compatible(payload)
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
             newline="",
-            suffix=".json",
-            dir=path.parent,
+            prefix=".final-model-",
+            suffix=".json.tmp",
+            dir=directory,
             delete=False,
         ) as temporary:
             temporary_path = Path(temporary.name)
             json.dump(
-                _json_compatible(payload),
+                normalized,
                 temporary,
                 ensure_ascii=False,
                 sort_keys=True,
                 indent=2,
+                allow_nan=False,
             )
             temporary.write("\n")
-        os.replace(temporary_path, path)
-    finally:
+        with temporary_path.open("r", encoding="utf-8") as handle:
+            if json.load(handle) != normalized:
+                raise ValueError("staged final model metadata 驗證失敗")
+        return temporary_path
+    except Exception:
         if temporary_path is not None and temporary_path.exists():
             temporary_path.unlink()
+        raise
+
+
+def _validate_final_publish_paths(
+    output_dir: Path,
+    model_dir: Path,
+    model_path: Path,
+    metadata_path: Path,
+) -> None:
+    """在 replace 前重新驗證所有 parent 與 final paths 未遭 link 置換。"""
+    _assert_unlinked_final_path(output_dir, output_dir)
+    _assert_unlinked_final_path(model_dir, output_dir / "models")
+    if _safe_final_path(model_dir, model_path.name, directory=False) != model_path:
+        raise ValueError("final model path 驗證失敗")
+    if (
+        _safe_final_path(output_dir, metadata_path.name, directory=False)
+        != metadata_path
+    ):
+        raise ValueError("final metadata path 驗證失敗")
+    for final_path in (model_path, metadata_path):
+        if final_path.exists() and not final_path.is_file():
+            raise ValueError("final artifact 必須是一般檔案")
+
+
+def _reserve_backup_path(final_path: Path) -> Path:
+    """在 final 同層保留唯一且尚未占用的 rollback backup path。"""
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{final_path.name}.",
+        suffix=".backup",
+        dir=final_path.parent,
+        delete=False,
+    ) as temporary:
+        backup = Path(temporary.name)
+    backup.unlink()
+    return backup
 
 
 def _validate_benchmark_metadata(images: pd.DataFrame) -> None:

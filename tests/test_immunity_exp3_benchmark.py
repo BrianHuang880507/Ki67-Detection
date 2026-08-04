@@ -103,11 +103,18 @@ def make_tiny_config() -> dict[str, object]:
             "random_forest",
             "extra_trees",
         ],
+        "feature_sets": {"basic_median": list(PRIMARY_FOV_FEATURES)},
+        "expected_outer_split_ids": {
+            validation: [f"{validation}:{fold}" for fold in range(1, fold_count + 1)]
+            for validation, fold_count in zip(
+                VALIDATIONS, (3, 3, 9, 8), strict=True
+            )
+        },
     }
 
 
 def make_ranking_fixture(
-    fold_counts: tuple[int, int, int, int] = (1, 1, 1, 1),
+    fold_counts: tuple[int, int, int, int] = (3, 3, 9, 8),
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """建立七個 candidates 與 Dummy 都通過基本完整性的 ranking fixture。"""
     metric_rows: list[dict[str, object]] = []
@@ -130,6 +137,7 @@ def make_ranking_fixture(
                             if model == "paper_linear_3f"
                             else "basic_median" if candidate else "none"
                         ),
+                        "n_test": 3,
                         "mae": mae,
                         "rmse": mae,
                         "r2": 0.2 if candidate else -0.1,
@@ -147,6 +155,7 @@ def make_ranking_fixture(
                             "fold": str(fold),
                             "split_id": f"{validation}:{fold}",
                             "model": model,
+                            "image_key": f"{validation}:{fold}:image-{int(observed)}",
                             "observed_ido_score": observed,
                             "predicted_ido_score": prediction,
                         }
@@ -169,6 +178,130 @@ def test_ranking_contains_only_seven_candidates_with_equal_validation_weights() 
     assert paper["eligible"]
     assert paper["winner"]
     assert select_winner(ranking) == "paper_linear_3f"
+
+
+def test_ranking_fails_feature_gate_without_actual_whitelist_evidence() -> None:
+    metrics, predictions = make_ranking_fixture()
+    config = make_tiny_config()
+    config.pop("feature_sets")
+
+    ranking = rank_phase_models(metrics, predictions, pd.DataFrame(), config)
+
+    assert not ranking["phase_only_feature_gate"].any()
+    assert not ranking["eligible"].any()
+    assert select_winner(ranking) is None
+
+
+def test_canonical_expected_folds_detect_when_every_model_misses_same_fold() -> None:
+    metrics, predictions = make_ranking_fixture()
+    missing_split = "leave_one_condition_out:8"
+    metrics = metrics[~metrics["split_id"].eq(missing_split)].copy()
+    predictions = predictions[~predictions["split_id"].eq(missing_split)].copy()
+
+    ranking = rank_phase_models(
+        metrics, predictions, pd.DataFrame(), make_tiny_config()
+    )
+
+    assert not ranking["complete_outer_folds_gate"].any()
+    assert not ranking["eligible"].any()
+
+
+@pytest.mark.parametrize("dummy_defect", ["missing", "failed"])
+def test_incomplete_dummy_fails_beat_dummy_gate(dummy_defect: str) -> None:
+    metrics, predictions = make_ranking_fixture()
+    selected = metrics["model"].eq("dummy_median") & metrics["split_id"].eq(
+        "leave_one_b_out:3"
+    )
+    if dummy_defect == "missing":
+        metrics = metrics.loc[~selected].copy()
+    else:
+        metrics.loc[selected, "status"] = "failed"
+
+    ranking = rank_phase_models(
+        metrics, predictions, pd.DataFrame(), make_tiny_config()
+    )
+
+    assert not ranking["mae_beats_dummy_gate"].any()
+    assert not ranking["eligible"].any()
+
+
+def test_invalid_expected_fold_evidence_fails_completeness_closed() -> None:
+    metrics, predictions = make_ranking_fixture()
+    invalid_configs: list[object] = [
+        None,
+        {},
+        {validation: [f"{validation}:1"] for validation in VALIDATIONS[:-1]},
+        {
+            **make_tiny_config()["expected_outer_split_ids"],
+            "leave_one_b_out": ["leave_one_b_out:1", "leave_one_b_out:1"],
+        },
+    ]
+
+    for invalid in invalid_configs:
+        config = make_tiny_config()
+        config["expected_outer_split_ids"] = invalid
+        ranking = rank_phase_models(metrics, predictions, pd.DataFrame(), config)
+        assert not ranking["complete_outer_folds_gate"].any()
+        assert not ranking["eligible"].any()
+
+
+def test_missing_oof_row_fails_exact_prediction_completeness() -> None:
+    metrics, predictions = make_ranking_fixture()
+    missing = predictions["model"].eq("ridge") & predictions["split_id"].eq(
+        "leave_one_group_out:9"
+    ) & predictions["image_key"].str.endswith("image-2")
+    predictions = predictions.loc[~missing].copy()
+
+    ranking = rank_phase_models(
+        metrics, predictions, pd.DataFrame(), make_tiny_config()
+    )
+    ridge = ranking.set_index("model").loc["ridge"]
+
+    assert not ridge["complete_outer_folds_gate"]
+    assert not ridge["prediction_sd_gate"]
+    assert np.isnan(ridge["overall_oof_spearman"])
+
+
+def test_duplicate_extreme_oof_row_fails_without_distorting_tie_fields() -> None:
+    metrics, predictions = make_ranking_fixture()
+    duplicate = predictions[
+        predictions["model"].eq("ridge")
+        & predictions["split_id"].eq("leave_one_b_out:1")
+    ].iloc[[0]].copy()
+    duplicate["predicted_ido_score"] = 1_000_000.0
+    predictions = pd.concat([predictions, duplicate], ignore_index=True)
+
+    ranking = rank_phase_models(
+        metrics, predictions, pd.DataFrame(), make_tiny_config()
+    )
+    ridge = ranking.set_index("model").loc["ridge"]
+
+    assert not ridge["complete_outer_folds_gate"]
+    assert not ridge["prediction_sd_gate"]
+    assert np.isnan(ridge["overall_oof_spearman"])
+
+
+@pytest.mark.parametrize(
+    ("table", "column"),
+    [("metrics", "n_test"), ("predictions", "split_id"), ("predictions", "image_key")],
+)
+def test_missing_oof_evidence_column_fails_prediction_gates_closed(
+    table: str, column: str
+) -> None:
+    metrics, predictions = make_ranking_fixture()
+    if table == "metrics":
+        metrics = metrics.drop(columns=column)
+    else:
+        predictions = predictions.drop(columns=column)
+
+    ranking = rank_phase_models(
+        metrics, predictions, pd.DataFrame(), make_tiny_config()
+    )
+    ridge = ranking.set_index("model").loc["ridge"]
+
+    assert not ridge["complete_outer_folds_gate"]
+    assert not ridge["prediction_sd_gate"]
+    assert np.isnan(ridge["overall_oof_spearman"])
 
 
 def test_five_eligibility_gates_are_individually_auditable() -> None:
@@ -200,7 +333,7 @@ def test_five_eligibility_gates_are_individually_auditable() -> None:
     assert not ridge["prediction_sd_gate"]
     assert not ridge["leave_one_group_out_prediction_sd_gate"]
     assert len(json.loads(ridge["ineligibility_reasons_json"])) == 4
-    assert by_model.loc["paper_linear_3f", "phase_only_feature_gate"]
+    assert not by_model.loc["paper_linear_3f", "phase_only_feature_gate"]
     assert not by_model.loc["extra_trees", "complete_outer_folds_gate"]
 
 
@@ -382,6 +515,30 @@ def test_condition_sensitivity_runs_three_non_loco_families_without_ranking_inpu
     ] == pytest.approx(0.5)
 
 
+def test_condition_sensitivity_failure_does_not_affect_raw_winner() -> None:
+    metrics, predictions = make_ranking_fixture()
+    failures = pd.DataFrame(
+        [
+            {
+                "validation": "leave_one_b_out",
+                "fold": "1",
+                "split_id": "leave_one_b_out:1",
+                "model": "paper_linear_3f",
+                "exception_type": "RuntimeError",
+                "message": "sensitivity only",
+                "analysis": "training_condition_mean_residual",
+            }
+        ]
+    )
+
+    ranking = rank_phase_models(metrics, predictions, failures, make_tiny_config())
+
+    paper = ranking.set_index("model").loc["paper_linear_3f"]
+    assert paper["complete_outer_folds_gate"]
+    assert paper["eligible"]
+    assert select_winner(ranking) == "paper_linear_3f"
+
+
 def _patch_exp3_output_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Path, Path]:
@@ -459,7 +616,7 @@ def test_final_fit_requires_declared_eligibility_and_exact_phase_whitelist(
     config = make_tiny_config()
     config["eligible_phase_models"] = ["paper_linear_3f"]
 
-    with pytest.raises(ValueError, match="eligible phase-only candidate"):
+    with pytest.raises(ValueError, match="eligible_phase_models"):
         fit_final_phase_model(
             make_grouped_images(),
             "ridge",
@@ -468,11 +625,39 @@ def test_final_fit_requires_declared_eligibility_and_exact_phase_whitelist(
             output_dir,
         )
     with pytest.raises(ValueError, match="精確 33 個 PRIMARY phase-only"):
+        exact_config = make_tiny_config()
+        exact_config["eligible_phase_models"] = ["ridge"]
         fit_final_phase_model(
             make_grouped_images(),
             "ridge",
             {"basic_median": [*PRIMARY_FOV_FEATURES[:-1], "delta_IDO_score"]},
-            make_tiny_config(),
+            exact_config,
+            output_dir,
+        )
+
+    assert not output_root.exists()
+
+
+@pytest.mark.parametrize(
+    "eligible_evidence",
+    ["missing", None, [], "ridge", {"ridge": True}, ["ridge", "ridge"], ["unknown"]],
+)
+def test_final_fit_fails_closed_without_valid_eligible_model_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    eligible_evidence: object,
+) -> None:
+    output_root, output_dir = _patch_exp3_output_root(tmp_path, monkeypatch)
+    config = make_tiny_config()
+    if eligible_evidence != "missing":
+        config["eligible_phase_models"] = eligible_evidence
+
+    with pytest.raises(ValueError, match="eligible_phase_models"):
+        fit_final_phase_model(
+            make_grouped_images(),
+            "ridge",
+            {"basic_median": list(PRIMARY_FOV_FEATURES)},
+            config,
             output_dir,
         )
 
@@ -559,6 +744,85 @@ def test_final_fit_rejects_paths_outside_exp3_and_linked_model_escape(
 
     assert not any(outside.iterdir())
     assert not (output_dir / "final_model.json").exists()
+
+
+def test_final_publish_failure_leaves_no_partial_artifact_on_clean_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, output_dir = _patch_exp3_output_root(tmp_path, monkeypatch)
+    config = make_tiny_config()
+    config["eligible_phase_models"] = ["ridge"]
+    model_path = output_dir / "models" / "ridge.joblib"
+    metadata_path = output_dir / "final_model.json"
+    real_replace = benchmark_module.os.replace
+    failed = False
+
+    def fail_metadata_publish_once(source: object, destination: object) -> None:
+        """只讓 new metadata publish 失敗一次，rollback 可正常執行。"""
+        nonlocal failed
+        if Path(destination) == metadata_path and not failed:
+            failed = True
+            raise OSError("synthetic metadata publish failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(benchmark_module.os, "replace", fail_metadata_publish_once)
+    with pytest.raises(OSError, match="synthetic metadata publish failure"):
+        fit_final_phase_model(
+            make_grouped_images(),
+            "ridge",
+            {"basic_median": list(PRIMARY_FOV_FEATURES)},
+            config,
+            output_dir,
+        )
+
+    assert failed
+    assert not model_path.exists()
+    assert not metadata_path.exists()
+    assert not [path for path in output_dir.rglob("*") if path.is_file()]
+
+
+def test_final_publish_failure_restores_existing_model_and_metadata_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, output_dir = _patch_exp3_output_root(tmp_path, monkeypatch)
+    config = make_tiny_config()
+    config["eligible_phase_models"] = ["ridge"]
+    model_path = output_dir / "models" / "ridge.joblib"
+    metadata_path = output_dir / "final_model.json"
+    model_path.parent.mkdir(parents=True)
+    old_model = b"old-model-generation"
+    old_metadata = '{"generation":"old"}\n'
+    model_path.write_bytes(old_model)
+    metadata_path.write_text(old_metadata, encoding="utf-8")
+    real_replace = benchmark_module.os.replace
+    failed = False
+
+    def fail_metadata_publish_once(source: object, destination: object) -> None:
+        """模擬第二個 final replace 失敗，後續 rollback 不再攔截。"""
+        nonlocal failed
+        if Path(destination) == metadata_path and not failed:
+            failed = True
+            raise OSError("synthetic metadata publish failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(benchmark_module.os, "replace", fail_metadata_publish_once)
+    with pytest.raises(OSError, match="synthetic metadata publish failure"):
+        fit_final_phase_model(
+            make_grouped_images(),
+            "ridge",
+            {"basic_median": list(PRIMARY_FOV_FEATURES)},
+            config,
+            output_dir,
+        )
+
+    assert failed
+    assert model_path.read_bytes() == old_model
+    assert metadata_path.read_text("utf-8") == old_metadata
+    assert sorted(
+        path.relative_to(output_dir).as_posix()
+        for path in output_dir.rglob("*")
+        if path.is_file()
+    ) == ["final_model.json", "models/ridge.joblib"]
 
 
 def test_outer_splits_have_expected_counts_disjoint_groups_and_full_coverage() -> None:
