@@ -151,10 +151,13 @@ def run_benchmark(
     """
     if not isinstance(config, Mapping):
         raise TypeError("Exp3 config 必須是 mapping")
+    config_evidence = _capture_config_evidence(config)
+    generation_config = dict(config)
+    generation_config["_config_evidence"] = config_evidence
     output_dir = _resolve_run_output(config, smoke_fovs_per_condition)
     _archive_previous_generation(output_dir)
     try:
-        return _run_benchmark_generation(config, smoke_fovs_per_condition)
+        return _run_benchmark_generation(generation_config, smoke_fovs_per_condition)
     except BaseException as error:
         try:
             _quarantine_failed_generation(output_dir)
@@ -190,6 +193,7 @@ def _run_benchmark_generation(
         raise TypeError("Exp3 config 必須是 mapping")
     started_at = datetime.now(timezone.utc)
     started_clock = time.perf_counter()
+    config_evidence = _required_config_evidence(config)
     output_dir = _resolve_run_output(config, smoke_fovs_per_condition)
     run_config = dict(config)
     run_config["_output_dir"] = str(output_dir)
@@ -331,12 +335,6 @@ def _run_benchmark_generation(
         benchmark_config,
         model_names=[*candidate_names, *diagnostic_names],
     )
-    if not primary.failures.empty:
-        _write_csv_atomically(primary.failures, output_dir / "model_failures.csv")
-        raise RuntimeError(
-            "model fold failure："
-            f"{primary.failures['message'].astype(str).tolist()}"
-        )
     condition_adjusted = run_condition_adjusted_sensitivity(
         images,
         feature_sets,
@@ -344,15 +342,6 @@ def _run_benchmark_generation(
         benchmark_config,
         model_names=candidate_names,
     )
-    if (
-        "status" in condition_adjusted.columns
-        and condition_adjusted["status"].eq("failed").any()
-    ):
-        _write_csv_atomically(
-            condition_adjusted,
-            output_dir / "condition_adjusted_metrics.csv",
-        )
-        raise RuntimeError("condition-adjusted model failure")
 
     evidence_config = dict(benchmark_config)
     evidence_config["feature_sets"] = {
@@ -404,12 +393,6 @@ def _run_benchmark_generation(
         round_two.feature_importance,
     )
     failures = _combine_round_frames(primary.failures, round_two.failures)
-    if not round_two.failures.empty:
-        _write_csv_atomically(failures, output_dir / "model_failures.csv")
-        raise RuntimeError(
-            "Round 2 model fold failure："
-            f"{round_two.failures['message'].astype(str).tolist()}"
-        )
 
     from immunity.exp3.reporting import (
         write_experiment_record,
@@ -446,7 +429,7 @@ def _run_benchmark_generation(
     write_figures(output_dir, primary_artifacts)
     final_config = dict(evidence_config)
     final_config["eligible_phase_models"] = eligible_phase_models
-    final_config["config_hash"] = _config_hash(config)[0]
+    final_config["config_hash"] = config_evidence["effective_config_hash"]
     final_config["manifest_hash"] = manifest_hash
     fit_final_phase_model(
         images,
@@ -458,14 +441,12 @@ def _run_benchmark_generation(
 
     ended_at = datetime.now(timezone.utc)
     elapsed_seconds = max(0.0, time.perf_counter() - started_clock)
-    config_hash, config_hash_source = _config_hash(config)
     metadata = _run_metadata(
         config=config,
         started_at=started_at,
         ended_at=ended_at,
         elapsed_seconds=elapsed_seconds,
-        config_hash=config_hash,
-        config_hash_source=config_hash_source,
+        config_evidence=config_evidence,
         manifest_hash=manifest_hash,
         enabled_feature_sets=enabled_feature_sets,
         smoke_fovs_per_condition=smoke_fovs_per_condition,
@@ -1084,6 +1065,10 @@ def _combine_round_frames(
     primary_round["round"] = "primary_round_1"
     exploratory_round = exploratory.copy()
     exploratory_round["round"] = "exploratory_round_2"
+    if primary_round.empty:
+        return exploratory_round.reset_index(drop=True)
+    if exploratory_round.empty:
+        return primary_round.reset_index(drop=True)
     return pd.concat([primary_round, exploratory_round], ignore_index=True)
 
 
@@ -1093,13 +1078,29 @@ def _sha256_bytes(value: bytes) -> str:
 
 
 def _config_hash(config: Mapping[str, Any]) -> tuple[str, str]:
-    """依原始 config bytes 或 canonical in-memory mapping 計算 SHA-256。"""
-    path_value = config.get("_config_path")
-    if isinstance(path_value, (str, Path)):
-        config_path = Path(path_value)
-        if config_path.is_file():
-            return _sha256_bytes(config_path.read_bytes()), "config_file_bytes"
+    """依 sanitized effective in-memory config 計算 SHA-256。"""
+    evidence = _capture_config_evidence(config)
+    return (
+        str(evidence["effective_config_hash"]),
+        str(evidence["config_hash_source"]),
+    )
+
+
+def _capture_config_evidence(config: Mapping[str, Any]) -> dict[str, Any]:
+    """在 run entry 凍結 effective config 與來源檔案證據。
+
+    Args:
+        config: 呼叫當下的完整 Exp3 設定；runtime 私有欄位不會發布。
+
+    Returns:
+        可由 strict JSON 重建的 sanitized snapshot、effective hash，以及入口時
+        原始設定檔的路徑與 bytes hash。
+    """
+    if not isinstance(config, Mapping):
+        raise TypeError("Exp3 config 必須是 mapping")
     canonical = _canonical_json_value(config)
+    if not isinstance(canonical, dict):
+        raise TypeError("effective config snapshot 必須是 mapping")
     payload = json.dumps(
         canonical,
         ensure_ascii=False,
@@ -1107,7 +1108,41 @@ def _config_hash(config: Mapping[str, Any]) -> tuple[str, str]:
         separators=(",", ":"),
         allow_nan=False,
     ).encode("utf-8")
-    return _sha256_bytes(payload), "canonical_in_memory_config"
+    path_value = config.get("_config_path")
+    entry_source = "in_memory_config"
+    entry_file_hash: str | None = None
+    if isinstance(path_value, (str, Path)):
+        config_path = Path(path_value).resolve(strict=False)
+        entry_source = str(config_path)
+        if config_path.is_file():
+            entry_file_hash = _sha256_bytes(config_path.read_bytes())
+    return {
+        "effective_config_snapshot": canonical,
+        "effective_config_hash": _sha256_bytes(payload),
+        "config_hash_source": "canonical_in_memory_config",
+        "entry_config_file_hash": entry_file_hash,
+        "entry_config_source": entry_source,
+    }
+
+
+def _required_config_evidence(config: Mapping[str, Any]) -> Mapping[str, Any]:
+    """取得入口凍結證據；直接呼叫 generation 時在該入口補捕捉。"""
+    evidence = config.get("_config_evidence")
+    if evidence is None:
+        return _capture_config_evidence(config)
+    if not isinstance(evidence, Mapping):
+        raise TypeError("_config_evidence 必須是 mapping")
+    required = {
+        "effective_config_snapshot",
+        "effective_config_hash",
+        "config_hash_source",
+        "entry_config_file_hash",
+        "entry_config_source",
+    }
+    missing = sorted(required - set(evidence))
+    if missing:
+        raise ValueError(f"_config_evidence 缺少欄位：{missing}")
+    return evidence
 
 
 def _canonical_json_value(value: Any) -> Any:
@@ -1116,7 +1151,7 @@ def _canonical_json_value(value: Any) -> Any:
         return {
             str(key): _canonical_json_value(item)
             for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-            if str(key) != "_segmenter" and not str(key).startswith("_runtime_")
+            if not str(key).startswith("_")
         }
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return [_canonical_json_value(item) for item in value]
@@ -1137,8 +1172,7 @@ def _run_metadata(
     started_at: datetime,
     ended_at: datetime,
     elapsed_seconds: float,
-    config_hash: str,
-    config_hash_source: str,
+    config_evidence: Mapping[str, Any],
     manifest_hash: str,
     enabled_feature_sets: Sequence[str],
     smoke_fovs_per_condition: int | None,
@@ -1149,6 +1183,10 @@ def _run_metadata(
 ) -> dict[str, Any]:
     """建立 strict-JSON-compatible reproducibility metadata。"""
     benchmark = _required_mapping(config, "benchmark")
+    effective_snapshot = _canonical_json_value(
+        config_evidence["effective_config_snapshot"]
+    )
+    effective_hash = str(config_evidence["effective_config_hash"])
     git_commit, dirty = _git_state()
     raw_pc = int(pd.to_numeric(pairing_qc["pc_count"], errors="raise").sum())
     raw_ido = int(pd.to_numeric(pairing_qc["ido_count"], errors="raise").sum())
@@ -1161,8 +1199,12 @@ def _run_metadata(
         "runtime_seconds": float(elapsed_seconds),
         "git_commit": git_commit,
         "dirty": dirty,
-        "config_hash": config_hash,
-        "config_hash_source": config_hash_source,
+        "config_hash": effective_hash,
+        "config_hash_source": str(config_evidence["config_hash_source"]),
+        "effective_config_hash": effective_hash,
+        "effective_config_snapshot": effective_snapshot,
+        "entry_config_file_hash": config_evidence["entry_config_file_hash"],
+        "entry_config_source": str(config_evidence["entry_config_source"]),
         "manifest_hash": manifest_hash,
         "python_version": platform.python_version(),
         "platform": platform.platform(),

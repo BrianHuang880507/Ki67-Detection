@@ -305,7 +305,15 @@ def _patch_eligible_winner_stages(
         (output_dir / "models").mkdir(exist_ok=True)
         (output_dir / "models" / "ridge.joblib").write_bytes(b"current-model")
         (output_dir / "final_model.json").write_text(
-            '{"winner":"ridge"}\n', encoding="utf-8"
+            json.dumps(
+                {
+                    "winner": winner,
+                    "config_hash": config["config_hash"],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
         )
 
     monkeypatch.setattr(
@@ -314,6 +322,69 @@ def _patch_eligible_winner_stages(
         publish_fake_model,
     )
     return fitted
+
+
+def _failure_result(model: str, message: str) -> object:
+    """建立單一 model/fold 失敗且可由 orchestration 發布的 evidence。"""
+    from immunity.exp3 import benchmark as benchmark_module
+
+    metric = pd.DataFrame(
+        [
+            {
+                "validation": "leave_one_b_out",
+                "fold": "B4",
+                "split_id": "leave_one_b_out:B4",
+                "model": model,
+                "role": (
+                    "candidate"
+                    if model
+                    in {
+                        "paper_linear_3f",
+                        "ridge",
+                        "elasticnet",
+                        "rbf_svr",
+                        "random_forest",
+                        "extra_trees",
+                        "hist_gradient_boosting",
+                    }
+                    else "diagnostic"
+                ),
+                "feature_set": "basic_median",
+                "n_train": 48,
+                "n_test": 24,
+                "mae": np.nan,
+                "rmse": np.nan,
+                "r2": np.nan,
+                "spearman": np.nan,
+                "observed_sd": 1.0,
+                "prediction_sd": np.nan,
+                "status": "failed",
+            }
+        ],
+        columns=benchmark_module.FOLD_METRIC_COLUMNS,
+    )
+    failure = pd.DataFrame(
+        [
+            {
+                "validation": "leave_one_b_out",
+                "fold": "B4",
+                "split_id": "leave_one_b_out:B4",
+                "model": model,
+                "exception_type": "RuntimeError",
+                "message": message,
+            }
+        ],
+        columns=benchmark_module.FAILURE_COLUMNS,
+    )
+    return benchmark_module.BenchmarkResult(
+        predictions=pd.DataFrame(columns=benchmark_module.OOF_COLUMNS),
+        fold_metrics=metric,
+        hyperparameters=pd.DataFrame(columns=benchmark_module.HYPERPARAMETER_COLUMNS),
+        feature_importance=pd.DataFrame(
+            columns=benchmark_module.FEATURE_IMPORTANCE_COLUMNS
+        ),
+        failures=failure,
+    )
 
 
 def test_exp3_output_must_stay_under_dedicated_root(tmp_path: Path) -> None:
@@ -408,6 +479,98 @@ def test_exp3_config_loads_without_running_pipeline() -> None:
     assert config["expected_totals"] == {"pc": 720, "ido": 719, "paired": 719}
     assert config["condition_mapping"] == {}
     assert config["feature_sets"]["enabled"] == ["basic_median"]
+
+
+def test_effective_config_hash_changes_after_loaded_mapping_is_edited(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Effective hash 必須反映 load 後正式 mapping，而非只反映原始檔 bytes。"""
+    output = (tmp_path / "output").resolve()
+    monkeypatch.setattr(run_module, "EXP3_OUTPUT_ROOT", output)
+    config_file = tmp_path / "exp3.json"
+    source = _base_test_config(output)
+    source.pop("_output_dir")
+    source.pop("_config_path")
+    source.update(
+        {
+            "datasets": [],
+            "expected_totals": {"pc": 0, "ido": 0, "paired": 0},
+        }
+    )
+    config_file.write_text(json.dumps(source), encoding="utf-8")
+    loaded = load_config(config_file)
+
+    before = run_module._capture_config_evidence(loaded)
+    loaded["condition_mapping"]["1"]["ifn_dose"] = 999.0
+    after = run_module._capture_config_evidence(loaded)
+
+    assert before["effective_config_hash"] != after["effective_config_hash"]
+    assert before["entry_config_file_hash"] == after["entry_config_file_hash"]
+    assert after["effective_config_snapshot"]["condition_mapping"]["1"][
+        "ifn_dose"
+    ] == 999.0
+    assert not any(
+        key.startswith("_") for key in after["effective_config_snapshot"]
+    )
+
+
+def test_run_reuses_entry_config_evidence_after_source_file_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """長時間執行中 config file 改變不得改寫本世代 provenance。"""
+    from immunity.exp3 import benchmark as benchmark_module
+
+    output = (tmp_path / "output").resolve()
+    monkeypatch.setattr(run_module, "EXP3_OUTPUT_ROOT", output)
+    config, segmenter = _make_synthetic_config(tmp_path, fovs_per_condition=1)
+    config["feature_sets"]["enabled"] = ["basic_median"]
+    config["_segmenter"] = segmenter
+    config["_runtime_secret"] = "must-not-publish"
+    config_file = tmp_path / "effective-exp3.yaml"
+    original_bytes = b"entry-generation-config\n"
+    config_file.write_bytes(original_bytes)
+    config["_config_path"] = str(config_file)
+    expected = run_module._capture_config_evidence(config)
+    fitted = _patch_eligible_winner_stages(monkeypatch)
+    empty_result = benchmark_module.BenchmarkResult(
+        predictions=pd.DataFrame(columns=benchmark_module.OOF_COLUMNS),
+        fold_metrics=pd.DataFrame(columns=benchmark_module.FOLD_METRIC_COLUMNS),
+        hyperparameters=pd.DataFrame(columns=benchmark_module.HYPERPARAMETER_COLUMNS),
+        feature_importance=pd.DataFrame(
+            columns=benchmark_module.FEATURE_IMPORTANCE_COLUMNS
+        ),
+        failures=pd.DataFrame(columns=benchmark_module.FAILURE_COLUMNS),
+    )
+
+    def mutate_source_during_primary(*args: object, **kwargs: object) -> object:
+        config_file.write_bytes(b"different-config-during-run\n")
+        return empty_result
+
+    monkeypatch.setattr(
+        benchmark_module,
+        "run_nested_benchmark",
+        mutate_source_during_primary,
+    )
+
+    record = run_module.run_benchmark(config)
+
+    metadata = json.loads((output / "run_metadata.json").read_text("utf-8"))
+    final_model = json.loads((output / "final_model.json").read_text("utf-8"))
+    assert record.is_file() and fitted == ["ridge"]
+    assert metadata["effective_config_hash"] == expected["effective_config_hash"]
+    assert metadata["config_hash"] == expected["effective_config_hash"]
+    assert metadata["entry_config_file_hash"] == hashlib.sha256(
+        original_bytes
+    ).hexdigest()
+    assert metadata["entry_config_source"] == str(config_file.resolve())
+    assert metadata["effective_config_snapshot"] == expected[
+        "effective_config_snapshot"
+    ]
+    assert "_segmenter" not in metadata["effective_config_snapshot"]
+    assert "_runtime_secret" not in metadata["effective_config_snapshot"]
+    assert final_model["config_hash"] == metadata["config_hash"]
 
 
 def test_empty_mapping_writes_pairing_qc_then_stops(
@@ -655,83 +818,127 @@ def test_smoke_pipeline_writes_recomputable_isolated_outputs_without_cellpose(
     }
 
 
-def test_model_failure_writes_failure_evidence_then_stops(
+@pytest.mark.parametrize(
+    ("failed_model", "winner"),
+    [
+        ("ridge", "elasticnet"),
+        ("dose_ridge", "ridge"),
+    ],
+)
+def test_primary_fold_failure_is_evidence_not_generation_abort(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    failed_model: str,
+    winner: str,
 ) -> None:
-    """實際 orchestration 偵測 fold failure 時不可發布成功 record。"""
+    """Candidate 失敗只使該 model 不合格；diagnostic 失敗不污染排名。"""
     from immunity.exp3 import benchmark as benchmark_module
 
-    output = (tmp_path / "output").resolve()
-    monkeypatch.setattr(run_module, "EXP3_OUTPUT_ROOT", output)
-    _seed_stale_generation(output)
-    config, segmenter = _make_synthetic_config(tmp_path, fovs_per_condition=1)
-    config["feature_sets"]["enabled"] = ["basic_median"]
-    config["_segmenter"] = segmenter
-
-    failure = pd.DataFrame(
-        [
-            {
-                "validation": "leave_one_b_out",
-                "fold": "B4",
-                "split_id": "leave_one_b_out:B4",
-                "model": "ridge",
-                "exception_type": "RuntimeError",
-                "message": "synthetic fold failure",
-            }
-        ],
-        columns=benchmark_module.FAILURE_COLUMNS,
-    )
-    failed_result = benchmark_module.BenchmarkResult(
-        predictions=pd.DataFrame(columns=benchmark_module.OOF_COLUMNS),
-        fold_metrics=pd.DataFrame(columns=benchmark_module.FOLD_METRIC_COLUMNS),
-        hyperparameters=pd.DataFrame(columns=benchmark_module.HYPERPARAMETER_COLUMNS),
-        feature_importance=pd.DataFrame(
-            columns=benchmark_module.FEATURE_IMPORTANCE_COLUMNS
-        ),
-        failures=failure,
-    )
-    monkeypatch.setattr(
-        benchmark_module,
-        "run_nested_benchmark",
-        lambda *args, **kwargs: failed_result,
-    )
-
-    with pytest.raises(RuntimeError, match="model.*failure"):
-        run_module.run_benchmark(config)
-
-    failures = pd.read_csv(output / "model_failures.csv")
-    assert failures["message"].tolist() == ["synthetic fold failure"]
-    _assert_stale_generation_archived(output)
-    _assert_no_current_success_artifacts(output)
-    assert not (output / "EXPERIMENT_RECORD.md").exists()
-
-
-def test_round_two_failure_happens_before_final_model_publication(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Eligible winner 不得在 Round2 成功前發布 final model。"""
     output = (tmp_path / "output").resolve()
     monkeypatch.setattr(run_module, "EXP3_OUTPUT_ROOT", output)
     config, segmenter = _make_synthetic_config(tmp_path, fovs_per_condition=1)
     config["feature_sets"]["enabled"] = ["basic_median"]
     config["_segmenter"] = segmenter
     fitted = _patch_eligible_winner_stages(monkeypatch)
+    result = _failure_result(failed_model, "synthetic fold failure")
+    ranking = pd.DataFrame(
+        [
+            {
+                "model": winner,
+                "eligible": True,
+                "winner": True,
+                "overall_rank": 1.0,
+                "worst_validation_rank": 1.0,
+                "leave_one_b_out_mae": 1.0,
+                "overall_oof_spearman": 0.8,
+                "simplicity_rank": 2.0,
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        benchmark_module,
+        "run_nested_benchmark",
+        lambda *args, **kwargs: result,
+    )
+    monkeypatch.setattr(
+        benchmark_module,
+        "rank_phase_models",
+        lambda *args, **kwargs: ranking.copy(),
+    )
 
-    def fail_round_two(**kwargs: object) -> object:
-        raise RuntimeError("synthetic Round 2 failure")
+    record = run_module.run_benchmark(config)
 
-    monkeypatch.setattr(run_module, "_run_round_two", fail_round_two)
+    failures = pd.read_csv(output / "model_failures.csv")
+    assert failures["message"].tolist() == ["synthetic fold failure"]
+    published_ranking = pd.read_csv(output / "model_ranking.csv")
+    assert published_ranking["model"].tolist() == [winner]
+    assert not published_ranking["model"].isin(
+        ["dummy_median", "dose_ridge", "dose_plus_morphology_ridge"]
+    ).any()
+    assert fitted == [winner]
+    assert record == output / "EXPERIMENT_RECORD.md"
+    assert record.is_file()
 
-    with pytest.raises(RuntimeError, match="Round 2 failure"):
-        run_module.run_benchmark(config)
 
-    assert fitted == []
-    _assert_no_current_success_artifacts(output)
-    assert (output / "pairing_qc.csv").is_file()
-    assert (output / "data_manifest.csv").is_file()
-    assert (output / "segmentation_qc.csv").is_file()
+def test_condition_adjusted_failure_is_published_as_sensitivity_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Condition-adjusted failed rows 不得阻止 raw eligible winner 發布。"""
+    from immunity.exp3 import benchmark as benchmark_module
+
+    output = (tmp_path / "output").resolve()
+    monkeypatch.setattr(run_module, "EXP3_OUTPUT_ROOT", output)
+    config, segmenter = _make_synthetic_config(tmp_path, fovs_per_condition=1)
+    config["feature_sets"]["enabled"] = ["basic_median"]
+    config["_segmenter"] = segmenter
+    fitted = _patch_eligible_winner_stages(monkeypatch)
+    adjusted = _failure_result("ridge", "condition sensitivity failure").fold_metrics
+    adjusted["analysis"] = "training_condition_mean_residual"
+    monkeypatch.setattr(
+        benchmark_module,
+        "run_condition_adjusted_sensitivity",
+        lambda *args, **kwargs: adjusted,
+    )
+
+    record = run_module.run_benchmark(config)
+
+    published = pd.read_csv(output / "condition_adjusted_metrics.csv")
+    assert published["status"].tolist() == ["failed"]
+    assert published["analysis"].tolist() == [
+        "training_condition_mean_residual"
+    ]
+    assert fitted == ["ridge"]
+    assert record.is_file()
+
+
+def test_round_two_fold_failure_is_published_as_exploratory_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round2 failed rows 不得推翻 Round1 raw eligible winner。"""
+    from immunity.exp3 import benchmark as benchmark_module
+
+    output = (tmp_path / "output").resolve()
+    monkeypatch.setattr(run_module, "EXP3_OUTPUT_ROOT", output)
+    config, segmenter = _make_synthetic_config(tmp_path, fovs_per_condition=1)
+    config["_segmenter"] = segmenter
+    fitted = _patch_eligible_winner_stages(monkeypatch)
+    round_two = _failure_result("ridge", "synthetic Round 2 fold failure")
+    round_two.fold_metrics["feature_set"] = "basic_median_iqr"
+
+    monkeypatch.setattr(run_module, "_run_round_two", lambda **kwargs: round_two)
+
+    record = run_module.run_benchmark(config)
+
+    failures = pd.read_csv(output / "model_failures.csv")
+    metrics = pd.read_csv(output / "fold_metrics.csv")
+    assert failures["message"].tolist() == ["synthetic Round 2 fold failure"]
+    assert failures["round"].tolist() == ["exploratory_round_2"]
+    exploratory = metrics[metrics["round"].eq("exploratory_round_2")]
+    assert exploratory["status"].tolist() == ["failed"]
+    assert fitted == ["ridge"]
+    assert record.is_file()
 
 
 def test_reporting_failure_happens_before_final_model_publication(
