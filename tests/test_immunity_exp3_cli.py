@@ -137,6 +137,8 @@ def _create_directory_link(link: Path, target: Path) -> None:
 class SyntheticSegmenter:
     """只以檔名條件建立 deterministic synthetic masks。"""
 
+    cache_signature = "synthetic-segmenter-v1"
+
     def segment(self, path: Path) -> tuple[np.ndarray, np.ndarray]:
         """回傳一組完全位於 whole-cell 內的 labels。"""
         condition = int(path.stem.split("-", maxsplit=1)[0])
@@ -803,6 +805,47 @@ def test_record_writer_failure_quarantines_model_and_partial_record(
     assert list((output / "_generations").glob("failed-*"))
 
 
+def test_keyboard_interrupt_quarantines_current_success_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非 Exception 中斷也必須隔離本世代已發布的成功 artifacts。"""
+    output = (tmp_path / "output").resolve()
+    monkeypatch.setattr(run_module, "EXP3_OUTPUT_ROOT", output)
+    config = _base_test_config(output)
+
+    def interrupt_after_publication(
+        config: object,
+        smoke_fovs_per_condition: object = None,
+    ) -> Path:
+        (output / "fold_metrics.csv").write_text("current\n", encoding="utf-8")
+        (output / "final_model.json").write_text("{}\n", encoding="utf-8")
+        (output / "EXPERIMENT_RECORD.md").write_text(
+            "current record\n", encoding="utf-8"
+        )
+        (output / "figures").mkdir()
+        (output / "figures" / "current.png").write_bytes(b"current")
+        (output / "models").mkdir()
+        (output / "models" / "current.joblib").write_bytes(b"current")
+        raise KeyboardInterrupt("synthetic user interrupt")
+
+    monkeypatch.setattr(
+        run_module,
+        "_run_benchmark_generation",
+        interrupt_after_publication,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="synthetic user interrupt"):
+        run_module.run_benchmark(config)
+
+    _assert_no_current_success_artifacts(output)
+    failed = list((output / "_generations").glob("failed-*"))
+    assert len(failed) == 1
+    assert (failed[0] / "fold_metrics.csv").is_file()
+    assert (failed[0] / "EXPERIMENT_RECORD.md").is_file()
+    assert (failed[0] / "models" / "current.joblib").is_file()
+
+
 @pytest.mark.parametrize(
     ("message", "exception_type"),
     [
@@ -970,6 +1013,84 @@ def test_round_two_top_models_apply_quarter_rank_tie_band() -> None:
     )
 
     assert selected == ["elasticnet", "random_forest"]
+
+
+def test_round_two_ignores_configured_tie_threshold_override() -> None:
+    """Round2 tie band 固定 0.25，benchmark config 不得縮小此門檻。"""
+    from immunity.exp3 import benchmark as benchmark_module
+
+    ranking = pd.DataFrame(
+        [
+            {
+                "model": "ridge",
+                "overall_rank": 1.0,
+                "worst_validation_rank": 4.0,
+                "leave_one_b_out_mae": 0.8,
+                "overall_oof_spearman": 0.9,
+                "simplicity_rank": 2,
+            },
+            {
+                "model": "elasticnet",
+                "overall_rank": 1.1,
+                "worst_validation_rank": 2.0,
+                "leave_one_b_out_mae": 1.0,
+                "overall_oof_spearman": 0.7,
+                "simplicity_rank": 3,
+            },
+            {
+                "model": "random_forest",
+                "overall_rank": 1.15,
+                "worst_validation_rank": 3.0,
+                "leave_one_b_out_mae": 0.5,
+                "overall_oof_spearman": 0.8,
+                "simplicity_rank": 6,
+            },
+        ]
+    )
+    captured: list[tuple[list[str], str]] = []
+
+    def capture_adapter(
+        images: pd.DataFrame,
+        feature_sets: object,
+        splits: object,
+        config: object,
+        *,
+        model_names: list[str],
+        feature_set_name: str,
+    ) -> benchmark_module.BenchmarkResult:
+        captured.append((list(model_names), feature_set_name))
+        return benchmark_module.BenchmarkResult(
+            predictions=pd.DataFrame(columns=benchmark_module.OOF_COLUMNS),
+            fold_metrics=pd.DataFrame(columns=benchmark_module.FOLD_METRIC_COLUMNS),
+            hyperparameters=pd.DataFrame(
+                columns=benchmark_module.HYPERPARAMETER_COLUMNS
+            ),
+            feature_importance=pd.DataFrame(
+                columns=benchmark_module.FEATURE_IMPORTANCE_COLUMNS
+            ),
+            failures=pd.DataFrame(columns=benchmark_module.FAILURE_COLUMNS),
+        )
+
+    run_module._run_round_two(
+        images=pd.DataFrame(),
+        feature_sets={"basic_median_iqr": ["feature"]},
+        splits=[],
+        benchmark_config={"tie_threshold": 0.05},
+        ranking=ranking,
+        enabled_feature_sets=["basic_median", "basic_median_iqr"],
+        primary_candidates=["ridge", "elasticnet", "random_forest"],
+        run_phase_feature_set_benchmark=capture_adapter,
+        benchmark_result_type=benchmark_module.BenchmarkResult,
+        oof_columns=benchmark_module.OOF_COLUMNS,
+        metric_columns=benchmark_module.FOLD_METRIC_COLUMNS,
+        hyperparameter_columns=benchmark_module.HYPERPARAMETER_COLUMNS,
+        importance_columns=benchmark_module.FEATURE_IMPORTANCE_COLUMNS,
+        failure_columns=benchmark_module.FAILURE_COLUMNS,
+    )
+
+    assert captured == [
+        (["elasticnet", "random_forest"], "basic_median_iqr")
+    ]
 
 
 def test_config_load_failure_writes_smoke_fallback_log(

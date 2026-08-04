@@ -1045,12 +1045,13 @@ def _mask_run_provenance(
     explicit_signature = getattr(segmenter, "cache_signature", None)
     if callable(explicit_signature):
         explicit_signature = explicit_signature()
-    signature = (
-        explicit_signature if explicit_signature is not None else class_identity
+    signature_missing = explicit_signature is None or (
+        isinstance(explicit_signature, str) and not explicit_signature.strip()
     )
     segmenter_evidence = {
         "class_identity": class_identity,
-        "signature": signature,
+        "signature": None if signature_missing else explicit_signature,
+        "signature_status": "missing" if signature_missing else "provided",
     }
     signature_json = _canonical_json(segmenter_evidence)
     return {
@@ -1067,6 +1068,11 @@ def _cache_mismatch_reason(
     current: Mapping[str, Any],
 ) -> str:
     """依可稽核欄位指出 cache 未重用的第一個原因。"""
+    current_segmenter = current.get("segmenter")
+    if not isinstance(current_segmenter, Mapping) or current_segmenter.get(
+        "signature_status"
+    ) != "provided":
+        return "segmenter_signature_missing"
     if cached.get("pc_sha256") != current.get("pc_sha256"):
         return "pc_content_changed"
     if cached.get("segmentation_config_hash") != current.get(

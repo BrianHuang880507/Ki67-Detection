@@ -23,6 +23,8 @@ from immunity.exp3.phase_features import (
 class FakeSegmenter:
     """提供可追蹤呼叫路徑的 synthetic segmentation。"""
 
+    cache_signature = "fake-segmenter-v1"
+
     def __init__(self) -> None:
         self.paths: list[Path] = []
 
@@ -241,6 +243,36 @@ def test_cache_phase_masks_replaces_cache_when_segmenter_signature_changes(
     assert qc.loc[0, "cache_reason"] == "segmenter_signature_changed"
 
 
+def test_cache_phase_masks_never_reuses_unsigned_injected_segmenter(
+    tmp_path: Path,
+) -> None:
+    """同 class 但無明確 signature 的 injected adapter 必須 fail closed。"""
+
+    class UnsignedSegmenter(FakeSegmenter):
+        cache_signature = None
+
+        def __init__(self, variant: str) -> None:
+            super().__init__()
+            self.variant = variant
+
+    manifest = pd.DataFrame(
+        [_manifest_row(tmp_path, "B4_P5_C01_F12", "B4_P5")]
+    )
+    cache_phase_masks(
+        manifest,
+        tmp_path / "cache",
+        {},
+        UnsignedSegmenter("variant-a"),
+    )
+    replacement = UnsignedSegmenter("variant-b")
+
+    qc = cache_phase_masks(manifest, tmp_path / "cache", {}, replacement)
+
+    assert replacement.paths == [Path(manifest.loc[0, "pc_path"])]
+    assert qc.loc[0, "cache_status"] == "replaced"
+    assert qc.loc[0, "cache_reason"] == "segmenter_signature_missing"
+
+
 def test_cache_phase_masks_replaces_legacy_cache_without_provenance(
     tmp_path: Path,
 ) -> None:
@@ -351,6 +383,8 @@ def test_cache_phase_masks_rejects_zero_paired_cells(tmp_path: Path) -> None:
     )
 
     class UnpairedSegmenter:
+        cache_signature = "unpaired-segmenter-v1"
+
         def segment(self, path: Path) -> tuple[np.ndarray, np.ndarray]:
             cell = np.zeros((12, 12), dtype=np.int32)
             nucleus = np.zeros((12, 12), dtype=np.int32)

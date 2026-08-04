@@ -7,7 +7,6 @@ import contextlib
 import hashlib
 import importlib.metadata
 import json
-import math
 import os
 import platform
 import subprocess
@@ -156,8 +155,14 @@ def run_benchmark(
     _archive_previous_generation(output_dir)
     try:
         return _run_benchmark_generation(config, smoke_fovs_per_condition)
-    except Exception:
-        _quarantine_failed_generation(output_dir)
+    except BaseException as error:
+        try:
+            _quarantine_failed_generation(output_dir)
+        except BaseException as quarantine_error:
+            error.add_note(
+                "Exp3 failed-generation quarantine error: "
+                f"{type(quarantine_error).__name__}: {quarantine_error}"
+            )
         raise
 
 
@@ -918,11 +923,7 @@ def _run_round_two(
     )
     if not secondary_sets:
         return empty
-    top_models = _round_two_top_models(
-        ranking,
-        primary_candidates,
-        tie_threshold=float(benchmark_config.get("tie_threshold", 0.25)),
-    )
+    top_models = _round_two_top_models(ranking, primary_candidates)
     if not top_models:
         return empty
     frames: dict[str, list[pd.DataFrame]] = {
@@ -970,8 +971,6 @@ def _run_round_two(
 def _round_two_top_models(
     ranking: pd.DataFrame,
     primary_candidates: Sequence[str],
-    *,
-    tie_threshold: float = 0.25,
 ) -> list[str]:
     """依 Task 8 完整 tie-break evidence 選取 Round 2 前兩名。"""
     required = {
@@ -998,12 +997,9 @@ def _round_two_top_models(
     ranked = ranked[ranked["overall_rank"].notna()]
     if ranked.empty:
         return []
-    threshold = float(tie_threshold)
-    if not math.isfinite(threshold) or threshold <= 0:
-        raise ValueError("Round 2 tie_threshold 必須是有限正數")
     best_rank = float(ranked["overall_rank"].min())
     first_band = ranked[
-        (ranked["overall_rank"] - best_rank).lt(threshold)
+        (ranked["overall_rank"] - best_rank).lt(0.25)
     ].copy()
     first_band["_spearman_sort"] = -first_band["overall_oof_spearman"]
     evidence_columns = [

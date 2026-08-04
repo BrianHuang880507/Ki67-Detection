@@ -44,9 +44,10 @@ Leave-one-B-out、Leave-one-passage-out、Leave-one-B×Passage-out 與
 Leave-one-condition-out。Eligibility evidence 不完整時流程會 fail closed；沒有模型通過全部
 gate 時不會強迫發布 winner。
 
-Round 2 先取距最佳 average rank 小於 `tie_threshold`（預設 0.25）的 tie band，再依 worst
-validation rank、LOBO MAE、Spearman、模型簡潔度與名稱決定前兩個 phase candidates；不足
-兩個才從 band 外依相同完整證據補足。Round 2 只使用明確啟用的 secondary sets，結果標記為
+Round 2 先取距最佳 average rank 小於固定 0.25 的 tie band，再依 worst validation rank、
+LOBO MAE、Spearman、模型簡潔度與名稱決定前兩個 phase candidates；不足兩個才從 band 外
+依相同完整證據補足。此門檻不可由 benchmark config 覆寫。Round 2 只使用明確啟用的
+secondary sets，結果標記為
 `exploratory_round_2`，不會回流 Primary ranking、eligibility 或 winner。
 
 ## ΔMorphology
@@ -70,5 +71,7 @@ count。
 pairing、manifest、segmentation 或 model failure evidence。
 
 `feature_cache/masks/` 的 NPZ 只有在 PC bytes SHA-256、segmentation config 與
-segmenter/model signature 全部吻合時才會重用。缺少 provenance 的舊 cache 或任一證據不符時，
-流程會重新 segmentation，並在 `segmentation_qc.csv` 記錄原因與 provenance hash。
+segmenter/model signature 全部吻合時才會重用。Injected Segmenter 若未提供明確且非空的
+`cache_signature`，即使 class 相同也一律重新 segmentation。缺少 provenance 的舊 cache 或
+任一證據不符時，流程會重新 segmentation，並在 `segmentation_qc.csv` 記錄原因與
+provenance hash。
