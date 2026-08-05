@@ -241,10 +241,17 @@ def _run_benchmark_generation(
         pairing_qc,
         _required_mapping(config, "expected_totals"),
     )
-    sampled_raw = _limit_smoke_manifest(raw_manifest, smoke_fovs_per_condition)
-    manifest = apply_condition_mapping(
-        sampled_raw,
+    mapped_manifest = apply_condition_mapping(
+        raw_manifest,
         _required_mapping(config, "condition_mapping"),
+    )
+    eligible_manifest, configured_exclusions = _apply_image_exclusions(
+        mapped_manifest,
+        config.get("image_exclusions", {}),
+    )
+    manifest = _limit_smoke_manifest(
+        eligible_manifest,
+        smoke_fovs_per_condition,
     )
     manifest_path = output_dir / "data_manifest.csv"
     _write_csv_atomically(manifest, manifest_path)
@@ -463,9 +470,12 @@ def _run_benchmark_generation(
         "raw_pc": metadata["input_counts"]["raw_pc"],
         "raw_ido": metadata["input_counts"]["raw_ido"],
         "complete_pairs": metadata["input_counts"]["complete_pairs"],
-        "exclusions": pairing_qc.loc[
-            ~pairing_qc["status"].eq("paired"), "detail"
-        ].astype(str).tolist(),
+        "exclusions": [
+            *pairing_qc.loc[
+                ~pairing_qc["status"].eq("paired"), "detail"
+            ].astype(str).tolist(),
+            *configured_exclusions,
+        ],
         "segmentation_pass_rate": float(segmentation_qc["status"].eq("passed").mean()),
         "condition_adjusted_metrics": condition_adjusted,
         "pc_nucleus_dapi_validation": development_validation,
@@ -832,6 +842,54 @@ def _limit_smoke_manifest(
     if identities.duplicated().any():
         raise ValueError("smoke sampling 產生重複 image identity")
     return sampled.reset_index(drop=True)
+
+
+def _apply_image_exclusions(
+    manifest: pd.DataFrame,
+    exclusions: Any,
+) -> tuple[pd.DataFrame, list[str]]:
+    """套用具名影像排除規則並產生可寫入報告的證據。
+
+    Args:
+        manifest: 已含穩定 ``image_key`` 的完整配對 manifest。
+        exclusions: ``image_key`` 對排除原因的 mapping。
+
+    Returns:
+        排除後的 manifest，以及依 image key 排序的排除說明。
+
+    Raises:
+        TypeError: 排除設定不是 mapping。
+        ValueError: image key、原因或 manifest 欄位無效。
+    """
+    if not isinstance(exclusions, Mapping):
+        raise TypeError("image_exclusions 必須是 mapping")
+    if "image_key" not in manifest.columns:
+        raise ValueError("image exclusions 需要 manifest.image_key")
+
+    normalized: dict[str, str] = {}
+    for raw_key, raw_reason in exclusions.items():
+        image_key = str(raw_key).strip()
+        reason = str(raw_reason).strip()
+        if not image_key or not reason:
+            raise ValueError("image_exclusions 的 image key 與原因不可為空")
+        if image_key in normalized:
+            raise ValueError(f"image_exclusions 出現重複 image key：{image_key}")
+        normalized[image_key] = reason
+
+    available = set(manifest["image_key"].astype(str))
+    unknown = sorted(set(normalized) - available)
+    if unknown:
+        raise ValueError(f"image_exclusions 含未知 image key：{unknown}")
+
+    excluded_keys = set(normalized)
+    eligible = manifest[
+        ~manifest["image_key"].astype(str).isin(excluded_keys)
+    ].reset_index(drop=True)
+    evidence = [
+        f"{image_key}: {normalized[image_key]}"
+        for image_key in sorted(normalized)
+    ]
+    return eligible, evidence
 
 
 def _combine_segmentation_and_extraction_qc(

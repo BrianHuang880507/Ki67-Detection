@@ -487,6 +487,15 @@ def test_exp3_config_loads_without_running_pipeline() -> None:
         7: {"condition": "IFN25_TNF25", "ifn_dose": 25.0, "tnf_dose": 25.0},
         8: {"condition": "IFN25_TNF50", "ifn_dose": 25.0, "tnf_dose": 50.0},
     }
+    assert set(config["image_exclusions"]) == {
+        "B7_P7_C06_F01",
+        "B8_P7_C01_F01",
+        "B8_P7_C02_F01",
+        "B8_P7_C07_F01",
+        "B8_P7_C07_F02",
+        "B8_P7_C07_F03",
+    }
+    assert all(config["image_exclusions"].values())
     assert config["feature_sets"]["enabled"] == ["basic_median"]
 
 
@@ -715,6 +724,9 @@ def test_smoke_pipeline_writes_recomputable_isolated_outputs_without_cellpose(
         tmp_path,
         fovs_per_condition=2,
     )
+    excluded_key = "B8_P7_C07_F01"
+    exclusion_reason = "phase segmentation found no paired cells in smoke QC"
+    config["image_exclusions"] = {excluded_key: exclusion_reason}
 
     def forbid_real_cellpose(config: object) -> object:
         """若 pipeline 未注入 synthetic Segmenter 就立即失敗。"""
@@ -747,8 +759,13 @@ def test_smoke_pipeline_writes_recomputable_isolated_outputs_without_cellpose(
     manifest_path = smoke / "data_manifest.csv"
     manifest = pd.read_csv(manifest_path)
     assert len(manifest) == 72
-    assert set(manifest["fov"]) == {1}
     assert manifest.groupby(["group_id", "condition_index"]).size().eq(1).all()
+    assert excluded_key not in set(manifest["image_key"])
+    replacement = manifest[
+        manifest["image_key"].eq("B8_P7_C07_F02")
+    ]
+    assert replacement["fov"].tolist() == [2]
+    assert exclusion_reason in record.read_text(encoding="utf-8")
 
     metrics = pd.read_csv(smoke / "fold_metrics.csv")
     ranking = pd.read_csv(smoke / "model_ranking.csv")

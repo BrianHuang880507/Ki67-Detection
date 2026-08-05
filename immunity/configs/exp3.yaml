@@ -24,6 +24,26 @@ condition_mapping:
   7: {condition: IFN25_TNF25, ifn_dose: 25.0, tnf_dose: 25.0}
   8: {condition: IFN25_TNF50, ifn_dose: 25.0, tnf_dose: 50.0}
 
+image_exclusions:
+  B7_P7_C06_F01: >-
+    fewer than 3 valid cells in smoke QC on 2026-08-05;
+    kept_full_cells=1
+  B8_P7_C01_F01: >-
+    fewer than 3 valid cells in smoke QC on 2026-08-05;
+    kept_full_cells=1
+  B8_P7_C02_F01: >-
+    fewer than 3 valid cells in smoke QC on 2026-08-05;
+    kept_full_cells=1
+  B8_P7_C07_F01: >-
+    phase segmentation found no paired cells in smoke QC on 2026-08-05;
+    whole_cell_labels=10, nucleus_labels=1, paired_cells=0
+  B8_P7_C07_F02: >-
+    fewer than 3 valid cells in smoke QC on 2026-08-05;
+    kept_full_cells=2
+  B8_P7_C07_F03: >-
+    fewer than 3 valid cells in replacement QC on 2026-08-05;
+    kept_full_cells=1
+
 segmentation:
   device: gpu
   force: false
