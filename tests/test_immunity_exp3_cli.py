@@ -477,7 +477,16 @@ def test_exp3_config_loads_without_running_pipeline() -> None:
 
     assert len(config["datasets"]) == 9
     assert config["expected_totals"] == {"pc": 720, "ido": 719, "paired": 719}
-    assert config["condition_mapping"] == {}
+    assert config["condition_mapping"] == {
+        1: {"condition": "IFN0_TNF0", "ifn_dose": 0.0, "tnf_dose": 0.0},
+        2: {"condition": "IFN25_TNF0", "ifn_dose": 25.0, "tnf_dose": 0.0},
+        3: {"condition": "IFN50_TNF0", "ifn_dose": 50.0, "tnf_dose": 0.0},
+        4: {"condition": "IFN100_TNF0", "ifn_dose": 100.0, "tnf_dose": 0.0},
+        5: {"condition": "IFN0_TNF25", "ifn_dose": 0.0, "tnf_dose": 25.0},
+        6: {"condition": "IFN0_TNF50", "ifn_dose": 0.0, "tnf_dose": 50.0},
+        7: {"condition": "IFN25_TNF25", "ifn_dose": 25.0, "tnf_dose": 25.0},
+        8: {"condition": "IFN25_TNF50", "ifn_dose": 25.0, "tnf_dose": 50.0},
+    }
     assert config["feature_sets"]["enabled"] == ["basic_median"]
 
 

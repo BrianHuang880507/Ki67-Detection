@@ -101,7 +101,9 @@ def scan_datasets(
     parse_error_rows: list[dict[str, Any]] = []
 
     for spec in specs:
-        root = Path(spec["input_dir"]).expanduser().resolve(strict=False)
+        # 保留 lexical path；將 input symlink 展開成 UNC 會讓 OpenCV 無法讀取
+        # 雖然同一檔案透過本機 symlink 路徑可以正常存取。
+        root = Path(spec["input_dir"]).expanduser().absolute()
         b_id = str(spec["b_id"])
         passage = int(spec["passage"])
         if not root.is_dir():
@@ -115,7 +117,7 @@ def scan_datasets(
             for path in sorted(folder.iterdir(), key=lambda item: item.name.lower()):
                 if not path.is_file() or path.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:
                     continue
-                resolved_path = path.resolve(strict=False)
+                lexical_path = path.absolute()
                 try:
                     condition_index, fov = parse_image_name(path.name, channel)
                 except ValueError as error:
@@ -130,14 +132,14 @@ def scan_datasets(
                             "ido_count": 0,
                             "pc_path": None,
                             "ido_path": None,
-                            "detail": f"{resolved_path}: {error}",
+                            "detail": f"{lexical_path}: {error}",
                         }
                     )
                     continue
 
                 key = (b_id, passage, condition_index, fov)
                 grouped_paths.setdefault(key, {"pc": [], "ido": []})[channel].append(
-                    resolved_path
+                    lexical_path
                 )
 
     manifest_rows: list[dict[str, Any]] = []

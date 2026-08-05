@@ -49,6 +49,37 @@ def test_scan_keeps_pair_and_records_missing_ido(tmp_path: Path) -> None:
     ]
 
 
+def test_scan_preserves_lexical_input_path_without_resolving_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """影像位於可讀 symlink 時，不得將路徑展開成 OpenCV 無法讀取的 UNC。"""
+    root = tmp_path / "input-alias" / "B4-P5"
+    (root / "PC").mkdir(parents=True)
+    (root / "IDO").mkdir()
+    pc = root / "PC" / "1-phase-100X-1.jpg"
+    ido = root / "IDO" / "1-IDO-100X-1.jpg"
+    pc.touch()
+    ido.touch()
+
+    original_resolve = Path.resolve
+
+    def fake_resolve(path: Path, strict: bool = False) -> Path:
+        if path.is_file() and path.suffix.lower() == ".jpg":
+            return Path(r"\\unreadable.example\share") / path.name
+        return original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", fake_resolve)
+
+    manifest, qc = scan_datasets(
+        [{"input_dir": root, "b_id": "B4", "passage": 5}]
+    )
+
+    assert qc["status"].tolist() == ["paired"]
+    assert manifest.loc[0, "pc_path"] == str(pc.absolute())
+    assert manifest.loc[0, "ido_path"] == str(ido.absolute())
+
+
 def test_scan_records_duplicate_and_parse_error_deterministically(tmp_path: Path) -> None:
     """重複與無法解析檔案應保留在 QC，且列順序不可依掃描順序漂移。"""
     root = tmp_path / "B4-P6"
