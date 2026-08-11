@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +25,7 @@ from immunity.exp3.phase_features import (
     load_cached_masks,
     paper_style_extras,
 )
-from immunity.exp3.round2_evidence import Round1Evidence
+from immunity.exp3.round2_evidence import Round1Evidence, validate_frozen_masks
 
 
 ROSTER_COLUMNS = ("image_key", "cell_label", "nucleus_label")
@@ -55,6 +56,17 @@ FEATURE_QC_COLUMNS = [
     "registered",
     "status",
 ]
+MASK_QC_COLUMNS = [
+    "image_key",
+    "pc_path",
+    "mask_path",
+    "expected_pc_sha256",
+    "actual_pc_sha256",
+    "expected_provenance_hash",
+    "actual_provenance_hash",
+    "status",
+    "reason",
+]
 _FORBIDDEN_PREDICTOR_TOKENS = (
     "ido",
     "ifn",
@@ -70,6 +82,10 @@ _FORBIDDEN_PREDICTOR_TOKENS = (
 _EXPECTED_BASIC_ATTR = "_paper93_expected_basic_images"
 _EXPECTED_CELLS_ATTR = "_paper93_expected_basic_cells"
 _ATOL_ATTR = "_paper93_atol"
+_FROZEN_ATOL = 1e-12
+_FORMAL_IMAGE_KEYS_SHA256 = (
+    "efc55b45033a3923f1467dce86802f6514a0e9c182de77e94a2c155d47503232"
+)
 
 
 @dataclass(frozen=True)
@@ -91,6 +107,10 @@ class Paper93Bundle:
     extraction_qc: pd.DataFrame
     feature_qc: pd.DataFrame
     predictor_columns: tuple[str, ...]
+    _images_semantic_sha256: str = field(repr=False)
+    _cells_semantic_sha256: str = field(repr=False)
+    _images_snapshot_sha256: str = field(repr=False)
+    _cells_snapshot_sha256: str = field(repr=False)
 
 
 def extract_locked_paper93(
@@ -121,11 +141,11 @@ def extract_locked_paper93(
         不會以常數填補；由 ``require_paper93_preflight`` 統一阻擋。
     """
     minimum = _positive_integer(min_finite_cells, "min_finite_cells")
-    if minimum < 3:
-        raise ValueError("min_finite_cells 至少為 3，不可放寬 frozen Paper93 gate")
+    if minimum != 3:
+        raise ValueError("min_finite_cells 必須精確為 3，不可變更 frozen Paper93 gate")
     tolerance = float(atol)
-    if not np.isfinite(tolerance) or tolerance < 0:
-        raise ValueError("atol 必須是非負有限值")
+    if tolerance != _FROZEN_ATOL:
+        raise ValueError("atol 必須精確為 1e-12，不可放寬 frozen basic drift gate")
 
     _require_columns(evidence.manifest, ("image_key", "group_id", "pc_path"), "manifest")
     _require_columns(
@@ -138,7 +158,7 @@ def extract_locked_paper93(
         ("image_key", *PRIMARY_FOV_FEATURES, "IDO_score"),
         "basic_images",
     )
-    _require_columns(mask_qc, ("image_key", "pc_path", "mask_path", "status"), "mask_qc")
+    _require_columns(mask_qc, MASK_QC_COLUMNS, "mask_qc", exact=True)
 
     manifest = _unique_by_image(evidence.manifest, "manifest")
     basic_images = _unique_by_image(evidence.basic_images, "basic_images")
@@ -149,6 +169,7 @@ def extract_locked_paper93(
     missing_qc = [key for key in keys if key not in verified.index]
     if missing_qc:
         raise ValueError(f"mask_qc 缺少 image_key：{missing_qc}")
+    fresh_qc = _unique_by_image(validate_frozen_masks(evidence, keys), "fresh mask_qc")
 
     selected_images = basic_images.loc[keys].reset_index(drop=True).copy()
     selected_cells = evidence.basic_cells[
@@ -161,6 +182,7 @@ def extract_locked_paper93(
     for image_key in keys:
         manifest_row = manifest.loc[image_key]
         qc_row = verified.loc[image_key]
+        fresh_qc_row = fresh_qc.loc[image_key]
         pc_path = Path(str(qc_row["pc_path"])).resolve(strict=False)
         mask_path = Path(str(qc_row["mask_path"])).resolve(strict=False)
         roster = selected_cells[selected_cells["image_key"].eq(image_key)].copy()
@@ -175,10 +197,7 @@ def extract_locked_paper93(
         }
         try:
             _require_verified_paths(evidence, manifest_row, qc_row, image_key)
-            if str(qc_row["status"]) != "passed":
-                raise ValueError(
-                    f"mask_qc status={qc_row['status']}; reason={qc_row.get('reason', '')}"
-                )
+            _require_fresh_mask_qc(qc_row, fresh_qc_row)
             image_rows = _extract_roster_image(
                 image_key,
                 pc_path,
@@ -233,6 +252,10 @@ def extract_locked_paper93(
     paper_cells.attrs[_ATOL_ATTR] = tolerance
 
     feature_qc = _build_feature_qc(images, valid_counts)
+    images_semantic_sha256 = _frame_semantic_sha256(images)
+    cells_semantic_sha256 = _frame_semantic_sha256(paper_cells)
+    images_snapshot_sha256 = _frame_semantic_sha256(expected_images)
+    cells_snapshot_sha256 = _frame_semantic_sha256(expected_cells)
     return Paper93Bundle(
         images=images,
         paper_cells=paper_cells,
@@ -240,6 +263,10 @@ def extract_locked_paper93(
         extraction_qc=pd.DataFrame(extraction_rows, columns=EXTRACTION_QC_COLUMNS),
         feature_qc=feature_qc,
         predictor_columns=tuple(PAPER_STYLE_FOV_FEATURES),
+        _images_semantic_sha256=images_semantic_sha256,
+        _cells_semantic_sha256=cells_semantic_sha256,
+        _images_snapshot_sha256=images_snapshot_sha256,
+        _cells_snapshot_sha256=cells_snapshot_sha256,
     )
 
 
@@ -281,6 +308,8 @@ def require_paper93_preflight(bundle: Paper93Bundle, *, formal: bool) -> None:
             f"expected={PAPER_STYLE_FOV_FEATURES[mismatch]}"
         )
     validate_phase_predictors(predictors)
+    if formal and len(bundle.images) == 693:
+        _validate_formal_image_roster(bundle.images)
 
     _require_columns(
         bundle.extraction_qc,
@@ -300,6 +329,8 @@ def require_paper93_preflight(bundle: Paper93Bundle, *, formal: bool) -> None:
     _validate_extraction_qc(bundle)
     _validate_frozen_images(bundle.images)
     _validate_frozen_cells(bundle.paper_cells)
+    _validate_extra_medians(bundle)
+    _validate_creation_semantics(bundle)
     _validate_valid_counts(bundle)
     _validate_feature_qc(bundle)
 
@@ -505,6 +536,108 @@ def _validate_frozen_cells(cells: pd.DataFrame) -> None:
     _assert_aligned_frozen_values(actual, expected, float(tolerance), "cell roster/basic/target")
 
 
+def _validate_extra_medians(bundle: Paper93Bundle) -> None:
+    """從 frozen-roster cells 重算 60 個 finite-only medians 並比對 FOV values。"""
+    image_keys = bundle.images["image_key"].astype(str).tolist()
+    for image_key in image_keys:
+        cells = bundle.paper_cells[
+            bundle.paper_cells["image_key"].astype(str).eq(image_key)
+        ]
+        image_rows = bundle.images[
+            bundle.images["image_key"].astype(str).eq(image_key)
+        ]
+        if len(image_rows) != 1:
+            raise ValueError(f"Paper93 median identity 不一致：image_key={image_key}")
+        image_row = image_rows.iloc[0]
+        for feature in PAPER_STYLE_EXTRA_FEATURES:
+            values = pd.to_numeric(cells[feature], errors="coerce").to_numpy(dtype=float)
+            finite = values[np.isfinite(values)]
+            expected = float(np.median(finite)) if finite.size else np.nan
+            actual = float(image_row[f"{feature}__median"])
+            if not np.isclose(
+                actual,
+                expected,
+                rtol=0,
+                atol=_FROZEN_ATOL,
+                equal_nan=False,
+            ):
+                raise ValueError(
+                    f"Paper93 median drift：feature={feature}, image_key={image_key}, "
+                    f"expected={expected}, actual={actual}"
+                )
+
+
+def _validate_creation_semantics(bundle: Paper93Bundle) -> None:
+    """以 immutable digests 鎖定 extraction-time tables 與 frozen snapshots。"""
+    expected_image_attrs = {_EXPECTED_BASIC_ATTR, _ATOL_ATTR}
+    expected_cell_attrs = {_EXPECTED_CELLS_ATTR, _ATOL_ATTR}
+    if set(bundle.images.attrs) != expected_image_attrs:
+        raise ValueError("Paper93 images attrs 偏離 creation-time contract")
+    if set(bundle.paper_cells.attrs) != expected_cell_attrs:
+        raise ValueError("Paper93 cells attrs 偏離 creation-time contract")
+    if float(bundle.images.attrs[_ATOL_ATTR]) != _FROZEN_ATOL:
+        raise ValueError("Paper93 images attrs atol 偏離 1e-12")
+    if float(bundle.paper_cells.attrs[_ATOL_ATTR]) != _FROZEN_ATOL:
+        raise ValueError("Paper93 cells attrs atol 偏離 1e-12")
+    expected_images = bundle.images.attrs[_EXPECTED_BASIC_ATTR]
+    expected_cells = bundle.paper_cells.attrs[_EXPECTED_CELLS_ATTR]
+    if not isinstance(expected_images, pd.DataFrame) or not isinstance(
+        expected_cells, pd.DataFrame
+    ):
+        raise ValueError("Paper93 frozen snapshot attrs 必須是 DataFrame")
+    checks = (
+        (
+            "images semantic",
+            _frame_semantic_sha256(bundle.images),
+            bundle._images_semantic_sha256,
+        ),
+        (
+            "cells semantic",
+            _frame_semantic_sha256(bundle.paper_cells),
+            bundle._cells_semantic_sha256,
+        ),
+        (
+            "images snapshot",
+            _frame_semantic_sha256(expected_images),
+            bundle._images_snapshot_sha256,
+        ),
+        (
+            "cells snapshot",
+            _frame_semantic_sha256(expected_cells),
+            bundle._cells_snapshot_sha256,
+        ),
+    )
+    for name, actual, expected in checks:
+        if actual != expected:
+            raise ValueError(
+                f"Paper93 {name} SHA-256 不一致：expected={expected}, actual={actual}"
+            )
+
+
+def _frame_semantic_sha256(frame: pd.DataFrame) -> str:
+    """計算含欄序、dtype、index 與 scalar values 的穩定 DataFrame digest。"""
+    digest = hashlib.sha256()
+    for column, dtype in zip(frame.columns, frame.dtypes, strict=True):
+        encoded = f"{column}\0{dtype}\n".encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    hashes = pd.util.hash_pandas_object(frame, index=True, categorize=False)
+    digest.update(hashes.to_numpy(dtype=np.uint64).tobytes())
+    return digest.hexdigest()
+
+
+def _validate_formal_image_roster(images: pd.DataFrame) -> None:
+    """鎖定 formal 693 FOV 的 production image-key roster digest。"""
+    keys = images["image_key"].astype(str).tolist()
+    payload = ("\n".join(sorted(keys)) + "\n").encode("utf-8")
+    actual = hashlib.sha256(payload).hexdigest()
+    if actual != _FORMAL_IMAGE_KEYS_SHA256:
+        raise ValueError(
+            "formal Paper93 image-key roster SHA-256 不一致："
+            f"expected={_FORMAL_IMAGE_KEYS_SHA256}, actual={actual}"
+        )
+
+
 def _assert_aligned_frozen_values(
     actual: pd.DataFrame,
     expected: pd.DataFrame,
@@ -571,6 +704,11 @@ def _validate_valid_counts(bundle: Paper93Bundle) -> None:
         raise ValueError("Paper93 valid_counts image/feature pair 不可重複")
     if set(actual_pairs) != expected_pairs:
         raise ValueError("Paper93 valid_counts 必須精確涵蓋每張 FOV × 60 extras")
+    required_numeric = pd.to_numeric(
+        bundle.valid_counts["required_minimum"], errors="coerce"
+    ).to_numpy(dtype=float)
+    if not np.equal(required_numeric, 3.0).all():
+        raise ValueError("Paper93 valid_counts required_minimum 必須精確為 3")
     counts = bundle.valid_counts.set_index(["image_key", "feature"], drop=False)
     required_values: set[int] = set()
     for image_key, feature in expected_pairs:
@@ -693,6 +831,26 @@ def _require_verified_paths(
         raise ValueError("mask_qc.pc_path 與 frozen manifest 不一致")
     if mask_path != expected_mask:
         raise ValueError("mask_qc.mask_path 與 frozen cache path 不一致")
+
+
+def _require_fresh_mask_qc(provided: pd.Series, fresh: pd.Series) -> None:
+    """要求 supplied Task 2 QC 與 extraction-time fresh provenance 完全一致。"""
+    if str(fresh["status"]) != "passed":
+        raise ValueError(f"fresh mask provenance failed：{fresh['reason']}")
+    if str(provided["status"]) != "passed":
+        raise ValueError(
+            f"provided mask_qc status={provided['status']}; reason={provided['reason']}"
+        )
+    mismatches = [
+        column
+        for column in MASK_QC_COLUMNS
+        if str(provided[column]) != str(fresh[column])
+    ]
+    if mismatches:
+        details = ", ".join(
+            f"{column}={provided[column]}/{fresh[column]}" for column in mismatches
+        )
+        raise ValueError(f"Task 2 mask_qc 與 fresh provenance 不一致：{details}")
 
 
 def _selected_image_keys(
