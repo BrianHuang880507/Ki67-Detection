@@ -401,6 +401,47 @@ def _formal_record_context() -> dict[str, Any]:
     }
 
 
+def _smoke_bundle_inputs() -> tuple[
+    dict[str, pd.DataFrame],
+    dict[str, dict[str, Any]],
+    dict[str, Any],
+]:
+    """建立可發布的 smoke bundle 測試輸入。"""
+    tables = _formal_tables()
+    keep_keys = {f"image-{index:03d}" for index in range(8)}
+    tables["data_snapshot.csv"] = tables["data_snapshot.csv"].loc[
+        tables["data_snapshot.csv"]["image_key"].isin(keep_keys)
+    ]
+    for name in (
+        "outer_splits.csv",
+        "mask_provenance_qc.csv",
+        "feature_valid_counts.csv",
+        "extraction_qc.csv",
+    ):
+        tables[name] = tables[name].loc[tables[name]["image_key"].isin(keep_keys)]
+    for name in ("fold_metrics.csv", "oof_predictions.csv", "hyperparameters.csv"):
+        tables[name] = tables[name].loc[
+            tables[name]["feature_set"].eq("paper_style_median")
+            & tables[name]["model"].isin(("extra_trees", "random_forest"))
+        ].head(16)
+    tables["dummy_fold_metrics.csv"] = tables["dummy_fold_metrics.csv"].iloc[0:0]
+    tables["dummy_oof_predictions.csv"] = tables["dummy_oof_predictions.csv"].iloc[0:0]
+    tables["feature_set_comparison.csv"] = tables["feature_set_comparison.csv"].loc[
+        tables["feature_set_comparison.csv"]["feature_set"].eq("paper_style_median")
+    ]
+    tables["eligibility.csv"] = tables["eligibility.csv"].loc[
+        tables["eligibility.csv"]["feature_set"].eq("paper_style_median")
+    ].copy()
+    tables["eligibility.csv"]["eligible"] = False
+    tables["eligibility.csv"]["recommended"] = False
+    tables["eligibility.csv"]["status"] = "smoke"
+    payloads = _formal_json_payloads()
+    payloads["run_metadata.json"] = {"mode": "smoke", "smoke": True, "seed": 20260804}
+    context = _formal_record_context()
+    context.update({"smoke": True, "recommendation": None})
+    return tables, payloads, context
+
+
 def _write_bundle(
     output: Path,
     tables: dict[str, pd.DataFrame],
@@ -472,6 +513,81 @@ def test_round2_validator_accepts_published_root_with_managed_generations_direct
     publish_round2_generation(generation)
 
     validate_round2_bundle(generation.output_dir, smoke=False)
+
+
+def test_round2_validator_accepts_formal_published_root_with_safe_smoke_child_without_recursing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Formal published root 可保留安全的 smoke child，且不遞迴驗證其內容。"""
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    publish_round2_generation(generation)
+    smoke = generation.output_dir / "smoke"
+    smoke.mkdir()
+    (smoke / "not-validated-by-formal.txt").write_text("smoke-owned\n", encoding="utf-8")
+
+    validate_round2_bundle(generation.output_dir, smoke=False)
+
+
+def test_round2_validator_rejects_smoke_directory_in_formal_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Formal staging 不得把 smoke child 視為 managed directory。"""
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    (generation.staging_dir / "smoke").mkdir()
+
+    with pytest.raises(ValueError, match="artifact keys|extra|smoke"):
+        validate_round2_bundle(generation.staging_dir, smoke=False)
+
+
+def test_round2_validator_rejects_nested_smoke_directory_in_published_smoke_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Published smoke root 不得再接受 nested smoke directory。"""
+    tables, payloads, context = _smoke_bundle_inputs()
+    output = _allowed_output(tmp_path, monkeypatch)
+    generation = _write_bundle(output / "smoke", tables, payloads, context)
+    publish_round2_generation(generation)
+    (generation.output_dir / "smoke").mkdir()
+
+    with pytest.raises(ValueError, match="artifact keys|extra|smoke"):
+        validate_round2_bundle(generation.output_dir, smoke=True)
+
+
+def test_round2_validator_rejects_reparse_smoke_child_in_formal_published_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Formal root 的 smoke child 若為 symlink/junction/reparse point 必須 fail-closed。"""
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    publish_round2_generation(generation)
+    outside = tmp_path / "outside-smoke"
+    outside.mkdir()
+    smoke = generation.output_dir / "smoke"
+    try:
+        smoke.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"此環境無法建立 directory symlink：{error}")
+
+    with pytest.raises(ValueError, match="symlink|junction|reparse|逃逸"):
+        validate_round2_bundle(generation.output_dir, smoke=False)
 
 
 def test_round2_published_root_rejects_other_directory(

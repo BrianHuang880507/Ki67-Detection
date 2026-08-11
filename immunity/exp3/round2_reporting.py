@@ -293,6 +293,10 @@ def validate_round2_bundle(directory: Path, *, smoke: bool) -> None:
     expected_entries = set(_BUNDLE_FILE_NAMES)
     if bundle == output:
         expected_entries.add("_generations")
+        smoke_directory = output / "smoke"
+        if not smoke and (smoke_directory.exists() or smoke_directory.is_symlink()):
+            expected_entries.add("smoke")
+            _assert_safe_directory(output, smoke_directory)
     if entries != expected_entries:
         missing = sorted(expected_entries - entries)
         extra = sorted(entries - expected_entries)
