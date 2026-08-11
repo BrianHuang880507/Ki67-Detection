@@ -19,8 +19,10 @@ from immunity.exp3.feature_sets import (
     PRIMARY_CELL_FEATURES,
     PRIMARY_FOV_FEATURES,
 )
+from immunity.exp3.phase_features import extract_features_from_arrays
 from immunity.exp3.round2_evidence import Round1Evidence, validate_frozen_masks
 from immunity.exp3.round2_features import (
+    EXTRACTION_QC_COLUMNS,
     Paper93Bundle,
     ROSTER_COLUMNS,
     VALID_COUNT_COLUMNS,
@@ -88,7 +90,10 @@ def frozen_evidence(tmp_path: Path) -> Round1Evidence:
         {
             "pc_sha256": pc_sha256,
             "schema_version": 1,
-            "segmentation_config": {"min_cells_per_image": 3},
+            "segmentation_config": {
+                "max_nucleus_outside_fraction": 0.05,
+                "min_cells_per_image": 3,
+            },
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -178,7 +183,11 @@ def frozen_evidence(tmp_path: Path) -> Round1Evidence:
         selected_importance=empty,
         selected_failures=empty,
         model_ranking=empty,
-        metadata={},
+        metadata={
+            "effective_config_snapshot": {
+                "segmentation": {"max_nucleus_outside_fraction": 0.05}
+            }
+        },
         artifact_hashes={},
     )
 
@@ -187,6 +196,108 @@ def frozen_evidence(tmp_path: Path) -> Round1Evidence:
 def verified_mask_qc(frozen_evidence: Round1Evidence) -> pd.DataFrame:
     """建立 Task 2 已通過 bytes 與 provenance 檢查的 mask QC。"""
     return validate_frozen_masks(frozen_evidence)
+
+
+def _replace_mask_arrays(
+    evidence: Round1Evidence,
+    cell_mask: np.ndarray,
+    nucleus_mask: np.ndarray,
+) -> None:
+    """只替換 synthetic cache arrays，保留已驗證的 provenance identity。"""
+    mask_path = Path(evidence.segmentation_qc.loc[0, "mask_path"])
+    with np.load(mask_path, allow_pickle=False) as cached:
+        arrays = {name: np.asarray(cached[name]) for name in cached.files}
+    arrays["cell_mask"] = np.asarray(cell_mask, dtype=np.int32)
+    arrays["nucleus_mask"] = np.asarray(nucleus_mask, dtype=np.int32)
+    np.savez(mask_path, **arrays)
+
+
+def _evidence_with_round1_pairs(
+    evidence: Round1Evidence,
+    cell_mask: np.ndarray,
+    nucleus_mask: np.ndarray,
+) -> Round1Evidence:
+    """以 Round 1 extractor 建立與指定 masks 相容的 frozen pair evidence。"""
+    _replace_mask_arrays(evidence, cell_mask, nucleus_mask)
+    image_key = str(evidence.manifest.loc[0, "image_key"])
+    phase = np.asarray(Image.open(evidence.manifest.loc[0, "pc_path"]))
+    rows, _ = extract_features_from_arrays(
+        image_key,
+        phase,
+        np.zeros_like(phase, dtype=np.float64),
+        cell_mask,
+        nucleus_mask,
+        max_nucleus_outside_fraction=0.05,
+        enabled_feature_sets=("basic_median",),
+    )
+    basic_cells = pd.DataFrame(rows).loc[
+        :, [*ROSTER_COLUMNS, *PRIMARY_CELL_FEATURES, "IDO_score"]
+    ]
+    basic_images = evidence.basic_images.copy()
+    basic_images.loc[0, "cell_count"] = len(basic_cells)
+    basic_images.loc[0, "IDO_score"] = float(basic_cells["IDO_score"].median())
+    for feature in PRIMARY_CELL_FEATURES:
+        basic_images.loc[0, f"{feature}__median"] = float(
+            basic_cells[feature].median()
+        )
+    return replace(
+        evidence,
+        basic_cells=basic_cells,
+        basic_images=basic_images,
+    )
+
+
+def _multi_nucleus_pair_masks() -> tuple[np.ndarray, np.ndarray]:
+    """建立三個 unique cells、四個 nucleus-cell pairs 的 synthetic masks。"""
+    cells = np.zeros((30, 30), dtype=np.int32)
+    nuclei = np.zeros_like(cells)
+    cells[2:10, 2:10] = 1
+    cells[2:8, 14:20] = 2
+    cells[15:19, 8:12] = 3
+    nuclei[3:5, 3:5] = 1
+    nuclei[4:6, 16:18] = 2
+    nuclei[16:18, 9:11] = 3
+    nuclei[7:9, 7:9] = 4
+    return cells, nuclei
+
+
+def _outside_boundary_masks(*, exact: bool) -> tuple[np.ndarray, np.ndarray]:
+    """建立 1/20 exact boundary 或 1/19 just-above boundary 的 masks。"""
+    cells = np.zeros((30, 30), dtype=np.int32)
+    nuclei = np.zeros_like(cells)
+    for label, (row, column) in enumerate(((2, 2), (2, 14), (15, 8)), 1):
+        cells[row : row + 8, column : column + 8] = label
+    nuclei[4:8, 4:9] = 1
+    nuclei[4:7, 16:19] = 2
+    nuclei[17:20, 10:13] = 3
+    cells[4, 4] = 0
+    if not exact:
+        nuclei[7, 8] = 0
+    return cells, nuclei
+
+
+def _evidence_with_embedded_threshold(
+    evidence: Round1Evidence,
+    threshold: float | None,
+) -> Round1Evidence:
+    """改寫 synthetic embedded provenance 並同步其 pinned provenance hash。"""
+    mask_path = Path(evidence.segmentation_qc.loc[0, "mask_path"])
+    with np.load(mask_path, allow_pickle=False) as cached:
+        arrays = {name: np.asarray(cached[name]) for name in cached.files}
+    provenance = json.loads(str(arrays["provenance_json"].item()))
+    segmentation = provenance["segmentation_config"]
+    if threshold is None:
+        segmentation.pop("max_nucleus_outside_fraction", None)
+    else:
+        segmentation["max_nucleus_outside_fraction"] = threshold
+    provenance_json = json.dumps(provenance, sort_keys=True, separators=(",", ":"))
+    provenance_hash = hashlib.sha256(provenance_json.encode("utf-8")).hexdigest()
+    arrays["provenance_json"] = np.asarray(provenance_json)
+    arrays["provenance_hash"] = np.asarray(provenance_hash)
+    np.savez(mask_path, **arrays)
+    segmentation_qc = evidence.segmentation_qc.copy()
+    segmentation_qc.loc[0, "cache_provenance_hash"] = provenance_hash
+    return replace(evidence, segmentation_qc=segmentation_qc)
 
 
 def test_paper93_bundle_preserves_roster_basic_values_and_target(
@@ -213,6 +324,196 @@ def test_paper93_bundle_preserves_roster_basic_values_and_target(
         atol=1e-12,
     )
     require_paper93_preflight(bundle, formal=False)
+
+
+def test_paper93_preserves_two_nuclei_mapped_to_one_frozen_cell_as_pair_rows(
+    frozen_evidence: Round1Evidence,
+) -> None:
+    cells, nuclei = _multi_nucleus_pair_masks()
+    evidence = _evidence_with_round1_pairs(frozen_evidence, cells, nuclei)
+
+    bundle = extract_locked_paper93(evidence, validate_frozen_masks(evidence))
+
+    assert bundle.extraction_qc["status"].tolist() == ["passed"]
+    assert set(
+        bundle.paper_cells.loc[
+            bundle.paper_cells["cell_label"].eq(1),
+            ["image_key", "cell_label", "nucleus_label"],
+        ].itertuples(index=False, name=None)
+    ) == {
+        ("B1_P1_C01_F01", 1, 1),
+        ("B1_P1_C01_F01", 1, 4),
+    }
+    assert len(bundle.paper_cells) == 4
+    assert bundle.images.loc[0, "cell_count"] == 4
+    assert bundle.images.loc[0, "cell__area__median"] == 50.0
+    assert bundle.paper_cells.loc[
+        bundle.paper_cells["cell_label"].eq(1),
+        "nucleus_cytoplasm_area_ratio",
+    ].tolist() == pytest.approx([4 / 60, 4 / 60])
+    require_paper93_preflight(bundle, formal=False)
+
+
+def test_paper93_rejects_one_nucleus_mapped_to_two_cells_with_label_evidence(
+    frozen_evidence: Round1Evidence,
+) -> None:
+    cells, nuclei = _multi_nucleus_pair_masks()
+    evidence = _evidence_with_round1_pairs(frozen_evidence, cells, nuclei)
+    duplicate_nucleus = evidence.basic_cells.iloc[[0]].copy()
+    duplicate_nucleus.loc[:, "cell_label"] = 2
+    evidence = replace(
+        evidence,
+        basic_cells=pd.concat(
+            [evidence.basic_cells, duplicate_nucleus],
+            ignore_index=True,
+        ),
+    )
+
+    bundle = extract_locked_paper93(evidence, validate_frozen_masks(evidence))
+
+    assert bundle.extraction_qc["status"].tolist() == ["failed"]
+    reason = bundle.extraction_qc.loc[0, "reason"]
+    assert "nucleus_label=1" in reason
+    assert "cell_labels=[1, 2]" in reason
+
+
+def test_paper93_rejects_frozen_pair_when_centroid_maps_to_another_cell(
+    frozen_evidence: Round1Evidence,
+) -> None:
+    cells, nuclei = _multi_nucleus_pair_masks()
+    evidence = _evidence_with_round1_pairs(frozen_evidence, cells, nuclei)
+    cells[3, 3] = 2
+    _replace_mask_arrays(evidence, cells, nuclei)
+
+    bundle = extract_locked_paper93(evidence, validate_frozen_masks(evidence))
+
+    assert bundle.extraction_qc["status"].tolist() == ["failed"]
+    assert "centroid" in bundle.extraction_qc.loc[0, "reason"]
+    assert "expected_cell_label=1" in bundle.extraction_qc.loc[0, "reason"]
+    assert "actual_cell_label=2" in bundle.extraction_qc.loc[0, "reason"]
+
+
+def test_paper93_accepts_exact_round1_outside_fraction_boundary(
+    frozen_evidence: Round1Evidence,
+) -> None:
+    cells, nuclei = _outside_boundary_masks(exact=True)
+    evidence = _evidence_with_round1_pairs(frozen_evidence, cells, nuclei)
+
+    bundle = extract_locked_paper93(evidence, validate_frozen_masks(evidence))
+
+    assert bundle.extraction_qc["status"].tolist() == ["passed"]
+    assert bundle.paper_cells.loc[
+        bundle.paper_cells["nucleus_label"].eq(1),
+        "nucleus_outside_fraction",
+    ].item() == pytest.approx(0.05)
+    qc = bundle.extraction_qc.iloc[0]
+    assert qc["retained_outside_pair_count"] == 1
+    assert qc["max_retained_outside_fraction"] == pytest.approx(0.05)
+    assert qc["max_nucleus_outside_fraction"] == pytest.approx(0.05)
+    require_paper93_preflight(bundle, formal=False)
+
+
+def test_paper93_rejects_just_above_round1_outside_fraction_with_evidence(
+    frozen_evidence: Round1Evidence,
+) -> None:
+    cells, nuclei = _outside_boundary_masks(exact=True)
+    evidence = _evidence_with_round1_pairs(frozen_evidence, cells, nuclei)
+    cells, nuclei = _outside_boundary_masks(exact=False)
+    _replace_mask_arrays(evidence, cells, nuclei)
+
+    bundle = extract_locked_paper93(evidence, validate_frozen_masks(evidence))
+
+    assert bundle.extraction_qc["status"].tolist() == ["failed"]
+    reason = bundle.extraction_qc.loc[0, "reason"]
+    assert "cell_label=1" in reason
+    assert "nucleus_label=1" in reason
+    assert "outside_fraction=0.052631578947" in reason
+    assert "max_nucleus_outside_fraction=0.05" in reason
+
+
+def test_paper93_requires_pinned_round1_metadata_threshold(
+    frozen_evidence: Round1Evidence,
+    verified_mask_qc: pd.DataFrame,
+) -> None:
+    evidence = replace(frozen_evidence, metadata={})
+
+    with pytest.raises(
+        ValueError,
+        match="run_metadata.*max_nucleus_outside_fraction",
+    ):
+        extract_locked_paper93(evidence, verified_mask_qc)
+
+
+@pytest.mark.parametrize("embedded_threshold", [None, 0.1])
+def test_paper93_requires_embedded_provenance_threshold_to_match_metadata(
+    frozen_evidence: Round1Evidence,
+    embedded_threshold: float | None,
+) -> None:
+    evidence = _evidence_with_embedded_threshold(
+        frozen_evidence,
+        embedded_threshold,
+    )
+
+    bundle = extract_locked_paper93(evidence, validate_frozen_masks(evidence))
+
+    assert bundle.extraction_qc["status"].tolist() == ["failed"]
+    reason = bundle.extraction_qc.loc[0, "reason"]
+    assert "provenance" in reason
+    assert "max_nucleus_outside_fraction" in reason
+
+
+def test_paper93_mapping_qc_reports_exact_pair_count_relationships(
+    frozen_evidence: Round1Evidence,
+) -> None:
+    cells, nuclei = _multi_nucleus_pair_masks()
+    evidence = _evidence_with_round1_pairs(frozen_evidence, cells, nuclei)
+
+    bundle = extract_locked_paper93(evidence, validate_frozen_masks(evidence))
+
+    assert list(bundle.extraction_qc.columns) == EXTRACTION_QC_COLUMNS
+    qc = bundle.extraction_qc.iloc[0]
+    assert qc["aggregation_unit"] == "frozen_nucleus_cell_pair"
+    assert qc["roster_pair_count"] == 4
+    assert qc["extracted_pair_count"] == 4
+    assert qc["unique_cell_count"] == 3
+    assert qc["unique_nucleus_count"] == 4
+    assert qc["multi_nucleus_cell_count"] == 1
+    assert qc["multi_nucleus_pair_count"] == 2
+    assert qc["max_nuclei_per_cell"] == 2
+    assert qc["retained_outside_pair_count"] == 0
+    assert qc["max_retained_outside_fraction"] == 0.0
+    assert qc["max_nucleus_outside_fraction"] == pytest.approx(0.05)
+    require_paper93_preflight(bundle, formal=False)
+
+
+@pytest.mark.parametrize(
+    ("column", "forged"),
+    [
+        ("unique_cell_count", 999),
+        ("multi_nucleus_pair_count", 999),
+        ("retained_outside_pair_count", 999),
+        ("max_retained_outside_fraction", 0.04),
+        ("max_nucleus_outside_fraction", 0.1),
+        ("aggregation_unit", "unique_cell"),
+        ("status", "forged"),
+    ],
+)
+def test_paper93_preflight_rejects_forged_pair_mapping_qc(
+    frozen_evidence: Round1Evidence,
+    column: str,
+    forged: object,
+) -> None:
+    cells, nuclei = _multi_nucleus_pair_masks()
+    evidence = _evidence_with_round1_pairs(frozen_evidence, cells, nuclei)
+    bundle = extract_locked_paper93(evidence, validate_frozen_masks(evidence))
+    extraction_qc = bundle.extraction_qc.copy()
+    extraction_qc.loc[0, column] = forged
+
+    with pytest.raises(ValueError, match="extraction.*QC|pair mapping|status"):
+        require_paper93_preflight(
+            replace(bundle, extraction_qc=extraction_qc),
+            formal=False,
+        )
 
 
 def test_paper93_valid_counts_require_three_finite_cells_per_extra(
