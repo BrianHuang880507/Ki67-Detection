@@ -878,11 +878,16 @@ def _validate_valid_counts(bundle: Paper93Bundle) -> None:
         expected_roster_count = len(cells)
         expected_finite_count = int(np.isfinite(values).sum())
         try:
-            roster_count = int(row["roster_cell_count"])
-            finite_count = int(row["finite_cell_count"])
+            roster_count = _nonnegative_integer(
+                row["roster_cell_count"], "roster_cell_count"
+            )
+            finite_count = _nonnegative_integer(
+                row["finite_cell_count"], "finite_cell_count"
+            )
         except (TypeError, ValueError, OverflowError) as error:
             raise ValueError(
-                f"Paper93 valid-count QC 非整數：image_key={image_key}, feature={feature}"
+                f"Paper93 valid-count QC 非整數：image_key={image_key}, "
+                f"feature={feature}, error={error}"
             ) from error
         expected_status = "passed" if expected_finite_count >= required else "failed"
         if (

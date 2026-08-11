@@ -118,12 +118,7 @@ def publish_round2_generation(generation: Round2Generation) -> None:
     """
     output, staging = _validate_generation(generation)
     validate_round2_bundle(staging, smoke=output.name == "smoke")
-    existing_files = [path for path in output.iterdir() if path.is_file() or path.is_symlink()]
-    unexpected = sorted(path.name for path in existing_files if path.name not in _BUNDLE_FILE_NAMES)
-    if unexpected:
-        raise ValueError(f"Round 2 output 含非預期檔案：{unexpected}")
-    for path in existing_files:
-        _assert_regular_file(output, path)
+    existing_files = _preflight_published_root(output)
 
     archive: Path | None = None
     archived: list[str] = []
@@ -146,20 +141,61 @@ def publish_round2_generation(generation: Round2Generation) -> None:
                 raise FileExistsError(f"Round 2 destination 已存在：{name}")
             os.replace(source, destination)
             published.append(name)
+        validate_round2_bundle(output, smoke=output.name == "smoke")
         staging.rmdir()
-    except Exception:
+    except BaseException:
         for name in reversed(published):
-            destination = output / name
-            if destination.exists() and not (staging / name).exists():
-                os.replace(destination, staging / name)
+            try:
+                destination = output / name
+                if destination.exists() and not (staging / name).exists():
+                    os.replace(destination, staging / name)
+            except BaseException:  # noqa: BLE001 - rollback 不可掩蓋原始中斷
+                pass
         if archive is not None:
             for name in reversed(archived):
-                source = archive / name
-                if source.exists() and not (output / name).exists():
-                    os.replace(source, output / name)
-            if archive.exists() and not any(archive.iterdir()):
-                archive.rmdir()
+                try:
+                    source = archive / name
+                    if source.exists() and not (output / name).exists():
+                        os.replace(source, output / name)
+                except BaseException:  # noqa: BLE001 - rollback 不可掩蓋原始中斷
+                    pass
+            try:
+                if archive.exists() and not any(archive.iterdir()):
+                    archive.rmdir()
+            except BaseException:  # noqa: BLE001 - rollback 不可掩蓋原始中斷
+                pass
         raise
+
+
+def _preflight_published_root(output: Path) -> list[Path]:
+    """在首次 rename 前驗證 published root 的完整 child 類型契約。
+
+    Args:
+        output: 已核准的 formal root 或 smoke root。
+
+    Returns:
+        目前位於 root 的既有 bundle regular files。
+
+    Raises:
+        ValueError: 當 root 含未知 child、symlink 或不安全目錄時拋出。
+    """
+    children = list(output.iterdir())
+    allowed_directories = {"_generations"}
+    if output.name != "smoke":
+        allowed_directories.add("smoke")
+    existing_files: list[Path] = []
+    unexpected: list[str] = []
+    for child in children:
+        if child.name in _BUNDLE_FILE_NAMES:
+            _assert_regular_file(output, child)
+            existing_files.append(child)
+        elif child.name in allowed_directories:
+            _assert_safe_directory(output, child)
+        else:
+            unexpected.append(child.name)
+    if unexpected:
+        raise ValueError(f"Round 2 output 含非預期 child：{sorted(unexpected)}")
+    return existing_files
 
 
 def quarantine_round2_generation(generation: Round2Generation) -> Path:

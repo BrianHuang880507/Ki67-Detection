@@ -66,6 +66,29 @@ _ROUND2_FEATURES = {
     "min_finite_cells_per_feature": 3,
     "numeric_atol": 1e-12,
 }
+_ROUND2_BENCHMARK = {
+    "seed": 20260804,
+    "inner_splits": 5,
+    "max_hyperparameter_candidates": 24,
+    "n_jobs": 1,
+    "permutation_repeats": 20,
+    "tree_estimators": 400,
+    "simplicity_order": [
+        "paper_linear_3f",
+        "ridge",
+        "elasticnet",
+        "rbf_svr",
+        "hist_gradient_boosting",
+        "random_forest",
+        "extra_trees",
+    ],
+}
+_ROUND2_SMOKE = {
+    "fovs_per_condition": 1,
+    "max_hyperparameter_candidates": 1,
+    "permutation_repeats": 2,
+    "tree_estimators": 10,
+}
 _EXPECTED_ROUND1_COUNTS = {
     "raw_pc": 720,
     "raw_ido": 719,
@@ -200,6 +223,8 @@ def run_round2(
     """
     if not isinstance(config, Mapping):
         raise TypeError("Round 2 config 必須是 mapping")
+    _validate_locked_mapping(config, "benchmark", _ROUND2_BENCHMARK)
+    _validate_locked_mapping(config, "smoke", _ROUND2_SMOKE)
     smoke = smoke_fovs_per_condition is not None
     smoke_count = _smoke_count(smoke_fovs_per_condition) if smoke else None
     output_value = _required_mapping(config, "output").get("dir")
@@ -517,6 +542,8 @@ def _effective_config(
     smoke_fovs_per_condition: int | None,
 ) -> dict[str, Any]:
     """建立保留原始設定、只縮小 smoke 計算量的 effective config。"""
+    _validate_locked_mapping(config, "benchmark", _ROUND2_BENCHMARK)
+    _validate_locked_mapping(config, "smoke", _ROUND2_SMOKE)
     effective = copy.deepcopy(dict(config))
     if smoke:
         benchmark = dict(_required_mapping(effective, "benchmark"))
@@ -822,8 +849,8 @@ def _validate_round2_config(config: dict[str, Any]) -> None:
         raise ValueError(f"Round 2 models 必須是 {list(ROUND2_MODELS)}")
     if config["features"] != _ROUND2_FEATURES:
         raise ValueError("Round 2 features 不符合 paper_style_median 93 predictors 合約")
-    if not isinstance(config["benchmark"], Mapping) or config["benchmark"].get("seed") != 20260804:
-        raise ValueError("Round 2 benchmark seed 必須是 20260804")
+    _validate_locked_mapping(config, "benchmark", _ROUND2_BENCHMARK)
+    _validate_locked_mapping(config, "smoke", _ROUND2_SMOKE)
     if not isinstance(config["round1"], Mapping):
         raise ValueError("Round 2 round1 必須是 mapping")
     expected = config["round1"].get("expected")
@@ -845,6 +872,40 @@ def _validate_round2_config(config: dict[str, Any]) -> None:
     if not isinstance(output, Mapping) or not isinstance(output.get("dir"), str):
         raise ValueError("Round 2 output.dir 必須是字串")
     resolve_round2_output_dir(output["dir"], smoke=False)
+
+
+def _validate_locked_mapping(
+    config: Mapping[str, Any],
+    section: str,
+    expected: Mapping[str, Any],
+) -> None:
+    """驗證不可變設定區段的鍵、型別與值皆完全相同。
+
+    Args:
+        config: 包含待驗證區段的 Round 2 設定。
+        section: 待驗證的設定區段名稱。
+        expected: 凍結的完整鍵值。
+
+    Raises:
+        ValueError: 當區段缺少、含額外鍵，或任一值偏移時拋出。
+    """
+    actual = config.get(section)
+    if not isinstance(actual, Mapping):
+        raise ValueError(f"Round 2 {section} 必須是 mapping")
+    actual_keys = set(actual)
+    expected_keys = set(expected)
+    if actual_keys != expected_keys:
+        missing = sorted(expected_keys - actual_keys)
+        extra = sorted(actual_keys - expected_keys)
+        raise ValueError(
+            f"Round 2 {section} keys 不符合凍結合約：missing={missing}, extra={extra}"
+        )
+    for field, expected_value in expected.items():
+        actual_value = actual[field]
+        if type(actual_value) is not type(expected_value) or actual_value != expected_value:
+            raise ValueError(
+                f"Round 2 {section}.{field} 必須是凍結值 {expected_value!r}"
+            )
 
 
 def _is_sha256(value: object) -> bool:

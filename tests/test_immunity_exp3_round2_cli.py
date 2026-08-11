@@ -40,9 +40,20 @@ def _synthetic_config(tmp_path: Path) -> dict[str, object]:
         },
         "benchmark": {
             "seed": 20260804,
+            "inner_splits": 5,
             "max_hyperparameter_candidates": 24,
+            "n_jobs": 1,
             "permutation_repeats": 20,
             "tree_estimators": 400,
+            "simplicity_order": [
+                "paper_linear_3f",
+                "ridge",
+                "elasticnet",
+                "rbf_svr",
+                "hist_gradient_boosting",
+                "random_forest",
+                "extra_trees",
+            ],
         },
         "smoke": {
             "fovs_per_condition": 1,
@@ -395,9 +406,20 @@ def test_round2_smoke_uses_subset_diagnostic_splits_and_nonformal_metadata(
     assert calls.count("run_paper93_benchmark") == 1
     assert captures["benchmark_config"] == {
         "seed": 20260804,
+        "inner_splits": 5,
         "max_hyperparameter_candidates": 1,
+        "n_jobs": 1,
         "permutation_repeats": 2,
         "tree_estimators": 10,
+        "simplicity_order": [
+            "paper_linear_3f",
+            "ridge",
+            "elasticnet",
+            "rbf_svr",
+            "hist_gradient_boosting",
+            "random_forest",
+            "extra_trees",
+        ],
     }
     metadata = captures["payloads"]["run_metadata.json"]
     assert metadata["diagnostic_splits"] is True
@@ -752,6 +774,97 @@ def test_round2_config_locks_exact_models_features_seed_and_frozen_hashes() -> N
         "A8333F12E1591D9E4C4174F5C6FE13DD31550124B19AEA3522F4D0F812E0E426"
     )
     assert len(config["round1"]["artifact_sha256"]) == 14
+
+
+_FORMAL_BENCHMARK_DRIFTS = (
+    ("seed", 20260805),
+    ("inner_splits", 4),
+    ("max_hyperparameter_candidates", 23),
+    ("n_jobs", 2),
+    ("permutation_repeats", 19),
+    ("tree_estimators", 399),
+    (
+        "simplicity_order",
+        [
+            "paper_linear_3f",
+            "ridge",
+            "elasticnet",
+            "rbf_svr",
+            "hist_gradient_boosting",
+            "extra_trees",
+            "random_forest",
+        ],
+    ),
+)
+_SMOKE_BENCHMARK_DRIFTS = (
+    ("max_hyperparameter_candidates", 2),
+    ("permutation_repeats", 3),
+    ("tree_estimators", 11),
+)
+
+
+@pytest.mark.parametrize(("field", "drifted"), _FORMAL_BENCHMARK_DRIFTS)
+def test_round2_config_rejects_every_formal_benchmark_drift(
+    tmp_path: Path,
+    field: str,
+    drifted: object,
+) -> None:
+    """YAML loader 必須逐欄鎖定正式 benchmark 資源與簡潔順序。"""
+    source = Path("immunity/configs/exp3_round2_paper93.yaml")
+    config = yaml.safe_load(source.read_text(encoding="utf-8"))
+    config["benchmark"][field] = drifted
+    path = tmp_path / f"formal-{field}.yaml"
+    path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=rf"benchmark.*{field}|{field}.*benchmark"):
+        load_round2_config(path)
+
+
+@pytest.mark.parametrize(("field", "drifted"), _SMOKE_BENCHMARK_DRIFTS)
+def test_round2_config_rejects_every_smoke_benchmark_override_drift(
+    tmp_path: Path,
+    field: str,
+    drifted: object,
+) -> None:
+    """Smoke 只能使用固定 1/2/10 overrides，不得由 YAML 擴張。"""
+    source = Path("immunity/configs/exp3_round2_paper93.yaml")
+    config = yaml.safe_load(source.read_text(encoding="utf-8"))
+    config["smoke"][field] = drifted
+    path = tmp_path / f"smoke-{field}.yaml"
+    path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=rf"smoke.*{field}|{field}.*smoke"):
+        load_round2_config(path)
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "drifted"),
+    [
+        *(("benchmark", field, value) for field, value in _FORMAL_BENCHMARK_DRIFTS),
+        *(("smoke", field, value) for field, value in _SMOKE_BENCHMARK_DRIFTS),
+    ],
+)
+def test_round2_direct_runner_cannot_bypass_benchmark_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    section: str,
+    field: str,
+    drifted: object,
+) -> None:
+    """Direct runner 必須在建立 generation 前重驗正式與 smoke 設定。"""
+    config = _synthetic_config(tmp_path)
+    config[section][field] = drifted
+    monkeypatch.setattr(run_module, "ROUND2_OUTPUT_ROOT", _formal_output(tmp_path).resolve())
+    begin = Mock(side_effect=AssertionError("generation must not begin"))
+    monkeypatch.setattr(run_module, "begin_round2_generation", begin)
+
+    with pytest.raises(ValueError, match=rf"{section}.*{field}|{field}.*{section}"):
+        run_module.run_round2(
+            config,
+            smoke_fovs_per_condition=1 if section == "smoke" else None,
+        )
+
+    begin.assert_not_called()
 
 
 @pytest.mark.parametrize(

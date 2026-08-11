@@ -725,6 +725,52 @@ def test_paper93_preflight_revalidates_qc_instead_of_trusting_passed_status(
         require_paper93_preflight(replace(bundle, **{table: changed}), formal=False)
 
 
+@pytest.mark.parametrize("bad_count", [3.5, True, -1])
+def test_paper93_valid_count_gate_rejects_non_strict_integers(
+    frozen_evidence: Round1Evidence,
+    verified_mask_qc: pd.DataFrame,
+    bad_count: object,
+) -> None:
+    """Valid-count 三個 count 欄位皆不得接受 bool、fraction 或負值。"""
+    bundle = extract_locked_paper93(frozen_evidence, verified_mask_qc)
+    for field in ("roster_cell_count", "finite_cell_count", "required_minimum"):
+        changed = bundle.valid_counts.copy().astype({field: object})
+        changed.loc[0, field] = bad_count
+        with pytest.raises(ValueError, match=field):
+            require_paper93_preflight(
+                replace(bundle, valid_counts=changed),
+                formal=False,
+            )
+
+
+@pytest.mark.parametrize("bad_count", [3.5, True, -1])
+def test_paper93_extraction_count_gate_rejects_non_strict_integers(
+    frozen_evidence: Round1Evidence,
+    verified_mask_qc: pd.DataFrame,
+    bad_count: object,
+) -> None:
+    """Extraction QC 每個 count 欄位皆採用不截斷的 nonnegative parser。"""
+    bundle = extract_locked_paper93(frozen_evidence, verified_mask_qc)
+    count_fields = (
+        "roster_pair_count",
+        "extracted_pair_count",
+        "unique_cell_count",
+        "unique_nucleus_count",
+        "multi_nucleus_cell_count",
+        "multi_nucleus_pair_count",
+        "max_nuclei_per_cell",
+        "retained_outside_pair_count",
+    )
+    for field in count_fields:
+        changed = bundle.extraction_qc.copy().astype({field: object})
+        changed.loc[0, field] = bad_count
+        with pytest.raises(ValueError, match="extraction QC.*不合法"):
+            require_paper93_preflight(
+                replace(bundle, extraction_qc=changed),
+                formal=False,
+            )
+
+
 @pytest.mark.parametrize("changed_table", ["images", "paper_cells"])
 def test_paper93_preflight_recomputes_60_extra_medians_from_cells(
     frozen_evidence: Round1Evidence,

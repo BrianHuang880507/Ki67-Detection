@@ -475,6 +475,15 @@ def _rehash(directory: Path, filename: str) -> None:
     )
 
 
+def _snapshot_files(directory: Path) -> dict[str, bytes]:
+    """擷取目錄內所有 regular files 的相對路徑與原始內容。"""
+    return {
+        path.relative_to(directory).as_posix(): path.read_bytes()
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+
+
 def test_round2_writer_publishes_exact_required_artifacts_atomically(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -730,6 +739,132 @@ def test_round2_publication_archives_prior_round2_generation_only(
     archives = sorted((output / "_generations").glob("archive-*"))
     assert len(archives) == 1
     assert (archives[0] / "EXPERIMENT_RECORD.md").read_text(encoding="utf-8") == old_record
+
+
+def test_round2_publication_rejects_unexpected_root_directory_before_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Publisher 必須在首次 rename 前拒絕任何非 managed root child。"""
+    output = _allowed_output(tmp_path, monkeypatch)
+    generation = _write_bundle(
+        output,
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    unexpected = output / "unmanaged"
+    unexpected.mkdir()
+    (unexpected / "owned.txt").write_bytes(b"must stay")
+    staging_before = _snapshot_files(generation.staging_dir)
+
+    with pytest.raises(ValueError, match="unmanaged|非預期"):
+        publish_round2_generation(generation)
+
+    assert _snapshot_files(generation.staging_dir) == staging_before
+    assert _snapshot_files(unexpected) == {"owned.txt": b"must stay"}
+    assert not any(path.is_file() for path in output.iterdir())
+
+
+@pytest.mark.parametrize("interruption_type", [KeyboardInterrupt, SystemExit])
+def test_round2_publication_restores_exact_state_after_base_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption_type: type[BaseException],
+) -> None:
+    """非 Exception 中斷發生在 replaces 之間也須精確復原並重拋原物件。"""
+    import immunity.exp3.round2_reporting as reporting
+
+    output = _allowed_output(tmp_path, monkeypatch)
+    first = _write_bundle(
+        output,
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    (first.staging_dir / "run.log").write_bytes(b"old generation\n")
+    publish_round2_generation(first)
+    second = _write_bundle(
+        output,
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    (second.staging_dir / "run.log").write_bytes(b"new generation\n")
+    old_root = {
+        path.name: path.read_bytes() for path in output.iterdir() if path.is_file()
+    }
+    staged = _snapshot_files(second.staging_dir)
+    assert not list((output / "_generations").glob("archive-*"))
+
+    real_replace = reporting.os.replace
+    interrupt_at = len(old_root) + 2
+    calls = 0
+    interruption = interruption_type("synthetic publication interruption")
+
+    def interrupt_between_replaces(
+        source: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == interrupt_at:
+            raise interruption
+        real_replace(source, destination)
+
+    monkeypatch.setattr(reporting.os, "replace", interrupt_between_replaces)
+
+    with pytest.raises(interruption_type) as caught:
+        publish_round2_generation(second)
+
+    assert caught.value is interruption
+    assert {
+        path.name: path.read_bytes() for path in output.iterdir() if path.is_file()
+    } == old_root
+    assert _snapshot_files(second.staging_dir) == staged
+    assert not list((output / "_generations").glob("archive-*"))
+
+
+def test_round2_publication_validates_published_root_before_removing_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """最後一次 replace 後的 corruption 必須由 published-root gate 攔截並復原。"""
+    import immunity.exp3.round2_reporting as reporting
+
+    output = _allowed_output(tmp_path, monkeypatch)
+    generation = _write_bundle(
+        output,
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    real_replace = reporting.os.replace
+
+    def corrupt_after_last_publish(
+        source: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+    ) -> None:
+        real_replace(source, destination)
+        destination_path = Path(destination)
+        if destination_path.parent == output and destination_path.name == "run.log":
+            with (output / "data_snapshot.csv").open("ab") as handle:
+                handle.write(b"corrupted-after-replace")
+
+    monkeypatch.setattr(reporting.os, "replace", corrupt_after_last_publish)
+
+    with pytest.raises(ValueError, match="hash|bytes"):
+        publish_round2_generation(generation)
+
+    assert generation.staging_dir.exists()
+    assert set(_snapshot_files(generation.staging_dir)) == {
+        *ROUND2_TABLE_NAMES,
+        *_JSON_NAMES,
+        "artifact_hashes.json",
+        "EXPERIMENT_RECORD.md",
+        "run.log",
+    }
+    assert not any(path.is_file() for path in output.iterdir())
 
 
 def test_round2_publication_never_moves_or_overwrites_round1_artifacts(
