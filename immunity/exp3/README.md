@@ -48,8 +48,14 @@ conda run --no-capture-output -n ki67dtc python -m immunity.exp3.run_round2_pape
 正式結果只會寫入 `immunity/outputs/exp3/round2_paper93/`；smoke 只會寫入其
 `smoke/` 子目錄。Smoke 僅驗證流程，不可用於 33 vs 93 的科學比較或 recommendation。
 
-IDO 只作亮度 target；結果不是免疫力 label，也不建立 donor label。Mask 或 frozen evidence
-不一致時，流程會停止並保留具名 QC；不會自動重新 segmentation、重寫 cache 或增加 exclusion。
+每個成功發布的 Round 2 bundle 固定包含 15 個 CSV、三個 caller JSON
+（`feature_sets.json`、`baseline_provenance.json`、`run_metadata.json`）、
+`artifact_hashes.json`、`EXPERIMENT_RECORD.md` 與 `run.log`；不產生 PNG。
+
+IDO 只作亮度 target；結果不是免疫力 label，也不建立 donor label。Mask provenance 不一致時，
+流程會停止，並在 failed generation 保留 `mask_provenance_qc.csv`。Frozen Round 1 evidence 載入
+不一致時，流程同樣停止，原因寫入 quarantined `run.log`，但此階段不保證存在 QC CSV。兩種情況
+都不會自動重新 segmentation、重寫 cache 或增加 exclusion。
 
 ## 特徵與模型範圍
 
@@ -79,15 +85,14 @@ secondary sets，結果標記為
 ΔMorphology 只描述 9 個 `B-ID × passage` biological groups 的 group-level patterns，不進入
 本次 regression，也不能把最多 719 張 FOV 當成 719 個獨立 biological samples。
 
-## 主要輸出
+## Round 1 主要輸出 contract
 
-每次成功執行會產生固定 13 個結果 CSV、`feature_sets.json`、`run_metadata.json`、8 張 PNG
-與 `EXPERIMENT_RECORD.md`。若 eligibility gate 選出 winner，另在 `models/` 保存 model bundle
-及相符的 `final_model.json`。Metadata 包含 UTC timestamps、runtime、Git 狀態、config／
-manifest SHA-256、Python／套件版本、seeds、feature sets、input counts、cache hits 與 failure
-count。
+Round 1 每次成功執行會產生固定 13 個結果 CSV、`feature_sets.json`、`run_metadata.json`、
+8 張 PNG 與 `EXPERIMENT_RECORD.md`。若 eligibility gate 選出 winner，另在 `models/` 保存 model
+bundle 及相符的 `final_model.json`。Metadata 包含 UTC timestamps、runtime、Git 狀態、config／
+manifest SHA-256、Python／套件版本、seeds、feature sets、input counts、cache hits 與 failure count。
 
-## 執行世代與 cache
+## Round 1 執行世代與 cache
 
 新 run 會先把固定名稱的上一世代 tables、JSON、record、figures 與 models 搬到同一 run root
 下的 `_generations/previous-*`，不會刪除 `feature_cache/` 或移動正在寫入的 `run.log`。若本世代
