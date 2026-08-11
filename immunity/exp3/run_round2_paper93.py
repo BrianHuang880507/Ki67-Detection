@@ -35,6 +35,27 @@ _EXPECTED_ROUND1_COUNTS = {
     "outer_folds": 23,
     "seed": 20260804,
 }
+_FROZEN_ROUND1_EXPECTED = {
+    **_EXPECTED_ROUND1_COUNTS,
+    "manifest_hash": "b4508aaf830f4c456759d1f02458606aa28ed385856575c6fb99a5ac2e163771",
+    "config_hash": "b7590ed3438cdb5062b2588e525e603dd0b7610d397322c761facdaea5b54bc0",
+}
+_FROZEN_ROUND1_ARTIFACT_SHA256 = {
+    "pairing_qc.csv": "0fa953eceb35678aab0209214eb1ee267e844a0b81e649b0c0acca487246e0eb",
+    "data_manifest.csv": "b4508aaf830f4c456759d1f02458606aa28ed385856575c6fb99a5ac2e163771",
+    "segmentation_qc.csv": "2a1e8969fc8d0a81d3dd737ef99df57f58ce3e1faf0206e833463f2dc9d28c1e",
+    "outer_splits.csv": "c7e9e26a9ad0c6f73d8f14c5fa4c73747f6e58865aac963bf8e16e527fa05a3e",
+    "feature_cache/image_level_basic.csv": "dad479258d08846d05a43f551b0001a52d96fa5e2e8ea6a98645723931aa0d14",
+    "feature_cache/cell_level_basic.csv": "7d999a728d848ccb61a3910cb5230c9efde6d7e1fa14f22de792990ee4ad7850",
+    "fold_metrics.csv": "8ce0df3866822a54c98cb1cd95dbec3c3a8ffa130af54890692b240250091884",
+    "oof_predictions.csv": "637242dc0f45c4dc436643214c21ac451fc560d7ae36b25a6db04aafe5d6a2c8",
+    "model_ranking.csv": "d279ae973d5ab7508e97460bb1b6f94dd95345ce27d4cca0ad2f587516cb72e4",
+    "hyperparameters.csv": "5da9c936b573126d21417752d0fd140306562ed387b299364a5cd356268bfe00",
+    "feature_importance.csv": "17cf4bafdb1d7b87654d7efd58ef79584f1324c40abac3cb7bdfc617a510b9f6",
+    "model_failures.csv": "b1ce311d21be365f1e5a010d9eb16aaea997e5d843e5b630aef77c91b52d98ea",
+    "feature_sets.json": "49e65affebbab6285170e45048eee3991bfc70e1a53454d7e6bbc94a092e28cd",
+    "run_metadata.json": "d0cdfabea5f9243eeadf7eb2278019f9497a75c3e82ba129b4077e1f62566b9f",
+}
 
 
 def load_round2_config(path: str | Path) -> dict[str, Any]:
@@ -125,18 +146,17 @@ def _validate_round2_config(config: dict[str, Any]) -> None:
     if not isinstance(config["round1"], Mapping):
         raise ValueError("Round 2 round1 必須是 mapping")
     expected = config["round1"].get("expected")
-    if not isinstance(expected, Mapping) or any(
-        expected.get(name) != value for name, value in _EXPECTED_ROUND1_COUNTS.items()
-    ):
-        raise ValueError("Round 2 round1 expected 不符合凍結計數")
+    if not isinstance(expected, Mapping) or dict(expected) != _FROZEN_ROUND1_EXPECTED:
+        raise ValueError("Round 2 round1 expected 不符合凍結 identity")
     roster_sha256 = config["round1"].get("roster_sha256")
     if not _is_sha256(roster_sha256):
         raise ValueError("Round 2 roster_sha256 必須是 SHA-256")
     artifacts = config["round1"].get("artifact_sha256")
-    if not isinstance(artifacts, Mapping) or len(artifacts) != 14 or not all(
-        isinstance(name, str) and _is_sha256(value) for name, value in artifacts.items()
+    if (
+        not isinstance(artifacts, Mapping)
+        or dict(artifacts) != _FROZEN_ROUND1_ARTIFACT_SHA256
     ):
-        raise ValueError("Round 2 artifact_sha256 必須包含 14 個 SHA-256")
+        raise ValueError("Round 2 artifact_sha256 不符合凍結 identity")
     output = config["output"]
     if not isinstance(output, Mapping) or not isinstance(output.get("dir"), str):
         raise ValueError("Round 2 output.dir 必須是字串")

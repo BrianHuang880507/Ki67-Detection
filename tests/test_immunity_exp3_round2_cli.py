@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 import immunity.exp3.run_round2_paper93 as run_module
 from immunity.exp3.run_round2_paper93 import (
@@ -49,6 +50,33 @@ def test_round2_config_locks_exact_models_features_seed_and_frozen_hashes() -> N
         "A8333F12E1591D9E4C4174F5C6FE13DD31550124B19AEA3522F4D0F812E0E426"
     )
     assert len(config["round1"]["artifact_sha256"]) == 14
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["manifest_hash", "config_hash", "artifact_name", "artifact_hash"],
+)
+def test_round2_config_rejects_mutated_frozen_round1_identity(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """即使格式正確，Round 1 的凍結 identity 不可遭竄改。"""
+    source = Path("immunity/configs/exp3_round2_paper93.yaml")
+    config = yaml.safe_load(source.read_text(encoding="utf-8"))
+    if mutation == "manifest_hash":
+        config["round1"]["expected"]["manifest_hash"] = "0" * 64
+    elif mutation == "config_hash":
+        config["round1"]["expected"]["config_hash"] = "0" * 64
+    elif mutation == "artifact_name":
+        artifacts = config["round1"]["artifact_sha256"]
+        artifacts["unexpected.csv"] = artifacts.pop("pairing_qc.csv")
+    else:
+        config["round1"]["artifact_sha256"]["pairing_qc.csv"] = "0" * 64
+    path = tmp_path / "mutated-round2.yaml"
+    path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Round 2"):
+        load_round2_config(path)
 
 
 def test_round2_output_resolver_accepts_only_formal_root_and_smoke_child(
