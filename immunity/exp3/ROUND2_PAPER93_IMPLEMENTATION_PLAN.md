@@ -1403,6 +1403,35 @@ git status --short
 
 Expected: tests PASS、diff check 無輸出；只保留已知未提交的 exp3.yaml／test_immunity_exp3_cli.py changes，以及任何刻意未 commit 的 runtime outputs。
 
+## Standalone Validator Acceptance Checklist（Final Fix Wave）
+
+- [x] Published root 在首次 rename 前枚舉所有 children；只接受固定 bundle files、
+  安全 `_generations/`，以及 formal root 的安全 regular `smoke/`。
+- [x] Publication 完成全部 staging replaces 後、刪除 staging 前，重新驗證 published root；
+  `BaseException` 走 best-effort rollback 並重拋原始物件。
+- [x] `run_metadata.json.reproducibility` 精確驗證 Git commit／branch／porcelain status／dirty、
+  Python、五個主要 package versions、UTC start/completion 與 finite runtime/duration 一致性；
+  dirty worktree 是合法 provenance，不要求 clean Git。
+- [x] `baseline_provenance.json` 精確驗證 schema、`read_only=true`、Round 1 root、roster hash、
+  artifact hash identities，並與 original/effective config evidence 對帳。
+- [x] `data_snapshot.csv` 的 target 與全部 93 predictors 都必須 numeric finite；
+  `mask_provenance_qc.csv` 必須 exact image coverage、無重複且全部 passed。
+- [x] `feature_valid_counts.csv` 必須 exact data FOV × 60 extras；所有 count 使用 strict integer
+  parser，固定 minimum=3，並重算 status、finite≤roster 與逐 FOV roster 一致性。
+- [x] `extraction_qc.csv` 必須 exact image coverage、全部 passed、extracted=roster、固定 pair
+  aggregation unit、pair topology count consistency，以及 frozen outside fraction ≤0.05；所有 totals
+  與 `run_metadata.json`／`pair_mapping_summary` 重新對帳。
+- [x] Candidate 與 Dummy OOF observed/predicted 必須 numeric finite，observed 必須逐列等於
+  data target；formal successful identities 必須精確符合 frozen test membership，每個
+  configuration × validation family × image 恰好一次，failed folds 與 metrics／failures／OOF／
+  hyperparameters 一致。
+- [x] Formal ranking 由 raw folds、candidate/Dummy OOF 與 failures 重新計算 pooled family MAE、
+  `method=min` ranks、average/worst rank、五個 eligibility gates、strict `<0.25` tie band、
+  same-algorithm 33-feature elimination 與 deterministic recommendation；
+  `feature_set_comparison.csv`、`eligibility.csv` 的每個 derived field 都逐欄比對。
+- [x] Smoke 只接受非空 strict subset、Paper93 ET/RF 流程、無 recommendation，且 metadata／
+  record 必須同時明示 diagnostic、non-formal 與不形成科學結論。
+
 ## Execution Handoff
 
 推薦用 superpowers:subagent-driven-development：每個 Task 使用 fresh subagent，完成後依序做 spec compliance 與 code quality review，再進下一 Task。若改用 superpowers:executing-plans，則以 Task 1–3、Task 4–7、Task 8–10 三個 checkpoints 分批執行；任何 preflight／smoke failure 都先停下來檢查 evidence，不直接進 formal full run。
