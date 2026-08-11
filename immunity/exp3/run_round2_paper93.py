@@ -40,6 +40,9 @@ _FROZEN_ROUND1_EXPECTED = {
     "manifest_hash": "b4508aaf830f4c456759d1f02458606aa28ed385856575c6fb99a5ac2e163771",
     "config_hash": "b7590ed3438cdb5062b2588e525e603dd0b7610d397322c761facdaea5b54bc0",
 }
+_FROZEN_ROUND1_ROSTER_SHA256 = (
+    "a8333f12e1591d9e4c4174f5c6fe13dd31550124b19aea3522f4d0f812e0e426"
+)
 _FROZEN_ROUND1_ARTIFACT_SHA256 = {
     "pairing_qc.csv": "0fa953eceb35678aab0209214eb1ee267e844a0b81e649b0c0acca487246e0eb",
     "data_manifest.csv": "b4508aaf830f4c456759d1f02458606aa28ed385856575c6fb99a5ac2e163771",
@@ -149,8 +152,11 @@ def _validate_round2_config(config: dict[str, Any]) -> None:
     if not isinstance(expected, Mapping) or dict(expected) != _FROZEN_ROUND1_EXPECTED:
         raise ValueError("Round 2 round1 expected 不符合凍結 identity")
     roster_sha256 = config["round1"].get("roster_sha256")
-    if not _is_sha256(roster_sha256):
-        raise ValueError("Round 2 roster_sha256 必須是 SHA-256")
+    if (
+        not _is_sha256(roster_sha256)
+        or roster_sha256.lower() != _FROZEN_ROUND1_ROSTER_SHA256
+    ):
+        raise ValueError("Round 2 roster_sha256 不符合凍結 identity")
     artifacts = config["round1"].get("artifact_sha256")
     if (
         not isinstance(artifacts, Mapping)

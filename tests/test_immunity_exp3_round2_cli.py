@@ -54,7 +54,13 @@ def test_round2_config_locks_exact_models_features_seed_and_frozen_hashes() -> N
 
 @pytest.mark.parametrize(
     "mutation",
-    ["manifest_hash", "config_hash", "artifact_name", "artifact_hash"],
+    [
+        "manifest_hash",
+        "config_hash",
+        "roster_sha256",
+        "artifact_name",
+        "artifact_hash",
+    ],
 )
 def test_round2_config_rejects_mutated_frozen_round1_identity(
     tmp_path: Path,
@@ -67,6 +73,8 @@ def test_round2_config_rejects_mutated_frozen_round1_identity(
         config["round1"]["expected"]["manifest_hash"] = "0" * 64
     elif mutation == "config_hash":
         config["round1"]["expected"]["config_hash"] = "0" * 64
+    elif mutation == "roster_sha256":
+        config["round1"]["roster_sha256"] = "0" * 64
     elif mutation == "artifact_name":
         artifacts = config["round1"]["artifact_sha256"]
         artifacts["unexpected.csv"] = artifacts.pop("pairing_qc.csv")
