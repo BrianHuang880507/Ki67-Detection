@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from io import StringIO
 import os
 from pathlib import Path
@@ -162,6 +163,38 @@ def _patch_round2_stages(
         "result": result,
     }
 
+    def collect_reproducibility() -> dict[str, object]:
+        calls.append("collect_reproducibility_metadata")
+        return {
+            "schema_version": 1,
+            "git": {
+                "commit": "a" * 40,
+                "branch": "codex/exp3-multimodel-benchmark",
+                "status_porcelain": " M immunity/configs/exp3.yaml",
+                "dirty": True,
+            },
+            "python": {"version": "3.10.11"},
+            "packages": {
+                "numpy": "1.26.4",
+                "pandas": "2.2.3",
+                "scikit-learn": "1.5.2",
+                "OpenCV": "4.10.0",
+                "PyYAML": "6.0.2",
+            },
+            "timing": {"started_at_utc": "2026-08-12T00:00:00.000000Z"},
+        }
+
+    monkeypatch.setattr(
+        run_module,
+        "collect_reproducibility_metadata",
+        collect_reproducibility,
+    )
+    monkeypatch.setattr(
+        run_module,
+        "_utc_now",
+        lambda: datetime(2026, 8, 12, 0, 0, 1, tzinfo=timezone.utc),
+    )
+
     def stage(name: str, value: object):
         def invoke(*args: object, **kwargs: object) -> object:
             calls.append(name)
@@ -278,6 +311,7 @@ def test_round2_orchestrator_runs_locked_stages_in_order(
     record = run_module.run_round2(_synthetic_config(tmp_path))
 
     assert calls == [
+        "collect_reproducibility_metadata",
         "load_round1_evidence",
         "require_formal_round1_evidence",
         "validate_frozen_masks",
@@ -488,6 +522,11 @@ def test_round2_metadata_and_record_context_include_computed_pair_summary(
     assert metadata["aggregation_unit"] == "frozen_nucleus_cell_pair"
     assert metadata["valid_pair_observations"] == 4
     assert metadata["pair_mapping_summary"] == expected
+    reproducibility = metadata["reproducibility"]
+    assert reproducibility["schema_version"] == 1
+    assert reproducibility["git"]["dirty"] is True
+    assert reproducibility["timing"]["completed_at_utc"].endswith("Z")
+    assert reproducibility["timing"]["runtime_seconds"] >= 0.0
     assert captures["context"]["valid_pair_observations"] == 4
     assert captures["context"]["pair_mapping_summary"] == expected
 
@@ -523,6 +562,83 @@ def test_round2_smoke_rejects_full_roster_before_downstream_stages(
     validate.assert_not_called()
     extract.assert_not_called()
     benchmark.assert_not_called()
+
+
+def test_round2_reproducibility_collector_uses_safe_git_argv_and_fixed_schema() -> None:
+    """Collector 必須用無 shell 的 argv 收集 fail-closed Git 與版本證據。"""
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    outputs = iter(
+        [
+            "4b3a12093975feb9f6166b7c5fc489434fbebba4\n",
+            "codex/exp3-multimodel-benchmark\n",
+            " M immunity/configs/exp3.yaml\n M tests/test_immunity_exp3_cli.py\n",
+        ]
+    )
+
+    def run_command(command: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append((command, kwargs))
+        return SimpleNamespace(stdout=next(outputs))
+
+    collected = run_module.collect_reproducibility_metadata(
+        command_runner=run_command,
+        utc_now=lambda: datetime(2026, 8, 11, 13, 9, 49, 867240, tzinfo=timezone.utc),
+        package_versions={
+            "numpy": "1.26.4",
+            "pandas": "2.2.3",
+            "scikit-learn": "1.5.2",
+            "OpenCV": "4.10.0",
+            "PyYAML": "6.0.2",
+        },
+        python_version="3.10.11",
+    )
+
+    assert [command[-2:] for command, _ in calls] == [
+        ["rev-parse", "HEAD"],
+        ["--show-current", "--quiet"],
+        ["--untracked-files=all", "--no-renames"],
+    ]
+    assert all(kwargs["shell"] is False for _, kwargs in calls)
+    assert collected == {
+        "schema_version": 1,
+        "git": {
+            "commit": "4b3a12093975feb9f6166b7c5fc489434fbebba4",
+            "branch": "codex/exp3-multimodel-benchmark",
+            "status_porcelain": (
+                " M immunity/configs/exp3.yaml\n"
+                " M tests/test_immunity_exp3_cli.py"
+            ),
+            "dirty": True,
+        },
+        "python": {"version": "3.10.11"},
+        "packages": {
+            "numpy": "1.26.4",
+            "pandas": "2.2.3",
+            "scikit-learn": "1.5.2",
+            "OpenCV": "4.10.0",
+            "PyYAML": "6.0.2",
+        },
+        "timing": {"started_at_utc": "2026-08-11T13:09:49.867240Z"},
+    }
+
+
+def test_round2_reproducibility_failure_prevents_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Git 或版本 provenance 無法收集時不得建立 staging 或開始資料工作。"""
+    monkeypatch.setattr(run_module, "ROUND2_OUTPUT_ROOT", _formal_output(tmp_path).resolve())
+    begin = Mock(side_effect=AssertionError("generation must not begin"))
+    monkeypatch.setattr(run_module, "begin_round2_generation", begin)
+
+    with pytest.raises(RuntimeError, match="git unavailable"):
+        run_module.run_round2(
+            _synthetic_config(tmp_path),
+            reproducibility_collector=Mock(
+                side_effect=RuntimeError("git unavailable")
+            ),
+        )
+
+    begin.assert_not_called()
 
 
 @pytest.mark.parametrize("count", [0, -1])

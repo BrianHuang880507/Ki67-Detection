@@ -6,11 +6,14 @@ import argparse
 import contextlib
 import copy
 import os
+import platform
 import stat
+import subprocess
 import sys
 import time
 import traceback
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -186,6 +189,134 @@ def resolve_round2_output_dir(path: str | Path, *, smoke: bool) -> Path:
     return expected_target
 
 
+def collect_reproducibility_metadata(
+    *,
+    command_runner: Callable[..., Any] | None = None,
+    utc_now: Callable[[], datetime] | None = None,
+    package_versions: Mapping[str, str] | None = None,
+    python_version: str | None = None,
+) -> dict[str, Any]:
+    """在 pipeline 工作開始前收集可重現性 provenance。
+
+    Args:
+        command_runner: 可注入的 subprocess-compatible Git runner。
+        utc_now: 可注入的 timezone-aware UTC clock。
+        package_versions: 可注入的五個主要 package 版本 mapping。
+        python_version: 可注入的 Python 版本字串。
+
+    Returns:
+        尚未填入 completion 與 runtime 的結構化 provenance。
+
+    Raises:
+        RuntimeError: Git identity、branch、package 或 Python 版本無法取得時拋出。
+        ValueError: UTC clock 或注入 schema 不合法時拋出。
+    """
+    runner = command_runner or subprocess.run
+    started_at_utc = _format_utc((utc_now or _utc_now)())
+
+    def git_output(arguments: list[str]) -> str:
+        completed = runner(
+            ["git", "-C", str(PROJECT_ROOT), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            shell=False,
+        )
+        output = getattr(completed, "stdout", None)
+        if not isinstance(output, str):
+            raise RuntimeError(f"Git provenance 缺少 stdout：{arguments}")
+        return output.rstrip("\r\n")
+
+    commit = git_output(["rev-parse", "HEAD"])
+    branch = git_output(["branch", "--show-current", "--quiet"])
+    status = git_output(
+        ["status", "--porcelain=v1", "--untracked-files=all", "--no-renames"]
+    )
+    if not _is_git_commit(commit):
+        raise RuntimeError("Git commit 必須是 40 位元十六進位 identity")
+    if not branch.strip():
+        raise RuntimeError("Git branch 不可為空或 detached HEAD")
+
+    versions = dict(package_versions or _main_package_versions())
+    expected_packages = {"numpy", "pandas", "scikit-learn", "OpenCV", "PyYAML"}
+    if set(versions) != expected_packages or any(
+        not isinstance(value, str) or not value.strip() for value in versions.values()
+    ):
+        raise RuntimeError("主要 package versions 必須完整且為非空字串")
+    resolved_python = python_version or platform.python_version()
+    if not isinstance(resolved_python, str) or not resolved_python.strip():
+        raise RuntimeError("Python version 不可為空")
+    return {
+        "schema_version": 1,
+        "git": {
+            "commit": commit,
+            "branch": branch,
+            "status_porcelain": status,
+            "dirty": bool(status),
+        },
+        "python": {"version": resolved_python},
+        "packages": versions,
+        "timing": {"started_at_utc": started_at_utc},
+    }
+
+
+def _main_package_versions() -> dict[str, str]:
+    """讀取 Round 2 主要 runtime packages 的實際版本。"""
+    try:
+        import cv2
+        import sklearn
+    except ImportError as error:
+        raise RuntimeError("無法載入 Round 2 主要 package versions") from error
+    return {
+        "numpy": str(np.__version__),
+        "pandas": str(pd.__version__),
+        "scikit-learn": str(sklearn.__version__),
+        "OpenCV": str(cv2.__version__),
+        "PyYAML": str(yaml.__version__),
+    }
+
+
+def _finalize_reproducibility_metadata(
+    collected: Mapping[str, Any],
+    *,
+    runtime_seconds: float,
+) -> dict[str, Any]:
+    """在 benchmark 後補齊 UTC completion 與 monotonic runtime。"""
+    runtime = float(runtime_seconds)
+    if not np.isfinite(runtime) or runtime < 0.0:
+        raise ValueError("runtime_seconds 必須是 finite nonnegative number")
+    finalized = copy.deepcopy(dict(collected))
+    timing = finalized.get("timing")
+    if not isinstance(timing, dict):
+        raise ValueError("reproducibility timing 必須是 mapping")
+    timing["completed_at_utc"] = _format_utc(_utc_now())
+    timing["runtime_seconds"] = runtime
+    return finalized
+
+
+def _utc_now() -> datetime:
+    """回傳 timezone-aware UTC 現在時間，供測試注入。"""
+    return datetime.now(timezone.utc)
+
+
+def _format_utc(value: datetime) -> str:
+    """格式化 microsecond 精度且以 ``Z`` 結尾的 UTC timestamp。"""
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ValueError("UTC timestamp 必須是 timezone-aware datetime")
+    normalized = value.astimezone(timezone.utc)
+    if value.utcoffset() != normalized.utcoffset():
+        raise ValueError("UTC timestamp 必須使用 UTC offset")
+    return normalized.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _is_git_commit(value: object) -> bool:
+    """判斷值是否為完整 40 位元十六進位 Git commit。"""
+    return isinstance(value, str) and len(value) == 40 and all(
+        character in "0123456789abcdefABCDEF" for character in value
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """建立 Round 2 CLI 的參數解析器。
 
@@ -205,6 +336,8 @@ def build_parser() -> argparse.ArgumentParser:
 def run_round2(
     config: Mapping[str, Any],
     smoke_fovs_per_condition: int | None = None,
+    *,
+    reproducibility_collector: Callable[[], Mapping[str, Any]] | None = None,
 ) -> Path:
     """執行並原子發布獨立的 Exp3 Round 2 Paper93 generation。
 
@@ -212,6 +345,8 @@ def run_round2(
         config: 已驗證且含 Round 1 pins、feature、benchmark 與 output 的設定。
         smoke_fovs_per_condition: 每個 ``group_id × condition_index`` 保留的
             smoke FOV 數；省略時執行正式 frozen membership benchmark。
+        reproducibility_collector: 可注入的 Git、Python、package 與 UTC 起始證據
+            collector；省略時使用 fail-closed production collector。
 
     Returns:
         已發布且存在的 ``EXPERIMENT_RECORD.md`` 路徑。
@@ -227,13 +362,15 @@ def run_round2(
     _validate_locked_mapping(config, "smoke", _ROUND2_SMOKE)
     smoke = smoke_fovs_per_condition is not None
     smoke_count = _smoke_count(smoke_fovs_per_condition) if smoke else None
+    started = time.perf_counter()
+    collector = reproducibility_collector or collect_reproducibility_metadata
+    reproducibility_start = collector()
     output_value = _required_mapping(config, "output").get("dir")
     if not isinstance(output_value, (str, Path)):
         raise ValueError("Round 2 output.dir 必須是路徑")
     output_dir = resolve_round2_output_dir(output_value, smoke=smoke)
     generation = begin_round2_generation(output_dir)
     log_path = generation.staging_dir / "run.log"
-    started = time.perf_counter()
     mask_qc: pd.DataFrame | None = None
     bundle: Any = None
 
@@ -319,12 +456,18 @@ def run_round2(
                     ranking=ranking,
                     smoke=smoke,
                 )
+                runtime_seconds = time.perf_counter() - started
+                reproducibility = _finalize_reproducibility_metadata(
+                    reproducibility_start,
+                    runtime_seconds=runtime_seconds,
+                )
                 payloads = _round2_json_payloads(
                     config=config,
                     effective_config=effective_config,
                     evidence=evidence,
                     bundle=bundle,
                     smoke=smoke,
+                    reproducibility=reproducibility,
                 )
                 context = _round2_record_context(
                     config=config,
@@ -332,7 +475,7 @@ def run_round2(
                     ranking=ranking,
                     recommendation=recommendation,
                     smoke=smoke,
-                    runtime_seconds=time.perf_counter() - started,
+                    runtime_seconds=runtime_seconds,
                 )
                 _remove_preflight_qc(generation.staging_dir)
                 write_round2_bundle(
@@ -641,6 +784,7 @@ def _round2_json_payloads(
     evidence: Any,
     bundle: Any,
     smoke: bool,
+    reproducibility: Mapping[str, Any],
 ) -> dict[str, Mapping[str, Any]]:
     """建立 predictor、來源 provenance 與執行模式 JSON artifacts。"""
     expected = _required_mapping(_required_mapping(config, "round1"), "expected")
@@ -660,6 +804,7 @@ def _round2_json_payloads(
         "no_scientific_conclusion": smoke,
         "original_config": _json_ready(config),
         "effective_config": _json_ready(effective_config),
+        "reproducibility": _json_ready(reproducibility),
     }
     payloads = {
         "feature_sets.json": {

@@ -14,9 +14,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from immunity.exp3.feature_sets import PAPER_STYLE_FOV_FEATURES, PRIMARY_FOV_FEATURES
+from immunity.exp3.round2_benchmark import (
+    Round2Comparison,
+    rank_round2_configurations,
+    select_round2_recommendation,
+)
 
 
 ROUND2_TABLE_NAMES = (
@@ -345,10 +351,12 @@ def validate_round2_bundle(directory: Path, *, smoke: bool) -> None:
 
     tables = {name: pd.read_csv(bundle / name) for name in ROUND2_TABLE_NAMES}
     feature_sets = _read_json_mapping(bundle / "feature_sets.json")
-    _read_json_mapping(bundle / "baseline_provenance.json")
+    baseline_provenance = _read_json_mapping(bundle / "baseline_provenance.json")
     metadata = _read_json_mapping(bundle / "run_metadata.json")
+    _validate_reproducibility_metadata(metadata)
+    _validate_baseline_provenance(baseline_provenance, metadata)
     _validate_predictor_registry(feature_sets)
-    _validate_common_tables(tables)
+    _validate_common_tables(tables, metadata)
     if smoke:
         _validate_smoke_tables(tables, metadata, bundle)
     else:
@@ -699,12 +707,213 @@ def _validate_predictor_registry(feature_sets: Mapping[str, Any]) -> None:
         raise ValueError("feature_sets.json 必須含精確 33 predictor identity")
 
 
-def _validate_common_tables(tables: Mapping[str, pd.DataFrame]) -> None:
+def _validate_reproducibility_metadata(metadata: Mapping[str, Any]) -> None:
+    """驗證 Git、runtime environment 與 UTC timing 的完整結構化證據。"""
+    reproducibility = metadata.get("reproducibility")
+    if not isinstance(reproducibility, Mapping):
+        raise ValueError("run_metadata reproducibility 必須是 mapping")
+    if set(reproducibility) != {"schema_version", "git", "python", "packages", "timing"}:
+        raise ValueError("reproducibility schema keys 不合法")
+    schema_version = reproducibility["schema_version"]
+    if isinstance(schema_version, bool) or schema_version != 1:
+        raise ValueError("reproducibility schema_version 必須是 1")
+
+    git = reproducibility["git"]
+    if not isinstance(git, Mapping) or set(git) != {
+        "commit",
+        "branch",
+        "status_porcelain",
+        "dirty",
+    }:
+        raise ValueError("Git reproducibility schema 不合法")
+    commit = git["commit"]
+    if not (
+        isinstance(commit, str)
+        and len(commit) == 40
+        and all(character in "0123456789abcdefABCDEF" for character in commit)
+    ):
+        raise ValueError("Git commit 必須是完整 40 位元十六進位 identity")
+    if not isinstance(git["branch"], str) or not git["branch"].strip():
+        raise ValueError("Git branch 不可為空")
+    status = git["status_porcelain"]
+    dirty = git["dirty"]
+    if not isinstance(status, str) or not isinstance(dirty, bool):
+        raise ValueError("Git status_porcelain/dirty 型別不合法")
+    if dirty is not bool(status):
+        raise ValueError("Git dirty 必須與 status_porcelain 一致")
+
+    python = reproducibility["python"]
+    if (
+        not isinstance(python, Mapping)
+        or set(python) != {"version"}
+        or not isinstance(python["version"], str)
+        or not python["version"].strip()
+    ):
+        raise ValueError("Python reproducibility version 不合法")
+    packages = reproducibility["packages"]
+    expected_packages = {"numpy", "pandas", "scikit-learn", "OpenCV", "PyYAML"}
+    if not isinstance(packages, Mapping) or set(packages) != expected_packages:
+        raise ValueError("reproducibility package keys 不合法")
+    if any(not isinstance(value, str) or not value.strip() for value in packages.values()):
+        raise ValueError("reproducibility package versions 必須是非空字串")
+
+    timing = reproducibility["timing"]
+    if not isinstance(timing, Mapping) or set(timing) != {
+        "started_at_utc",
+        "completed_at_utc",
+        "runtime_seconds",
+    }:
+        raise ValueError("reproducibility timing schema 不合法")
+    started = _parse_utc_timestamp(timing["started_at_utc"], "started_at_utc")
+    completed = _parse_utc_timestamp(timing["completed_at_utc"], "completed_at_utc")
+    runtime = timing["runtime_seconds"]
+    if (
+        isinstance(runtime, bool)
+        or not isinstance(runtime, (int, float))
+        or not math.isfinite(float(runtime))
+        or float(runtime) < 0.0
+    ):
+        raise ValueError("reproducibility runtime_seconds 必須是 finite nonnegative number")
+    duration = (completed - started).total_seconds()
+    if duration < 0.0:
+        raise ValueError("UTC completion 不得早於 start")
+    if abs(duration - float(runtime)) > 1.0:
+        raise ValueError(
+            "reproducibility UTC duration 與 runtime_seconds 不一致："
+            f"duration={duration}, runtime={runtime}"
+        )
+
+
+def _parse_utc_timestamp(value: object, name: str) -> datetime:
+    """解析 canonical ``Z`` UTC timestamp。"""
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise ValueError(f"UTC {name} 必須是 Z timestamp")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise ValueError(f"UTC {name} 格式不合法") from error
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise ValueError(f"UTC {name} offset 不合法")
+    return parsed
+
+
+def _validate_baseline_provenance(
+    provenance: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> None:
+    """驗證 read-only Round 1 hash pins 與 original/effective config evidence。"""
+    expected_keys = {
+        "round1_root",
+        "read_only",
+        "artifact_sha256",
+        "roster_sha256",
+    }
+    if set(provenance) != expected_keys or provenance.get("read_only") is not True:
+        raise ValueError("baseline provenance schema/read_only 不合法")
+    root = provenance.get("round1_root")
+    artifacts = provenance.get("artifact_sha256")
+    roster = provenance.get("roster_sha256")
+    if not isinstance(root, str) or not root.strip():
+        raise ValueError("baseline provenance round1_root 不合法")
+    if not isinstance(artifacts, Mapping) or not artifacts:
+        raise ValueError("baseline provenance artifact_sha256 不合法")
+    if not all(
+        isinstance(name, str) and name
+        and isinstance(digest, str)
+        and len(digest) == 64
+        and all(character in "0123456789abcdefABCDEF" for character in digest)
+        for name, digest in artifacts.items()
+    ):
+        raise ValueError("baseline provenance artifact hash identity 不合法")
+    if not (
+        isinstance(roster, str)
+        and len(roster) == 64
+        and all(character in "0123456789abcdefABCDEF" for character in roster)
+    ):
+        raise ValueError("baseline provenance roster hash identity 不合法")
+    for config_name in ("original_config", "effective_config"):
+        config = metadata.get(config_name)
+        round1 = config.get("round1") if isinstance(config, Mapping) else None
+        if not isinstance(round1, Mapping):
+            raise ValueError(f"baseline provenance 缺少 {config_name}.round1 evidence")
+        if dict(round1.get("artifact_sha256", {})) != dict(artifacts):
+            raise ValueError(f"baseline provenance artifact hashes 與 {config_name} 不一致")
+        config_roster = round1.get("roster_sha256")
+        if not isinstance(config_roster, str) or config_roster.lower() != roster.lower():
+            raise ValueError(f"baseline provenance roster hash 與 {config_name} 不一致")
+        configured_root = round1.get("dir")
+        if not isinstance(configured_root, str) or not configured_root.strip():
+            raise ValueError(f"baseline provenance {config_name} round1.dir 不合法")
+        normalized_root = root.replace("\\", "/").rstrip("/").casefold()
+        normalized_config = configured_root.replace("\\", "/").strip("/").casefold()
+        if not (
+            normalized_root == normalized_config
+            or normalized_root.endswith("/" + normalized_config)
+        ):
+            raise ValueError(f"baseline provenance round1_root 與 {config_name} 不一致")
+
+
+def _strict_integer(value: object, name: str, *, minimum: int = 0) -> int:
+    """解析 QC integer 並拒絕 bool、非有限值、fraction 與低於下限。"""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} 必須是 >= {minimum} 的 strict integer")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"{name} 必須是 >= {minimum} 的 strict integer") from error
+    if not math.isfinite(numeric) or numeric < minimum or numeric != math.floor(numeric):
+        raise ValueError(f"{name} 必須是 >= {minimum} 的 strict integer")
+    return int(numeric)
+
+
+def _finite_float(value: object, name: str) -> float:
+    """解析非 bool 的 finite 浮點 QC 值。"""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} 必須是 finite number")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"{name} 必須是 finite number") from error
+    if not math.isfinite(numeric):
+        raise ValueError(f"{name} 必須是 finite number")
+    return numeric
+
+
+def _validate_common_tables(
+    tables: Mapping[str, pd.DataFrame],
+    metadata: Mapping[str, Any],
+) -> None:
     """驗證 formal/smoke 共用的 93-feature schema 與 QC tables。"""
     data = tables["data_snapshot.csv"]
     _require_columns(data, ("image_key", "IDO_score", *PAPER_STYLE_FOV_FEATURES), "data_snapshot")
     if data.empty or data["image_key"].duplicated().any():
         raise ValueError("data_snapshot image_key 必須非空且唯一")
+    numeric_columns = ["IDO_score", *PAPER_STYLE_FOV_FEATURES]
+    numeric = data.loc[:, numeric_columns].apply(pd.to_numeric, errors="coerce")
+    if not np.isfinite(numeric.to_numpy(dtype=float)).all():
+        raise ValueError("data_snapshot 的 target 與 93 predictors 必須 numeric finite")
+    image_keys = set(data["image_key"].astype(str))
+
+    mask_qc = tables["mask_provenance_qc.csv"]
+    _require_columns(mask_qc, ("image_key", "status"), "mask_provenance_qc")
+    mask_keys = mask_qc["image_key"].astype(str)
+    if (
+        len(mask_qc) != len(image_keys)
+        or mask_keys.duplicated().any()
+        or set(mask_keys) != image_keys
+        or not mask_qc["status"].astype(str).eq("passed").all()
+    ):
+        raise ValueError("mask provenance QC 必須逐一涵蓋 data images 且全部 passed")
+
+    valid_rosters = _validate_published_valid_counts(
+        tables["feature_valid_counts.csv"], image_keys
+    )
+    _validate_published_extraction_qc(
+        tables["extraction_qc.csv"],
+        image_keys,
+        valid_rosters,
+        metadata,
+    )
     feature_qc = tables["feature_qc.csv"]
     _require_columns(feature_qc, ("feature", "status"), "feature_qc")
     if (
@@ -712,6 +921,8 @@ def _validate_common_tables(tables: Mapping[str, pd.DataFrame]) -> None:
         or len(feature_qc) != 93
     ):
         raise ValueError("feature_qc 必須精確包含 93 predictor identity")
+    if not feature_qc["status"].astype(str).eq("passed").all():
+        raise ValueError("feature_qc 的 93 predictors 必須全部 passed")
     _require_columns(
         tables["fold_metrics.csv"],
         _IDENTITY_COLUMNS + ("n_test", "status"),
@@ -719,15 +930,213 @@ def _validate_common_tables(tables: Mapping[str, pd.DataFrame]) -> None:
     )
     _require_columns(
         tables["oof_predictions.csv"],
-        _IDENTITY_COLUMNS + ("image_key",),
+        _IDENTITY_COLUMNS
+        + ("image_key", "observed_ido_score", "predicted_ido_score"),
         "oof_predictions",
     )
+    _validate_oof_values(tables["oof_predictions.csv"], data, "candidate OOF")
     _require_columns(tables["hyperparameters.csv"], _IDENTITY_COLUMNS, "hyperparameters")
     _require_columns(
         tables["eligibility.csv"],
         ("configuration_id", "eligible", "recommended"),
         "eligibility",
     )
+
+
+def _validate_published_valid_counts(
+    frame: pd.DataFrame,
+    image_keys: set[str],
+) -> dict[str, int]:
+    """驗證 data FOV × 60 extras 的 strict integer count identities。"""
+    required = (
+        "image_key",
+        "feature",
+        "roster_cell_count",
+        "finite_cell_count",
+        "required_minimum",
+        "status",
+    )
+    _require_columns(frame, required, "feature_valid_counts")
+    extras = set(PAPER_STYLE_FOV_FEATURES) - set(PRIMARY_FOV_FEATURES)
+    identities = list(
+        frame.loc[:, ["image_key", "feature"]].astype(str).itertuples(
+            index=False, name=None
+        )
+    )
+    expected = {(image_key, feature) for image_key in image_keys for feature in extras}
+    if len(identities) != len(set(identities)) or set(identities) != expected:
+        raise ValueError("feature valid-count 必須精確涵蓋 data FOV × 60 extras")
+    roster_by_image: dict[str, int] = {}
+    for row in frame.itertuples(index=False):
+        image_key = str(row.image_key)
+        roster = _strict_integer(row.roster_cell_count, "roster_cell_count", minimum=1)
+        finite = _strict_integer(row.finite_cell_count, "finite_cell_count", minimum=0)
+        minimum = _strict_integer(row.required_minimum, "required_minimum", minimum=1)
+        if minimum != 3:
+            raise ValueError("feature valid-count required_minimum 必須精確為 3")
+        if finite > roster:
+            raise ValueError("feature valid-count finite_cell_count 不可大於 roster")
+        expected_status = "passed" if finite >= minimum else "failed"
+        if str(row.status) != expected_status or expected_status != "passed":
+            raise ValueError("feature valid-count minimum/status/count 不一致或未通過")
+        previous = roster_by_image.setdefault(image_key, roster)
+        if previous != roster:
+            raise ValueError("同一 data FOV 的 valid-count roster 必須全表一致")
+    return roster_by_image
+
+
+def _validate_published_extraction_qc(
+    frame: pd.DataFrame,
+    image_keys: set[str],
+    valid_rosters: Mapping[str, int],
+    metadata: Mapping[str, Any],
+) -> None:
+    """重算 extraction pair counts、outside boundary 與 metadata totals。"""
+    count_fields = (
+        "roster_pair_count",
+        "extracted_pair_count",
+        "unique_cell_count",
+        "unique_nucleus_count",
+        "multi_nucleus_cell_count",
+        "multi_nucleus_pair_count",
+        "max_nuclei_per_cell",
+        "retained_outside_pair_count",
+    )
+    required = (
+        "image_key",
+        "aggregation_unit",
+        *count_fields,
+        "max_retained_outside_fraction",
+        "max_nucleus_outside_fraction",
+        "status",
+    )
+    _require_columns(frame, required, "extraction_qc")
+    keys = frame["image_key"].astype(str)
+    if (
+        len(frame) != len(image_keys)
+        or keys.duplicated().any()
+        or set(keys) != image_keys
+        or not frame["status"].astype(str).eq("passed").all()
+    ):
+        raise ValueError("extraction QC 必須逐一涵蓋 data images 且全部 passed")
+    totals = {field: 0 for field in count_fields}
+    maximum_nuclei = 0
+    maximum_outside = 0.0
+    for row in frame.itertuples(index=False):
+        image_key = str(row.image_key)
+        if str(row.aggregation_unit) != "frozen_nucleus_cell_pair":
+            raise ValueError("extraction QC aggregation unit 必須是 frozen nucleus-cell pair")
+        counts = {
+            field: _strict_integer(
+                getattr(row, field),
+                field,
+                minimum=(1 if field in {
+                    "roster_pair_count",
+                    "extracted_pair_count",
+                    "unique_cell_count",
+                    "unique_nucleus_count",
+                    "max_nuclei_per_cell",
+                } else 0),
+            )
+            for field in count_fields
+        }
+        if (
+            counts["roster_pair_count"] != counts["extracted_pair_count"]
+            or counts["roster_pair_count"] != valid_rosters[image_key]
+        ):
+            raise ValueError("extraction QC extracted=roster 與 valid-count identity 不一致")
+        extracted = counts["extracted_pair_count"]
+        multi_cells = counts["multi_nucleus_cell_count"]
+        multi_pairs = counts["multi_nucleus_pair_count"]
+        if (
+            counts["unique_cell_count"] > extracted
+            or counts["unique_nucleus_count"] != extracted
+            or multi_cells > counts["unique_cell_count"]
+            or multi_pairs > extracted
+            or (multi_cells == 0) != (multi_pairs == 0)
+            or (multi_cells > 0 and multi_pairs < 2 * multi_cells)
+            or counts["retained_outside_pair_count"] > extracted
+        ):
+            raise ValueError("extraction QC pair topology counts 不一致")
+        retained = _finite_float(
+            row.max_retained_outside_fraction,
+            "max_retained_outside_fraction",
+        )
+        threshold = _finite_float(
+            row.max_nucleus_outside_fraction,
+            "max_nucleus_outside_fraction",
+        )
+        if threshold != 0.05 or retained < 0.0 or retained > threshold:
+            raise ValueError("extraction QC outside fraction 必須位於 frozen <=0.05 boundary")
+        for field, value in counts.items():
+            totals[field] += value
+        maximum_nuclei = max(maximum_nuclei, counts["max_nuclei_per_cell"])
+        maximum_outside = max(maximum_outside, retained)
+    _validate_pair_metadata_totals(
+        metadata,
+        image_count=len(image_keys),
+        totals=totals,
+        maximum_nuclei=maximum_nuclei,
+        maximum_outside=maximum_outside,
+    )
+
+
+def _validate_pair_metadata_totals(
+    metadata: Mapping[str, Any],
+    *,
+    image_count: int,
+    totals: Mapping[str, int],
+    maximum_nuclei: int,
+    maximum_outside: float,
+) -> None:
+    """以 extraction rows 對帳 metadata 與 pair summary。"""
+    summary = metadata.get("pair_mapping_summary")
+    expected_keys = {
+        "aggregation_unit",
+        "image_count",
+        "pair_observation_count",
+        "unique_cell_count",
+        "unique_nucleus_count",
+        "multi_nucleus_cell_count",
+        "multi_nucleus_pair_count",
+        "max_nuclei_per_cell",
+        "retained_outside_pair_count",
+        "max_retained_outside_fraction",
+        "max_nucleus_outside_fraction",
+    }
+    if not isinstance(summary, Mapping) or set(summary) != expected_keys:
+        raise ValueError("metadata pair_mapping_summary schema 不合法")
+    expected_counts = {
+        "image_count": image_count,
+        "pair_observation_count": totals["extracted_pair_count"],
+        "unique_cell_count": totals["unique_cell_count"],
+        "unique_nucleus_count": totals["unique_nucleus_count"],
+        "multi_nucleus_cell_count": totals["multi_nucleus_cell_count"],
+        "multi_nucleus_pair_count": totals["multi_nucleus_pair_count"],
+        "max_nuclei_per_cell": maximum_nuclei,
+        "retained_outside_pair_count": totals["retained_outside_pair_count"],
+    }
+    for field, expected in expected_counts.items():
+        if _strict_integer(summary[field], f"pair_mapping_summary.{field}") != expected:
+            raise ValueError(f"metadata pair summary {field} 與 extraction QC 不一致")
+    if summary["aggregation_unit"] != "frozen_nucleus_cell_pair":
+        raise ValueError("metadata aggregation unit 不合法")
+    if (
+        _finite_float(summary["max_retained_outside_fraction"], "summary outside")
+        != maximum_outside
+        or _finite_float(summary["max_nucleus_outside_fraction"], "summary threshold")
+        != 0.05
+    ):
+        raise ValueError("metadata outside fraction summary 與 extraction QC 不一致")
+    for field, expected in (
+        ("analyzed_images", image_count),
+        ("valid_cells", totals["extracted_pair_count"]),
+        ("valid_pair_observations", totals["extracted_pair_count"]),
+    ):
+        if _strict_integer(metadata.get(field), field) != expected:
+            raise ValueError(f"metadata {field} 與 extraction QC 不一致")
+    if metadata.get("aggregation_unit") != "frozen_nucleus_cell_pair":
+        raise ValueError("metadata aggregation_unit 不合法")
 
 
 _IDENTITY_COLUMNS = (
@@ -748,8 +1157,15 @@ def _validate_formal_tables(
     data = tables["data_snapshot.csv"]
     if len(data) != 693:
         raise ValueError("Formal data_snapshot 必須精確為 693 rows")
-    if metadata.get("mode", "formal") != "formal" or metadata.get("seed") != 20260804:
-        raise ValueError("Formal run_metadata mode/seed 不合法")
+    if (
+        metadata.get("mode") != "formal"
+        or metadata.get("smoke") is not False
+        or metadata.get("seed") != 20260804
+        or metadata.get("diagnostic_splits") is not False
+        or metadata.get("non_formal") is not False
+        or metadata.get("no_scientific_conclusion") is not False
+    ):
+        raise ValueError("Formal run_metadata mode/seed/non-scientific flags 不合法")
     split_membership = _formal_split_membership(
         tables["outer_splits.csv"], set(data["image_key"].astype(str))
     )
@@ -807,8 +1223,13 @@ def _validate_formal_tables(
         failed,
     )
 
+    _validate_oof_values(
+        tables["dummy_oof_predictions.csv"],
+        data,
+        "Dummy OOF",
+    )
     _validate_dummy_tables(tables, split_membership)
-    _validate_formal_ranking(tables, failed)
+    _validate_formal_ranking(tables, failed, split_membership)
 
 
 def _formal_split_membership(
@@ -870,6 +1291,38 @@ def _identity_pairs(frame: pd.DataFrame) -> set[tuple[str, str]]:
     )
 
 
+def _validate_oof_values(
+    predictions: pd.DataFrame,
+    data: pd.DataFrame,
+    name: str,
+) -> None:
+    """驗證 OOF observed/predicted finite，且 observed 重現 data target。"""
+    _require_columns(
+        predictions,
+        ("image_key", "observed_ido_score", "predicted_ido_score"),
+        name,
+    )
+    if predictions.empty:
+        return
+    numeric = predictions.loc[
+        :, ["observed_ido_score", "predicted_ido_score"]
+    ].apply(pd.to_numeric, errors="coerce")
+    values = numeric.to_numpy(dtype=float)
+    if not np.isfinite(values).all():
+        raise ValueError(f"{name} observed/predicted 必須 numeric finite")
+    targets = data.set_index(data["image_key"].astype(str))["IDO_score"]
+    expected = predictions["image_key"].astype(str).map(targets)
+    if expected.isna().any() or not np.isclose(
+        numeric["observed_ido_score"].to_numpy(dtype=float),
+        expected.to_numpy(dtype=float),
+        rtol=0.0,
+        atol=1e-12,
+    ).all():
+        raise ValueError(
+            f"{name} identity/image_key membership 的 observed 必須精確重現 data target"
+        )
+
+
 def _validate_oof_coverage(
     metrics: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -898,7 +1351,14 @@ def _validate_oof_coverage(
             & predictions["split_id"].astype(str).eq(identity[1])
         ]
         frozen_keys = expected_membership[identity[1]]
-        if int(row.n_test) != len(frozen_keys):
+        if (
+            _strict_integer(
+                row.n_test,
+                "fold n_test frozen membership",
+                minimum=1,
+            )
+            != len(frozen_keys)
+        ):
             raise ValueError(
                 f"fold n_test 與 frozen test membership 不一致：{identity}"
             )
@@ -957,7 +1417,8 @@ def _validate_dummy_tables(
         ]
         expected_keys = expected_membership[str(row.split_id)]
         if (
-            int(row.n_test) != len(expected_keys)
+            _strict_integer(row.n_test, "Dummy fold n_test", minimum=1)
+            != len(expected_keys)
             or len(selected) != len(expected_keys)
             or set(selected["image_key"].astype(str)) != expected_keys
         ):
@@ -1053,10 +1514,16 @@ def _importance_completeness_text(value: Any) -> str:
     """依實際 completeness 摘要產生明確 diagnostic 訊息。"""
     if not isinstance(value, Mapping):
         return "Feature importance diagnostic completeness 未提供。"
-    actual = int(value.get("actual", 0))
-    expected = int(value.get("expected", 0))
-    missing = int(value.get("missing", max(expected - actual, 0)))
-    incomplete = int(value.get("incomplete", 0))
+    actual = _strict_integer(value.get("actual", 0), "importance actual")
+    expected = _strict_integer(value.get("expected", 0), "importance expected")
+    missing = _strict_integer(
+        value.get("missing", max(expected - actual, 0)),
+        "importance missing",
+    )
+    incomplete = _strict_integer(
+        value.get("incomplete", 0),
+        "importance incomplete",
+    )
     if missing or incomplete or actual != expected:
         return (
             "Feature importance diagnostic completeness warning："
@@ -1070,9 +1537,11 @@ def _importance_completeness_text(value: Any) -> str:
 
 
 def _validate_formal_ranking(
-    tables: Mapping[str, pd.DataFrame], failed: set[tuple[str, str]]
+    tables: Mapping[str, pd.DataFrame],
+    failed: set[tuple[str, str]],
+    split_membership: Mapping[str, set[str]],
 ) -> None:
-    """驗證四組比較、eligibility 與 failed configuration 對帳。"""
+    """由 raw evidence 重算並逐欄驗證 ranking、gates 與 recommendation。"""
     comparison = tables["feature_set_comparison.csv"]
     eligibility = tables["eligibility.csv"]
     _require_columns(
@@ -1114,6 +1583,67 @@ def _validate_formal_ranking(
     bad = eligibility.loc[eligible, "configuration_id"].astype(str).isin(failed_configurations)
     if bad.any():
         raise ValueError("含 failed fold 的 configuration 必須 ineligible")
+    expected_splits = {
+        validation: sorted(
+            split_id
+            for split_id in split_membership
+            if split_id.startswith(f"{validation}:")
+        )
+        for validation in _VALIDATIONS
+    }
+    raw_metrics = tables["fold_metrics.csv"].copy()
+    raw_metrics.attrs["round2_expected_splits"] = expected_splits
+    recomputed = rank_round2_configurations(
+        Round2Comparison(
+            fold_metrics=raw_metrics,
+            predictions=tables["oof_predictions.csv"].copy(),
+            dummy_metrics=tables["dummy_fold_metrics.csv"].copy(),
+            dummy_predictions=tables["dummy_oof_predictions.csv"].copy(),
+            hyperparameters=tables["hyperparameters.csv"].copy(),
+            feature_importance=tables["feature_importance.csv"].copy(),
+            failures=tables["model_failures.csv"].copy(),
+        ),
+        {
+            "basic_median": list(PRIMARY_FOV_FEATURES),
+            "paper_style_median": list(PAPER_STYLE_FOV_FEATURES),
+        },
+    )
+    expected_recommendation = select_round2_recommendation(recomputed)
+    for published, name in (
+        (comparison, "feature_set_comparison"),
+        (eligibility, "eligibility"),
+    ):
+        _compare_recomputed_ranking(published, recomputed, name)
+    actual_recommendation = select_round2_recommendation(eligibility)
+    if actual_recommendation != expected_recommendation:
+        raise ValueError("derived ranking deterministic recommendation 不一致")
+
+
+def _compare_recomputed_ranking(
+    published: pd.DataFrame,
+    recomputed: pd.DataFrame,
+    name: str,
+) -> None:
+    """以 configuration stable order 比對每個 ranking derived field。"""
+    if list(published.columns) != list(recomputed.columns):
+        raise ValueError(f"{name} derived ranking columns 不一致")
+    actual = published.sort_values("configuration_id", kind="stable").reset_index(
+        drop=True
+    )
+    expected = recomputed.sort_values(
+        "configuration_id", kind="stable"
+    ).reset_index(drop=True)
+    try:
+        pd.testing.assert_frame_equal(
+            actual,
+            expected,
+            check_dtype=False,
+            check_exact=False,
+            rtol=1e-12,
+            atol=1e-12,
+        )
+    except AssertionError as error:
+        raise ValueError(f"{name} derived ranking/gate drift：{error}") from error
 
 
 def _validate_smoke_tables(
@@ -1125,9 +1655,14 @@ def _validate_smoke_tables(
     data = tables["data_snapshot.csv"]
     if data.empty or len(data) >= 693:
         raise ValueError("Smoke data_snapshot 必須是非空 subset")
-    mode_ok = metadata.get("mode") == "smoke" or metadata.get("smoke") is True
-    if not mode_ok:
-        raise ValueError("Smoke run_metadata 必須明示 smoke status")
+    if (
+        metadata.get("mode") != "smoke"
+        or metadata.get("smoke") is not True
+        or metadata.get("diagnostic_splits") is not True
+        or metadata.get("non_formal") is not True
+        or metadata.get("no_scientific_conclusion") is not True
+    ):
+        raise ValueError("Smoke metadata 必須明示 diagnostic/non-formal/無科學結論")
     metrics = tables["fold_metrics.csv"]
     if metrics.empty:
         raise ValueError("Smoke fold_metrics 不可為空")
@@ -1185,13 +1720,8 @@ def _display(value: Any) -> str:
 
 
 def _display_count(value: Any) -> str:
-    """以千分位顯示整數 observation count，其他值沿用 scalar formatter。"""
-    if isinstance(value, bool):
-        return str(value)
-    try:
-        numeric = int(value)
-    except (TypeError, ValueError, OverflowError):
-        return _display(value)
+    """嚴格解析 observation count 後以千分位顯示。"""
+    numeric = _strict_integer(value, "display count")
     return f"{numeric:,}"
 
 

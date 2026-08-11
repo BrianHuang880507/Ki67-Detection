@@ -16,6 +16,10 @@ import pytest
 
 import immunity.exp3.run_round2_paper93 as run_module
 from immunity.exp3.feature_sets import PAPER_STYLE_FOV_FEATURES, PRIMARY_FOV_FEATURES
+from immunity.exp3.round2_benchmark import (
+    Round2Comparison,
+    rank_round2_configurations,
+)
 from immunity.exp3.round2_reporting import (
     ROUND2_TABLE_NAMES,
     begin_round2_generation,
@@ -79,6 +83,16 @@ def test_round2_reporting_can_be_imported_in_fresh_interpreter() -> None:
     assert result.stdout.strip() == "validate_round2_bundle"
 
 
+@pytest.mark.parametrize("bad_count", [3.5, True, -1])
+def test_round2_record_rejects_non_strict_display_counts(bad_count: object) -> None:
+    """Record count formatter 不得截斷 fraction 或接受 bool/negative。"""
+    context = _formal_record_context()
+    context["valid_pair_observations"] = bad_count
+
+    with pytest.raises(ValueError, match="count|integer|analyzed"):
+        build_round2_experiment_record(context)
+
+
 def _allowed_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """將測試限定在暫存的正式 Round 2 根目錄。"""
     output = (tmp_path / "immunity" / "outputs" / "exp3" / "round2_paper93").resolve()
@@ -111,6 +125,7 @@ def _formal_tables() -> dict[str, pd.DataFrame]:
             },
         }
     )
+    score_by_key = data_snapshot.set_index("image_key")["IDO_score"].to_dict()
     split_rows: list[dict[str, object]] = []
     metric_rows: list[dict[str, object]] = []
     prediction_rows: list[dict[str, object]] = []
@@ -138,6 +153,8 @@ def _formal_tables() -> dict[str, pd.DataFrame]:
                 "source_round": "round1",
                 "configuration_id": "dummy_median__none",
                 "n_test": len(test_keys),
+                "mae": 0.3,
+                "r2": -0.1,
                 "status": "ok",
             }
         )
@@ -152,7 +169,7 @@ def _formal_tables() -> dict[str, pd.DataFrame]:
                     "source_round": "round1",
                     "configuration_id": "dummy_median__none",
                     "image_key": image_key,
-                    "observed_ido_score": 0.5,
+                    "observed_ido_score": score_by_key[image_key],
                     "predicted_ido_score": 0.5,
                 }
             )
@@ -198,18 +215,23 @@ def _formal_tables() -> dict[str, pd.DataFrame]:
                         "source_round": source_round,
                         "configuration_id": configuration_id,
                         "image_key": image_key,
-                        "observed_ido_score": 0.5,
-                        "predicted_ido_score": 0.5,
+                        "observed_ido_score": score_by_key[image_key],
+                        "predicted_ido_score": score_by_key[image_key],
                     }
                 )
 
+    roster_counts = {
+        image_key: 35 if index < 414 else 34
+        for index, image_key in enumerate(image_keys)
+    }
+    assert sum(roster_counts.values()) == 23976
     valid_counts = pd.DataFrame(
         [
             {
                 "image_key": image_key,
                 "feature": feature,
-                "roster_cell_count": 4,
-                "finite_cell_count": 4,
+                "roster_cell_count": roster_counts[image_key],
+                "finite_cell_count": roster_counts[image_key],
                 "required_minimum": 3,
                 "status": "passed",
             }
@@ -229,26 +251,7 @@ def _formal_tables() -> dict[str, pd.DataFrame]:
             "status": ["passed"] * 93,
         }
     )
-    eligibility = pd.DataFrame(
-        [
-            {
-                "configuration_id": configuration_id,
-                "model": model,
-                "feature_set": feature_set,
-                "source_round": source_round,
-                "eligible": True,
-                "recommended": configuration_id == "extra_trees__basic_median",
-                "status": "formal",
-            }
-            for configuration_id, model, feature_set, source_round in _CONFIGURATIONS
-        ]
-    )
-    comparison = eligibility.loc[
-        :, ["configuration_id", "model", "feature_set", "source_round"]
-    ].copy()
-    comparison["mae"] = [0.1, 0.2, 0.3, 0.4]
-
-    return {
+    tables = {
         "data_snapshot.csv": data_snapshot,
         "outer_splits.csv": pd.DataFrame(split_rows),
         "mask_provenance_qc.csv": pd.DataFrame(
@@ -256,7 +259,22 @@ def _formal_tables() -> dict[str, pd.DataFrame]:
         ),
         "feature_valid_counts.csv": valid_counts,
         "extraction_qc.csv": pd.DataFrame(
-            {"image_key": image_keys, "status": ["passed"] * 693, "reason": [""] * 693}
+            {
+                "image_key": image_keys,
+                "aggregation_unit": ["frozen_nucleus_cell_pair"] * 693,
+                "roster_pair_count": [roster_counts[key] for key in image_keys],
+                "extracted_pair_count": [roster_counts[key] for key in image_keys],
+                "unique_cell_count": [roster_counts[key] for key in image_keys],
+                "unique_nucleus_count": [roster_counts[key] for key in image_keys],
+                "multi_nucleus_cell_count": [0] * 693,
+                "multi_nucleus_pair_count": [0] * 693,
+                "max_nuclei_per_cell": [1] * 693,
+                "retained_outside_pair_count": [0] * 693,
+                "max_retained_outside_fraction": [0.0] * 693,
+                "max_nucleus_outside_fraction": [0.05] * 693,
+                "status": ["passed"] * 693,
+                "reason": [""] * 693,
+            }
         ),
         "feature_qc.csv": feature_qc,
         "fold_metrics.csv": pd.DataFrame(metric_rows),
@@ -290,9 +308,43 @@ def _formal_tables() -> dict[str, pd.DataFrame]:
                 "message",
             ]
         ),
-        "feature_set_comparison.csv": comparison,
-        "eligibility.csv": eligibility,
+        "feature_set_comparison.csv": pd.DataFrame(),
+        "eligibility.csv": pd.DataFrame(),
     }
+    _refresh_ranking_tables(tables)
+    return tables
+
+
+def _refresh_ranking_tables(tables: dict[str, pd.DataFrame]) -> None:
+    """由 raw fold/OOF/dummy evidence 產生 fixture 的完整 derived ranking。"""
+    expected_splits = {
+        validation: [
+            split_id
+            for candidate_validation, _, split_id, _ in _split_contract()
+            if candidate_validation == validation
+        ]
+        for validation, _ in _VALIDATIONS
+    }
+    fold_metrics = tables["fold_metrics.csv"]
+    fold_metrics.attrs["round2_expected_splits"] = expected_splits
+    comparison = Round2Comparison(
+        fold_metrics=fold_metrics,
+        predictions=tables["oof_predictions.csv"],
+        dummy_metrics=tables["dummy_fold_metrics.csv"],
+        dummy_predictions=tables["dummy_oof_predictions.csv"],
+        hyperparameters=tables["hyperparameters.csv"],
+        feature_importance=tables["feature_importance.csv"],
+        failures=tables["model_failures.csv"],
+    )
+    ranking = rank_round2_configurations(
+        comparison,
+        {
+            "basic_median": list(PRIMARY_FOV_FEATURES),
+            "paper_style_median": list(PAPER_STYLE_FOV_FEATURES),
+        },
+    )
+    tables["feature_set_comparison.csv"] = ranking.copy()
+    tables["eligibility.csv"] = ranking.copy()
 
 
 def _formal_tables_with_failed_fold() -> dict[str, pd.DataFrame]:
@@ -329,10 +381,7 @@ def _formal_tables_with_failed_fold() -> dict[str, pd.DataFrame]:
             }
         ]
     )
-    tables["eligibility.csv"].loc[
-        tables["eligibility.csv"]["configuration_id"].eq(configuration),
-        ["eligible", "recommended"],
-    ] = [False, False]
+    _refresh_ranking_tables(tables)
     return tables
 
 
@@ -344,17 +393,117 @@ def _formal_json_payloads() -> dict[str, dict[str, Any]]:
             "basic_median": list(PAPER_STYLE_FOV_FEATURES[:33]),
         },
         "baseline_provenance.json": {
-            "round1_winner": "extra_trees__basic_median",
+            "round1_root": "D:/evidence/immunity/outputs/exp3",
             "read_only": True,
+            "artifact_sha256": {"source.csv": "b" * 64},
+            "roster_sha256": "a" * 64,
         },
-        "run_metadata.json": {
-            "mode": "formal",
-            "seed": 20260804,
-            "analyzed_images": 693,
-            "valid_cells": 23976,
-            "exclusions": 26,
+        "run_metadata.json": _run_metadata_payload(smoke=False),
+    }
+
+
+def _run_metadata_payload(*, smoke: bool) -> dict[str, Any]:
+    """建立含完整可重現性 schema 的 formal/smoke metadata。"""
+    return {
+        "mode": "smoke" if smoke else "formal",
+        "smoke": smoke,
+        "diagnostic_splits": smoke,
+        "non_formal": smoke,
+        "no_scientific_conclusion": smoke,
+        "seed": 20260804,
+        "analyzed_images": 693,
+        "valid_cells": 23976,
+        "aggregation_unit": "frozen_nucleus_cell_pair",
+        "valid_pair_observations": 23976,
+        "pair_mapping_summary": {
+            "aggregation_unit": "frozen_nucleus_cell_pair",
+            "image_count": 693,
+            "pair_observation_count": 23976,
+            "unique_cell_count": 23976,
+            "unique_nucleus_count": 23976,
+            "multi_nucleus_cell_count": 0,
+            "multi_nucleus_pair_count": 0,
+            "max_nuclei_per_cell": 1,
+            "retained_outside_pair_count": 0,
+            "max_retained_outside_fraction": 0.0,
+            "max_nucleus_outside_fraction": 0.05,
+        },
+        "exclusions": 26,
+        "original_config": {
+            "round1": {
+                "dir": "immunity/outputs/exp3",
+                "artifact_sha256": {"source.csv": "b" * 64},
+                "roster_sha256": "a" * 64,
+            }
+        },
+        "effective_config": {
+            "round1": {
+                "dir": "immunity/outputs/exp3",
+                "artifact_sha256": {"source.csv": "b" * 64},
+                "roster_sha256": "a" * 64,
+            }
+        },
+        "reproducibility": {
+            "schema_version": 1,
+            "git": {
+                "commit": "4b3a12093975feb9f6166b7c5fc489434fbebba4",
+                "branch": "codex/exp3-multimodel-benchmark",
+                "status_porcelain": (
+                    " M immunity/configs/exp3.yaml\n"
+                    " M tests/test_immunity_exp3_cli.py"
+                ),
+                "dirty": True,
+            },
+            "python": {"version": "3.10.11"},
+            "packages": {
+                "numpy": "1.26.4",
+                "pandas": "2.2.3",
+                "scikit-learn": "1.5.2",
+                "OpenCV": "4.10.0",
+                "PyYAML": "6.0.2",
+            },
+            "timing": {
+                "started_at_utc": "2026-08-11T13:09:49.867240Z",
+                "completed_at_utc": "2026-08-11T13:10:02.367240Z",
+                "runtime_seconds": 12.5,
+            },
         },
     }
+
+
+def _synchronize_smoke_metadata(
+    payloads: dict[str, dict[str, Any]],
+    tables: dict[str, pd.DataFrame],
+) -> None:
+    """依 smoke subset 的 extraction QC 重算非科學性 metadata totals。"""
+    metadata = _run_metadata_payload(smoke=True)
+    extraction = tables["extraction_qc.csv"]
+    summary = metadata["pair_mapping_summary"]
+    summary.update(
+        {
+            "image_count": len(tables["data_snapshot.csv"]),
+            "pair_observation_count": int(extraction["extracted_pair_count"].sum()),
+            "unique_cell_count": int(extraction["unique_cell_count"].sum()),
+            "unique_nucleus_count": int(extraction["unique_nucleus_count"].sum()),
+            "multi_nucleus_cell_count": int(
+                extraction["multi_nucleus_cell_count"].sum()
+            ),
+            "multi_nucleus_pair_count": int(
+                extraction["multi_nucleus_pair_count"].sum()
+            ),
+            "max_nuclei_per_cell": int(extraction["max_nuclei_per_cell"].max()),
+            "retained_outside_pair_count": int(
+                extraction["retained_outside_pair_count"].sum()
+            ),
+            "max_retained_outside_fraction": float(
+                extraction["max_retained_outside_fraction"].max()
+            ),
+        }
+    )
+    metadata["analyzed_images"] = summary["image_count"]
+    metadata["valid_cells"] = summary["pair_observation_count"]
+    metadata["valid_pair_observations"] = summary["pair_observation_count"]
+    payloads["run_metadata.json"] = metadata
 
 
 def _formal_record_context() -> dict[str, Any]:
@@ -419,11 +568,18 @@ def _smoke_bundle_inputs() -> tuple[
         "extraction_qc.csv",
     ):
         tables[name] = tables[name].loc[tables[name]["image_key"].isin(keep_keys)]
-    for name in ("fold_metrics.csv", "oof_predictions.csv", "hyperparameters.csv"):
+    for name in ("fold_metrics.csv", "hyperparameters.csv"):
         tables[name] = tables[name].loc[
             tables[name]["feature_set"].eq("paper_style_median")
             & tables[name]["model"].isin(("extra_trees", "random_forest"))
         ].head(16)
+    tables["oof_predictions.csv"] = tables["oof_predictions.csv"].loc[
+        tables["oof_predictions.csv"]["feature_set"].eq("paper_style_median")
+        & tables["oof_predictions.csv"]["model"].isin(
+            ("extra_trees", "random_forest")
+        )
+        & tables["oof_predictions.csv"]["image_key"].isin(keep_keys)
+    ].head(16)
     tables["dummy_fold_metrics.csv"] = tables["dummy_fold_metrics.csv"].iloc[0:0]
     tables["dummy_oof_predictions.csv"] = tables["dummy_oof_predictions.csv"].iloc[0:0]
     tables["feature_set_comparison.csv"] = tables["feature_set_comparison.csv"].loc[
@@ -436,7 +592,7 @@ def _smoke_bundle_inputs() -> tuple[
     tables["eligibility.csv"]["recommended"] = False
     tables["eligibility.csv"]["status"] = "smoke"
     payloads = _formal_json_payloads()
-    payloads["run_metadata.json"] = {"mode": "smoke", "smoke": True, "seed": 20260804}
+    _synchronize_smoke_metadata(payloads, tables)
     context = _formal_record_context()
     context.update({"smoke": True, "recommendation": None})
     return tables, payloads, context
@@ -1399,11 +1555,18 @@ def test_smoke_validator_accepts_subset_schema_but_requires_no_recommendation(
         "extraction_qc.csv",
     ):
         tables[name] = tables[name].loc[tables[name]["image_key"].isin(keep_keys)]
-    for name in ("fold_metrics.csv", "oof_predictions.csv", "hyperparameters.csv"):
+    for name in ("fold_metrics.csv", "hyperparameters.csv"):
         tables[name] = tables[name].loc[
             tables[name]["feature_set"].eq("paper_style_median")
             & tables[name]["model"].isin(("extra_trees", "random_forest"))
         ].head(16)
+    tables["oof_predictions.csv"] = tables["oof_predictions.csv"].loc[
+        tables["oof_predictions.csv"]["feature_set"].eq("paper_style_median")
+        & tables["oof_predictions.csv"]["model"].isin(
+            ("extra_trees", "random_forest")
+        )
+        & tables["oof_predictions.csv"]["image_key"].isin(keep_keys)
+    ].head(16)
     tables["dummy_fold_metrics.csv"] = tables["dummy_fold_metrics.csv"].iloc[0:0]
     tables["dummy_oof_predictions.csv"] = tables["dummy_oof_predictions.csv"].iloc[0:0]
     tables["feature_set_comparison.csv"] = tables["feature_set_comparison.csv"].loc[
@@ -1416,7 +1579,7 @@ def test_smoke_validator_accepts_subset_schema_but_requires_no_recommendation(
     tables["eligibility.csv"]["recommended"] = False
     tables["eligibility.csv"]["status"] = "smoke"
     payloads = _formal_json_payloads()
-    payloads["run_metadata.json"] = {"mode": "smoke", "smoke": True, "seed": 20260804}
+    _synchronize_smoke_metadata(payloads, tables)
     context = _formal_record_context()
     context.update({"smoke": True, "recommendation": None})
     output = _allowed_output(tmp_path, monkeypatch)
@@ -1429,6 +1592,36 @@ def test_smoke_validator_accepts_subset_schema_but_requires_no_recommendation(
     eligibility.to_csv(generation.staging_dir / "eligibility.csv", index=False)
     _rehash(generation.staging_dir, "eligibility.csv")
     with pytest.raises(ValueError, match="smoke.*recommendation|recommendation.*smoke"):
+        validate_round2_bundle(generation.staging_dir, smoke=True)
+
+
+@pytest.mark.parametrize(
+    "flag",
+    ["diagnostic_splits", "non_formal", "no_scientific_conclusion"],
+)
+def test_smoke_validator_requires_all_non_scientific_metadata_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    flag: str,
+) -> None:
+    """Smoke metadata 必須逐一明示 diagnostic、non-formal 與無科學結論。"""
+    tables, payloads, context = _smoke_bundle_inputs()
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch) / "smoke",
+        tables,
+        payloads,
+        context,
+    )
+    path = generation.staging_dir / "run_metadata.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload[flag] = False
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _rehash(generation.staging_dir, "run_metadata.json")
+
+    with pytest.raises(ValueError, match="Smoke|smoke|diagnostic|non.formal|科學"):
         validate_round2_bundle(generation.staging_dir, smoke=True)
 
 
@@ -1448,6 +1641,296 @@ def test_round2_validator_rejects_mode_that_disagrees_with_output_boundary(
     )
 
     with pytest.raises(ValueError, match="smoke|formal|boundary"):
+        validate_round2_bundle(generation.staging_dir, smoke=False)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_reproducibility",
+        "bad_commit",
+        "empty_branch",
+        "dirty_mismatch",
+        "missing_package",
+        "non_utc_start",
+        "completion_before_start",
+        "boolean_runtime",
+        "duration_mismatch",
+    ],
+)
+def test_round2_validator_rejects_reproducibility_metadata_mutations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    """Standalone validator 必須獨立拒絕 provenance schema 與 timing drift。"""
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    path = generation.staging_dir / "run_metadata.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    reproducibility = payload["reproducibility"]
+    if mutation == "missing_reproducibility":
+        payload.pop("reproducibility")
+    elif mutation == "bad_commit":
+        reproducibility["git"]["commit"] = "0" * 39
+    elif mutation == "empty_branch":
+        reproducibility["git"]["branch"] = ""
+    elif mutation == "dirty_mismatch":
+        reproducibility["git"]["dirty"] = False
+    elif mutation == "missing_package":
+        reproducibility["packages"].pop("OpenCV")
+    elif mutation == "non_utc_start":
+        reproducibility["timing"]["started_at_utc"] = "2026-08-11T21:09:49.867240+08:00"
+    elif mutation == "completion_before_start":
+        reproducibility["timing"]["completed_at_utc"] = "2026-08-11T13:09:48.000000Z"
+    elif mutation == "boolean_runtime":
+        reproducibility["timing"]["runtime_seconds"] = True
+    else:
+        reproducibility["timing"]["runtime_seconds"] = 99.0
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _rehash(generation.staging_dir, "run_metadata.json")
+
+    with pytest.raises(ValueError, match="reproducibility|Git|git|package|UTC|runtime|duration"):
+        validate_round2_bundle(generation.staging_dir, smoke=False)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "nonnumeric_predictor",
+        "infinite_target",
+        "missing_mask_image",
+        "failed_mask_status",
+        "missing_valid_identity",
+        "fractional_valid_count",
+        "boolean_valid_count",
+        "negative_valid_count",
+        "valid_minimum_drift",
+        "valid_status_drift",
+        "fractional_extraction_count",
+        "boolean_extraction_count",
+        "negative_extraction_count",
+        "extraction_roster_mismatch",
+        "aggregation_unit_drift",
+        "outside_threshold_violation",
+        "metadata_total_drift",
+        "baseline_read_write",
+        "baseline_hash_drift",
+    ],
+)
+def test_round2_validator_rejects_independent_data_qc_and_provenance_mutations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    """Standalone validator 必須由 raw tables 重算，不得相信 passed/summary。"""
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    directory = generation.staging_dir
+    if mutation in {"nonnumeric_predictor", "infinite_target"}:
+        name = "data_snapshot.csv"
+        frame = pd.read_csv(directory / name)
+        field = PAPER_STYLE_FOV_FEATURES[0] if mutation == "nonnumeric_predictor" else "IDO_score"
+        if mutation == "nonnumeric_predictor":
+            frame[field] = frame[field].astype(object)
+            frame.loc[0, field] = "not-numeric"
+        else:
+            frame.loc[0, field] = np.inf
+        frame.to_csv(directory / name, index=False)
+    elif mutation in {"missing_mask_image", "failed_mask_status"}:
+        name = "mask_provenance_qc.csv"
+        frame = pd.read_csv(directory / name)
+        if mutation == "missing_mask_image":
+            frame = frame.iloc[1:]
+        else:
+            frame.loc[0, "status"] = "passed"  # summaries仍宣稱 passed
+            frame.loc[1, "status"] = "failed"
+        frame.to_csv(directory / name, index=False)
+    elif mutation.startswith("baseline_"):
+        name = "baseline_provenance.json"
+        payload = json.loads((directory / name).read_text(encoding="utf-8"))
+        if mutation == "baseline_read_write":
+            payload["read_only"] = False
+        else:
+            payload["artifact_sha256"]["source.csv"] = "c" * 64
+        (directory / name).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    elif mutation == "metadata_total_drift":
+        name = "run_metadata.json"
+        payload = json.loads((directory / name).read_text(encoding="utf-8"))
+        payload["pair_mapping_summary"]["pair_observation_count"] += 1
+        (directory / name).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    elif "valid" in mutation:
+        name = "feature_valid_counts.csv"
+        frame = pd.read_csv(directory / name)
+        if mutation == "missing_valid_identity":
+            frame = frame.iloc[1:]
+        elif mutation == "fractional_valid_count":
+            frame["roster_cell_count"] = frame["roster_cell_count"].astype(object)
+            frame.loc[0, "roster_cell_count"] = 35.5
+        elif mutation == "boolean_valid_count":
+            frame["finite_cell_count"] = frame["finite_cell_count"].astype(object)
+            frame.loc[0, "finite_cell_count"] = True
+        elif mutation == "negative_valid_count":
+            frame.loc[0, "finite_cell_count"] = -1
+        elif mutation == "valid_minimum_drift":
+            frame.loc[0, "required_minimum"] = 2
+        else:
+            frame.loc[0, "status"] = "failed"
+        frame.to_csv(directory / name, index=False)
+    else:
+        name = "extraction_qc.csv"
+        frame = pd.read_csv(directory / name)
+        if mutation == "fractional_extraction_count":
+            frame["extracted_pair_count"] = frame["extracted_pair_count"].astype(object)
+            frame.loc[0, "extracted_pair_count"] = 35.5
+        elif mutation == "boolean_extraction_count":
+            frame["max_nuclei_per_cell"] = frame["max_nuclei_per_cell"].astype(object)
+            frame.loc[0, "max_nuclei_per_cell"] = True
+        elif mutation == "negative_extraction_count":
+            frame.loc[0, "retained_outside_pair_count"] = -1
+        elif mutation == "extraction_roster_mismatch":
+            frame.loc[0, "extracted_pair_count"] -= 1
+        elif mutation == "aggregation_unit_drift":
+            frame.loc[0, "aggregation_unit"] = "unique_cell"
+        else:
+            frame.loc[0, "max_retained_outside_fraction"] = 0.051
+        frame.to_csv(directory / name, index=False)
+    _rehash(directory, name)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "data_snapshot|numeric|finite|mask|valid|count|integer|QC|aggregation|"
+            "outside|metadata|pair|baseline|provenance|read_only|hash"
+        ),
+    ):
+        validate_round2_bundle(directory, smoke=False)
+
+
+@pytest.mark.parametrize(
+    ("table_name", "field", "value"),
+    [
+        ("oof_predictions.csv", "predicted_ido_score", np.inf),
+        ("oof_predictions.csv", "observed_ido_score", "not-numeric"),
+        ("oof_predictions.csv", "observed_ido_score", 999.0),
+        ("dummy_oof_predictions.csv", "predicted_ido_score", np.inf),
+        ("dummy_oof_predictions.csv", "observed_ido_score", "not-numeric"),
+        ("dummy_oof_predictions.csv", "observed_ido_score", 999.0),
+    ],
+)
+def test_round2_validator_rejects_oof_numeric_and_observed_mutations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    table_name: str,
+    field: str,
+    value: object,
+) -> None:
+    """Candidate 與 Dummy OOF 必須 finite，observed 必須重現 data target。"""
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    path = generation.staging_dir / table_name
+    frame = pd.read_csv(path)
+    if isinstance(value, str):
+        frame[field] = frame[field].astype(object)
+    frame.loc[0, field] = value
+    frame.to_csv(path, index=False)
+    _rehash(generation.staging_dir, table_name)
+
+    with pytest.raises(ValueError, match="OOF|observed|predicted|numeric|finite|target"):
+        validate_round2_bundle(generation.staging_dir, smoke=False)
+
+
+@pytest.mark.parametrize("table_name", ["fold_metrics.csv", "dummy_fold_metrics.csv"])
+@pytest.mark.parametrize("bad_kind", ["fractional", "boolean", "negative"])
+def test_round2_validator_rejects_non_strict_fold_n_test(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    table_name: str,
+    bad_kind: str,
+) -> None:
+    """Candidate 與 Dummy fold n_test 都不得以 int() 截斷或接受 bool。"""
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    path = generation.staging_dir / table_name
+    frame = pd.read_csv(path)
+    if bad_kind == "fractional":
+        frame["n_test"] = frame["n_test"].astype(object)
+        frame.loc[0, "n_test"] = float(frame.loc[0, "n_test"]) + 0.5
+    elif bad_kind == "boolean":
+        frame["n_test"] = frame["n_test"].astype(object)
+        frame.loc[0, "n_test"] = True
+    else:
+        frame.loc[0, "n_test"] = -1
+    frame.to_csv(path, index=False)
+    _rehash(generation.staging_dir, table_name)
+
+    with pytest.raises(ValueError, match="n_test|integer|membership"):
+        validate_round2_bundle(generation.staging_dir, smoke=False)
+
+
+@pytest.mark.parametrize(
+    "table_name", ["feature_set_comparison.csv", "eligibility.csv"]
+)
+@pytest.mark.parametrize(
+    "field",
+    [
+        "leave_one_b_out_oof_mae",
+        "leave_one_b_out_rank",
+        "average_rank",
+        "worst_validation_rank",
+        "mae_beats_dummy_gate",
+        "in_tie_band",
+        "eliminated_by_simplicity",
+    ],
+)
+def test_round2_validator_rejects_rehashed_derived_ranking_mutations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    table_name: str,
+    field: str,
+) -> None:
+    """兩份 ranking 的 pooled MAE、min ranks、gates 與 33-feature elimination 都須重算。"""
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    path = generation.staging_dir / table_name
+    frame = pd.read_csv(path)
+    if pd.api.types.is_bool_dtype(frame[field]):
+        frame.loc[0, field] = not bool(frame.loc[0, field])
+    else:
+        frame.loc[0, field] = float(frame.loc[0, field]) + 0.125
+    frame.to_csv(path, index=False)
+    _rehash(generation.staging_dir, table_name)
+
+    with pytest.raises(ValueError, match="ranking|derived|gate|rank|comparison|eligibility"):
         validate_round2_bundle(generation.staging_dir, smoke=False)
 
 
