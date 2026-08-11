@@ -3,13 +3,53 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import copy
 import os
 import stat
+import sys
+import time
+import traceback
 from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
+import pandas as pd
 import yaml
+
+if __name__ == "__main__":
+    #避免 ``python -m`` 下 reporting 反向匯入 canonical module 造成第二份初始化。
+    sys.modules.setdefault("immunity.exp3.run_round2_paper93", sys.modules[__name__])
+
+from immunity.exp3.benchmark import outer_split_manifest
+from immunity.exp3.feature_sets import PAPER_STYLE_FOV_FEATURES, PRIMARY_FOV_FEATURES
+from immunity.exp3.round2_benchmark import (
+    build_round2_comparison,
+    rank_round2_configurations,
+    run_paper93_benchmark,
+    select_round2_recommendation,
+)
+from immunity.exp3.round2_evidence import (
+    expected_split_ids,
+    load_round1_evidence,
+    make_smoke_outer_splits,
+    require_formal_round1_evidence,
+    restore_frozen_outer_splits,
+    validate_frozen_masks,
+)
+from immunity.exp3.round2_features import (
+    extract_locked_paper93,
+    require_paper93_preflight,
+)
+from immunity.exp3.round2_reporting import (
+    ROUND2_JSON_NAMES,
+    ROUND2_TABLE_NAMES,
+    begin_round2_generation,
+    publish_round2_generation,
+    quarantine_round2_generation,
+    validate_round2_bundle,
+    write_round2_bundle,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -134,6 +174,505 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def run_round2(
+    config: Mapping[str, Any],
+    smoke_fovs_per_condition: int | None = None,
+) -> Path:
+    """執行並原子發布獨立的 Exp3 Round 2 Paper93 generation。
+
+    Args:
+        config: 已驗證且含 Round 1 pins、feature、benchmark 與 output 的設定。
+        smoke_fovs_per_condition: 每個 ``group_id × condition_index`` 保留的
+            smoke FOV 數；省略時執行正式 frozen membership benchmark。
+
+    Returns:
+        已發布且存在的 ``EXPERIMENT_RECORD.md`` 路徑。
+
+    Raises:
+        TypeError: ``config`` 不是 mapping 時拋出。
+        ValueError: 設定、來源證據、mask、特徵或 bundle validation 失敗時拋出。
+        RuntimeError: 發布後 record 不存在時拋出。
+    """
+    if not isinstance(config, Mapping):
+        raise TypeError("Round 2 config 必須是 mapping")
+    smoke = smoke_fovs_per_condition is not None
+    smoke_count = _smoke_count(smoke_fovs_per_condition) if smoke else None
+    output_value = _required_mapping(config, "output").get("dir")
+    if not isinstance(output_value, (str, Path)):
+        raise ValueError("Round 2 output.dir 必須是路徑")
+    output_dir = resolve_round2_output_dir(output_value, smoke=smoke)
+    generation = begin_round2_generation(output_dir)
+    log_path = generation.staging_dir / "run.log"
+    started = time.perf_counter()
+    mask_qc: pd.DataFrame | None = None
+    bundle: Any = None
+
+    try:
+        with log_path.open("w", encoding="utf-8", newline="\n") as log_handle:
+            stdout_tee = _Tee(sys.stdout, log_handle)
+            stderr_tee = _Tee(sys.stderr, log_handle)
+            with contextlib.redirect_stdout(stdout_tee), contextlib.redirect_stderr(
+                stderr_tee
+            ):
+                evidence = load_round1_evidence(config)
+                #Smoke 仍必須先驗證完整 14-artifact source pins 與正式 roster。
+                require_formal_round1_evidence(evidence)
+                image_keys = (
+                    _select_smoke_image_keys(evidence.basic_images, smoke_count)
+                    if smoke
+                    else evidence.basic_images["image_key"].astype(str).tolist()
+                )
+                mask_qc = validate_frozen_masks(evidence, image_keys)
+                mask_qc.to_csv(
+                    generation.staging_dir / "mask_provenance_qc.csv",
+                    index=False,
+                    lineterminator="\n",
+                )
+                _require_mask_qc(mask_qc)
+
+                feature_config = _required_mapping(config, "features")
+                bundle = extract_locked_paper93(
+                    evidence,
+                    mask_qc,
+                    image_keys,
+                    min_finite_cells=int(
+                        feature_config["min_finite_cells_per_feature"]
+                    ),
+                    atol=float(feature_config["numeric_atol"]),
+                )
+                _write_feature_qc(generation.staging_dir, bundle)
+                require_paper93_preflight(bundle, formal=not smoke)
+
+                splits = (
+                    make_smoke_outer_splits(bundle.images, config)
+                    if smoke
+                    else restore_frozen_outer_splits(
+                        bundle.images, evidence.split_manifest
+                    )
+                )
+                effective_config = _effective_config(
+                    config,
+                    smoke=smoke,
+                    smoke_fovs_per_condition=smoke_count,
+                )
+                paper93_result = run_paper93_benchmark(
+                    bundle.images,
+                    splits,
+                    _required_mapping(effective_config, "benchmark"),
+                )
+                if smoke:
+                    comparison = None
+                    ranking = _smoke_eligibility()
+                    recommendation = None
+                else:
+                    comparison = build_round2_comparison(
+                        evidence,
+                        paper93_result,
+                        expected_split_ids(splits),
+                    )
+                    ranking = rank_round2_configurations(
+                        comparison,
+                        {
+                            "basic_median": list(PRIMARY_FOV_FEATURES),
+                            "paper_style_median": list(PAPER_STYLE_FOV_FEATURES),
+                        },
+                    )
+                    recommendation = select_round2_recommendation(ranking)
+
+                tables = _round2_tables(
+                    evidence=evidence,
+                    bundle=bundle,
+                    mask_qc=mask_qc,
+                    splits=splits,
+                    paper93_result=paper93_result,
+                    comparison=comparison,
+                    ranking=ranking,
+                    smoke=smoke,
+                )
+                payloads = _round2_json_payloads(
+                    config=config,
+                    effective_config=effective_config,
+                    evidence=evidence,
+                    bundle=bundle,
+                    smoke=smoke,
+                )
+                context = _round2_record_context(
+                    config=config,
+                    bundle=bundle,
+                    ranking=ranking,
+                    recommendation=recommendation,
+                    smoke=smoke,
+                    runtime_seconds=time.perf_counter() - started,
+                )
+                _remove_preflight_qc(generation.staging_dir)
+                write_round2_bundle(
+                    generation.staging_dir,
+                    tables,
+                    payloads,
+                    context,
+                )
+                validate_round2_bundle(generation.staging_dir, smoke=smoke)
+
+        #Windows 上已開啟的 handle 不可安全搬移；發布只能發生在 with 之外。
+        publish_round2_generation(generation)
+        record = output_dir / "EXPERIMENT_RECORD.md"
+        if not record.is_file():
+            raise RuntimeError("EXPERIMENT_RECORD.md 未成功發布")
+        return record
+    except BaseException as error:
+        error_info = sys.exc_info()
+        _restore_failure_qc(generation.staging_dir, mask_qc, bundle)
+        _append_failure_evidence(log_path, error_info, generation.staging_dir)
+        try:
+            if generation.staging_dir.exists():
+                quarantine_round2_generation(generation)
+        except BaseException as quarantine_error:
+            error.add_note(
+                "Round 2 failed-generation quarantine error: "
+                f"{type(quarantine_error).__name__}: {quarantine_error}"
+            )
+        raise
+
+
+def main() -> int:
+    """執行 Round 2 CLI 並將 pipeline 失敗轉為非零 exit code。
+
+    Returns:
+        Bundle 完成 validation、發布且 record 存在時回傳 0；否則回傳非零。
+    """
+    arguments = build_parser().parse_args()
+    try:
+        config = load_round2_config(arguments.config)
+        record = run_round2(
+            config,
+            smoke_fovs_per_condition=arguments.smoke_fovs_per_condition,
+        )
+        if record.name != "EXPERIMENT_RECORD.md" or not record.is_file():
+            raise RuntimeError("EXPERIMENT_RECORD.md 不存在，CLI 不可回傳成功")
+        print(f"Exp3 Round 2 record: {record}")
+        return 0
+    except Exception:  # noqa: BLE001 - CLI 必須把完整 traceback 輸出到 stderr
+        traceback.print_exc()
+        return 1
+
+
+class _Tee:
+    """將 console stream 同步寫入 run-local log。"""
+
+    def __init__(self, stream: TextIO, log: TextIO) -> None:
+        self._stream = stream
+        self._log = log
+
+    def write(self, value: str) -> int:
+        """同步寫入 console 與 log，並立即刷新 log。"""
+        self._stream.write(value)
+        self._log.write(value)
+        self._log.flush()
+        return len(value)
+
+    def flush(self) -> None:
+        """同步刷新 console 與 log。"""
+        self._stream.flush()
+        self._log.flush()
+
+
+def _required_mapping(config: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    """取得必要 mapping 設定。"""
+    value = config.get(key)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"Round 2 {key} 必須是 mapping")
+    return value
+
+
+def _smoke_count(value: int | None) -> int:
+    """驗證 smoke 每組 FOV 數是正整數。"""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("smoke_fovs_per_condition 必須是正整數")
+    return value
+
+
+def _select_smoke_image_keys(images: pd.DataFrame, count: int | None) -> list[str]:
+    """依 group、condition 與 FOV stable sort 選取 deterministic smoke subset。"""
+    if count is None:
+        raise ValueError("smoke subset 缺少每組 FOV 數")
+    required = {"image_key", "group_id", "condition_index", "fov"}
+    missing = sorted(required - set(images.columns))
+    if missing:
+        raise ValueError(f"smoke images 缺少必要欄位：{missing}")
+    ordered = images.assign(_image_key=images["image_key"].astype(str)).sort_values(
+        ["group_id", "condition_index", "fov", "_image_key"], kind="stable"
+    )
+    selected = ordered.groupby(
+        ["group_id", "condition_index"], sort=False, dropna=False
+    ).head(count)
+    if selected.empty:
+        raise ValueError("smoke image subset 不可為空")
+    return selected["_image_key"].tolist()
+
+
+def _require_mask_qc(mask_qc: pd.DataFrame) -> None:
+    """在 feature extraction 前阻擋所有 mask provenance failures。"""
+    if "status" not in mask_qc:
+        raise ValueError("mask provenance QC 缺少 status")
+    failed = mask_qc[~mask_qc["status"].astype(str).eq("passed")]
+    if not failed.empty:
+        columns = [
+            name
+            for name in ("image_key", "pc_path", "mask_path", "reason")
+            if name in failed
+        ]
+        evidence = failed.loc[:, columns].to_dict(orient="records")
+        raise ValueError(f"mask provenance failure：{evidence}")
+
+
+def _write_feature_qc(staging: Path, bundle: Any) -> None:
+    """在 preflight 前保留可用的 feature extraction QC。"""
+    for name, frame in (
+        ("feature_valid_counts.csv", bundle.valid_counts),
+        ("extraction_qc.csv", bundle.extraction_qc),
+        ("feature_qc.csv", bundle.feature_qc),
+    ):
+        frame.to_csv(staging / name, index=False, lineterminator="\n")
+
+
+def _remove_preflight_qc(staging: Path) -> None:
+    """成功 preflight 後移除暫存 QC，交由 atomic bundle writer 重寫。"""
+    for name in (
+        "mask_provenance_qc.csv",
+        "feature_valid_counts.csv",
+        "extraction_qc.csv",
+        "feature_qc.csv",
+    ):
+        (staging / name).unlink()
+
+
+def _restore_failure_qc(
+    staging: Path,
+    mask_qc: pd.DataFrame | None,
+    bundle: Any,
+) -> None:
+    """在晚期 failure quarantine 前補回尚未由 writer 留下的 QC tables。"""
+    frames = {
+        "mask_provenance_qc.csv": mask_qc,
+        "feature_valid_counts.csv": getattr(bundle, "valid_counts", None),
+        "extraction_qc.csv": getattr(bundle, "extraction_qc", None),
+        "feature_qc.csv": getattr(bundle, "feature_qc", None),
+    }
+    for name, frame in frames.items():
+        path = staging / name
+        if path.exists() or not isinstance(frame, pd.DataFrame):
+            continue
+        frame.to_csv(path, index=False, lineterminator="\n")
+
+
+def _effective_config(
+    config: Mapping[str, Any],
+    *,
+    smoke: bool,
+    smoke_fovs_per_condition: int | None,
+) -> dict[str, Any]:
+    """建立保留原始設定、只縮小 smoke 計算量的 effective config。"""
+    effective = copy.deepcopy(dict(config))
+    if smoke:
+        benchmark = dict(_required_mapping(effective, "benchmark"))
+        smoke_config = _required_mapping(config, "smoke")
+        for key in (
+            "max_hyperparameter_candidates",
+            "permutation_repeats",
+            "tree_estimators",
+        ):
+            benchmark[key] = smoke_config[key]
+        effective["benchmark"] = benchmark
+        effective["smoke"] = {
+            **dict(smoke_config),
+            "fovs_per_condition": smoke_fovs_per_condition,
+        }
+    return effective
+
+
+def _smoke_eligibility() -> pd.DataFrame:
+    """建立不含排名或 recommendation 的兩模型 smoke status 表。"""
+    return pd.DataFrame(
+        {
+            "configuration_id": [
+                "extra_trees__paper_style_median",
+                "random_forest__paper_style_median",
+            ],
+            "model": ["extra_trees", "random_forest"],
+            "feature_set": [ROUND2_FEATURE_SET, ROUND2_FEATURE_SET],
+            "source_round": ["round2_paper93", "round2_paper93"],
+            "eligible": [False, False],
+            "recommended": [False, False],
+            "status": ["smoke", "smoke"],
+        }
+    )
+
+
+def _round2_tables(
+    *,
+    evidence: Any,
+    bundle: Any,
+    mask_qc: pd.DataFrame,
+    splits: Any,
+    paper93_result: Any,
+    comparison: Any,
+    ranking: pd.DataFrame,
+    smoke: bool,
+) -> dict[str, pd.DataFrame]:
+    """依 formal/smoke contract 建立固定 Round 2 CSV tables。"""
+    if smoke:
+        sources = {
+            "fold_metrics.csv": paper93_result.fold_metrics,
+            "oof_predictions.csv": paper93_result.predictions,
+            "dummy_fold_metrics.csv": evidence.selected_metrics.iloc[0:0].copy(),
+            "dummy_oof_predictions.csv": evidence.selected_predictions.iloc[
+                0:0
+            ].copy(),
+            "hyperparameters.csv": paper93_result.hyperparameters,
+            "feature_importance.csv": paper93_result.feature_importance,
+            "model_failures.csv": paper93_result.failures,
+            "feature_set_comparison.csv": pd.DataFrame(
+                columns=["configuration_id", "model", "feature_set", "source_round"]
+            ),
+            "eligibility.csv": ranking,
+        }
+    else:
+        sources = {
+            "fold_metrics.csv": comparison.fold_metrics,
+            "oof_predictions.csv": comparison.predictions,
+            "dummy_fold_metrics.csv": comparison.dummy_metrics,
+            "dummy_oof_predictions.csv": comparison.dummy_predictions,
+            "hyperparameters.csv": comparison.hyperparameters,
+            "feature_importance.csv": comparison.feature_importance,
+            "model_failures.csv": comparison.failures,
+            "feature_set_comparison.csv": ranking,
+            "eligibility.csv": ranking,
+        }
+    tables = {
+        "data_snapshot.csv": bundle.images,
+        "outer_splits.csv": outer_split_manifest(bundle.images, splits),
+        "mask_provenance_qc.csv": mask_qc,
+        "feature_valid_counts.csv": bundle.valid_counts,
+        "extraction_qc.csv": bundle.extraction_qc,
+        "feature_qc.csv": bundle.feature_qc,
+        **sources,
+    }
+    if set(tables) != set(ROUND2_TABLE_NAMES):
+        raise RuntimeError("Round 2 table assembly 未符合固定 artifact contract")
+    return tables
+
+
+def _round2_json_payloads(
+    *,
+    config: Mapping[str, Any],
+    effective_config: Mapping[str, Any],
+    evidence: Any,
+    bundle: Any,
+    smoke: bool,
+) -> dict[str, Mapping[str, Any]]:
+    """建立 predictor、來源 provenance 與執行模式 JSON artifacts。"""
+    expected = _required_mapping(_required_mapping(config, "round1"), "expected")
+    metadata = {
+        "mode": "smoke" if smoke else "formal",
+        "smoke": smoke,
+        "seed": int(_required_mapping(effective_config, "benchmark")["seed"]),
+        "analyzed_images": len(bundle.images),
+        "valid_cells": len(bundle.paper_cells),
+        "exclusions": int(expected.get("exclusions", 26)),
+        "diagnostic_splits": smoke,
+        "non_formal": smoke,
+        "no_scientific_conclusion": smoke,
+        "original_config": _json_ready(config),
+        "effective_config": _json_ready(effective_config),
+    }
+    payloads = {
+        "feature_sets.json": {
+            "basic_median": list(PRIMARY_FOV_FEATURES),
+            "paper_style_median": list(PAPER_STYLE_FOV_FEATURES),
+        },
+        "baseline_provenance.json": {
+            "round1_root": str(evidence.root),
+            "read_only": True,
+            "artifact_sha256": dict(evidence.artifact_hashes),
+            "roster_sha256": _required_mapping(config, "round1").get(
+                "roster_sha256"
+            ),
+        },
+        "run_metadata.json": metadata,
+    }
+    if set(payloads) != set(ROUND2_JSON_NAMES):
+        raise RuntimeError("Round 2 JSON assembly 未符合固定 artifact contract")
+    return payloads
+
+
+def _round2_record_context(
+    *,
+    config: Mapping[str, Any],
+    bundle: Any,
+    ranking: pd.DataFrame,
+    recommendation: str | None,
+    smoke: bool,
+    runtime_seconds: float,
+) -> dict[str, Any]:
+    """建立正式結論或 smoke 無科學結論的繁體中文 record context。"""
+    expected = _required_mapping(_required_mapping(config, "round1"), "expected")
+    failed = bundle.extraction_qc[
+        ~bundle.extraction_qc["status"].astype(str).eq("passed")
+    ]
+    return {
+        "smoke": smoke,
+        "recommendation": recommendation,
+        "paper93_better_than_basic": (
+            recommendation.endswith("__paper_style_median")
+            if recommendation is not None
+            else None
+        ),
+        "analyzed_images": len(bundle.images),
+        "valid_cells": len(bundle.paper_cells),
+        "exclusions": int(expected.get("exclusions", 26)),
+        "seed": int(_required_mapping(config, "benchmark")["seed"]),
+        "runtime_seconds": runtime_seconds,
+        "comparison": "smoke diagnostic only" if smoke else ranking,
+        "eligibility": "smoke: no ranking/recommendation" if smoke else ranking,
+        "feature_qc": bundle.feature_qc,
+        "extraction_failures": len(failed),
+    }
+
+
+def _json_ready(value: Any) -> Any:
+    """將 caller config 複製成可稽核且可 strict JSON 序列化的值。"""
+    if isinstance(value, Mapping):
+        return {str(key): _json_ready(child) for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(child) for child in value]
+    if isinstance(value, Path):
+        return str(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return repr(value)
+
+
+def _append_failure_evidence(
+    log_path: Path,
+    error_info: tuple[Any, Any, Any],
+    staging: Path,
+) -> None:
+    """以短暫 handle 寫入 traceback 與已落盤的具名 QC evidence。"""
+    try:
+        with log_path.open("a", encoding="utf-8", newline="\n") as log_handle:
+            traceback.print_exception(*error_info, file=log_handle)
+            for name in ("mask_provenance_qc.csv", "extraction_qc.csv"):
+                path = staging / name
+                if not path.is_file():
+                    continue
+                log_handle.write(f"\n[{name}]\n")
+                log_handle.write(path.read_text(encoding="utf-8"))
+            log_handle.flush()
+            os.fsync(log_handle.fileno())
+    except OSError:
+        traceback.print_exception(*error_info)
+
+
 def _validate_round2_config(config: dict[str, Any]) -> None:
     """驗證設定中的凍結 Round 2 合約。"""
     required = {"experiment_name", "round1", "models", "features", "benchmark", "smoke", "output"}
@@ -198,3 +737,7 @@ def _is_reparse_point(path: Path) -> bool:
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     attributes = getattr(status, "st_file_attributes", 0)
     return path.is_symlink() or bool(attributes & reparse_flag)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
