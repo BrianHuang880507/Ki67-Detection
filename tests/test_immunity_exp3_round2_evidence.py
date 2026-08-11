@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from dataclasses import replace
@@ -495,6 +496,32 @@ def test_formal_round1_gate_accepts_only_693_23976_exact_hashes_roster_and_23_fo
     require_formal_round1_evidence(formal_evidence)
 
 
+@pytest.mark.parametrize("field", ["config_hash", "input_counts"])
+def test_formal_round1_gate_rejects_metadata_mutation_after_load(
+    formal_evidence: Round1Evidence,
+    field: str,
+) -> None:
+    canonical = json.dumps(
+        dict(formal_evidence.metadata),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    assert hashlib.sha256(canonical).hexdigest() == (
+        "b10871a7f6b86dff8a86ebbe0cd604a4d599b84aa955646adc7db2cea46fd4a4"
+    )
+    metadata = copy.deepcopy(formal_evidence.metadata)
+    if field == "config_hash":
+        metadata["config_hash"] = "0" * 64
+    else:
+        metadata["input_counts"]["analyzed_images"] = 692
+    changed = replace(formal_evidence, metadata=metadata)
+
+    with pytest.raises(ValueError, match="metadata.*semantic digest"):
+        require_formal_round1_evidence(changed)
+
+
 @pytest.mark.parametrize(
     "drift",
     [
@@ -627,6 +654,24 @@ def test_restore_frozen_splits_rejects_coordinated_cross_fold_membership_swap(
 
     with pytest.raises(ValueError, match="canonical.*membership"):
         restore_frozen_outer_splits(formal_evidence.basic_images, manifest)
+
+
+def test_restore_frozen_splits_rejects_synchronized_nonproduction_image_keys(
+    formal_evidence: Round1Evidence,
+) -> None:
+    image_keys = sorted(formal_evidence.basic_images["image_key"].astype(str))
+    payload = ("\n".join(image_keys) + "\n").encode("utf-8")
+    assert hashlib.sha256(payload).hexdigest() == (
+        "efc55b45033a3923f1467dce86802f6514a0e9c182de77e94a2c155d47503232"
+    )
+    renamed = {key: f"RENAMED_{key}" for key in image_keys}
+    images = formal_evidence.basic_images.copy()
+    images["image_key"] = images["image_key"].map(renamed)
+    manifest = formal_evidence.split_manifest.copy()
+    manifest["image_key"] = manifest["image_key"].map(renamed)
+
+    with pytest.raises(ValueError, match="image-key roster SHA-256"):
+        restore_frozen_outer_splits(images, manifest)
 
 
 @pytest.mark.parametrize("drift", ["missing", "duplicate", "unknown", "membership", "metadata"])

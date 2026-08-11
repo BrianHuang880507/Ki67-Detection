@@ -62,6 +62,9 @@ _FROZEN_ARTIFACT_HASHES = {
 _FROZEN_ROSTER_HASH = (
     "a8333f12e1591d9e4c4174f5c6fe13dd31550124b19aea3522f4d0f812e0e426"
 )
+_FROZEN_IMAGE_KEYS_SHA256 = (
+    "efc55b45033a3923f1467dce86802f6514a0e9c182de77e94a2c155d47503232"
+)
 _MODEL_CONTRACT = {
     "extra_trees": ("candidate", "basic_median"),
     "random_forest": ("candidate", "basic_median"),
@@ -95,6 +98,14 @@ _MASK_QC_COLUMNS = (
     "reason",
 )
 _SEMANTIC_DIGEST_ATTR = "round1_frozen_semantic_sha256"
+
+
+class _EvidenceMetadata(dict[str, Any]):
+    """保存 mutable metadata 與其 loader-time canonical semantic digest。"""
+
+    def __init__(self, value: Mapping[str, Any]) -> None:
+        super().__init__(value)
+        self.frozen_semantic_sha256 = _metadata_semantic_sha256(self)
 
 
 @dataclass(frozen=True)
@@ -269,6 +280,7 @@ def load_round1_evidence(config: Mapping[str, Any]) -> Round1Evidence:
             "model_ranking": model_ranking,
         }
     )
+    frozen_metadata = _EvidenceMetadata(metadata)
     return Round1Evidence(
         root=root,
         manifest=manifest,
@@ -282,7 +294,7 @@ def load_round1_evidence(config: Mapping[str, Any]) -> Round1Evidence:
         selected_importance=selected_importance,
         selected_failures=selected_failures,
         model_ranking=model_ranking,
-        metadata=metadata,
+        metadata=frozen_metadata,
         artifact_hashes=hashes,
     )
 
@@ -313,6 +325,7 @@ def require_formal_round1_evidence(evidence: Round1Evidence) -> None:
             "model_ranking": evidence.model_ranking,
         }
     )
+    _require_metadata_unchanged(evidence.metadata)
     if len(evidence.basic_images) != 693 or evidence.basic_images["image_key"].nunique() != 693:
         raise ValueError("formal Round 1 必須含 693 unique images")
     if len(evidence.basic_cells) != 23976:
@@ -480,6 +493,12 @@ def restore_frozen_outer_splits(
     image_keys = images["image_key"].astype(str)
     if image_keys.duplicated().any():
         raise ValueError("images 出現重複 image_key")
+    image_key_hash = _canonical_image_keys_sha256(image_keys)
+    if image_key_hash != _FROZEN_IMAGE_KEYS_SHA256:
+        raise ValueError(
+            "formal Round 1 image-key roster SHA-256 不符合固定 snapshot："
+            f"actual={image_key_hash}"
+        )
     source = split_manifest.copy()
     source["validation"] = source["validation"].astype(str)
     source["fold"] = source["fold"].astype(str)
@@ -918,6 +937,37 @@ def _frame_semantic_sha256(frame: pd.DataFrame) -> str:
     digest = hashlib.sha256(schema)
     digest.update(values.tobytes(order="C"))
     return digest.hexdigest()
+
+
+def _canonical_image_keys_sha256(image_keys: Sequence[str]) -> str:
+    """計算 production image-key roster 的 canonical SHA-256。"""
+    keys = sorted(str(key) for key in image_keys)
+    payload = ("\n".join(keys) + "\n").encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _metadata_semantic_sha256(metadata: Mapping[str, Any]) -> str:
+    """計算 run metadata strict canonical JSON 的 SHA-256。"""
+    payload = json.dumps(
+        dict(metadata),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _require_metadata_unchanged(metadata: Mapping[str, Any]) -> None:
+    """拒絕缺少 snapshot digest 或 loader 後被改寫的 run metadata。"""
+    expected = getattr(metadata, "frozen_semantic_sha256", None)
+    if not isinstance(expected, str):
+        raise ValueError("formal Round 1 metadata semantic digest 不可缺少")
+    actual = _metadata_semantic_sha256(metadata)
+    if actual != expected:
+        raise ValueError(
+            "formal Round 1 metadata semantic digest 不符合 loader snapshot"
+        )
 
 
 def _freeze_semantic_frames(frames: Mapping[str, pd.DataFrame]) -> None:
