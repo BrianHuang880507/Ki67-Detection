@@ -267,8 +267,9 @@ def test_paper93_recomputes_33_cell_features_and_rejects_mask_array_drift(
     cell_mask[2:9, 2:10] = 1
     arrays["cell_mask"] = cell_mask
     np.savez(mask_path, **arrays)
+    refreshed_mask_qc = validate_frozen_masks(frozen_evidence)
 
-    bundle = extract_locked_paper93(frozen_evidence, verified_mask_qc)
+    bundle = extract_locked_paper93(frozen_evidence, refreshed_mask_qc)
 
     assert bundle.extraction_qc["status"].tolist() == ["failed"]
     assert "basic feature drift" in bundle.extraction_qc.loc[0, "reason"]
@@ -606,3 +607,38 @@ def test_paper93_formal_preflight_rejects_synchronized_693_key_rename(
 
     with pytest.raises(ValueError, match="image-key roster SHA-256"):
         require_paper93_preflight(renamed, formal=True)
+
+
+def test_paper93_rejects_same_shape_mask_pixel_mutation_after_task2_qc(
+    frozen_evidence: Round1Evidence,
+    verified_mask_qc: pd.DataFrame,
+) -> None:
+    mask_path = Path(verified_mask_qc.loc[0, "mask_path"])
+    with np.load(mask_path, allow_pickle=False) as cached:
+        arrays = {name: np.asarray(cached[name]) for name in cached.files}
+    changed = arrays["cell_mask"].copy()
+    changed[0, 0] = 99
+    arrays["cell_mask"] = changed
+    np.savez(mask_path, **arrays)
+
+    bundle = extract_locked_paper93(frozen_evidence, verified_mask_qc)
+
+    assert bundle.extraction_qc["status"].tolist() == ["failed"]
+    reason = bundle.extraction_qc.loc[0, "reason"]
+    assert "cell_mask_sha256" in reason
+    assert "image_key=B1_P1_C01_F01" in reason
+    assert str(mask_path) in reason
+
+
+def test_paper93_normalizes_inherited_round1_loader_attrs(
+    frozen_evidence: Round1Evidence,
+    verified_mask_qc: pd.DataFrame,
+) -> None:
+    frozen_evidence.basic_images.attrs["round1_frozen_semantic_sha256"] = {
+        "columns": "loader-owned-digest"
+    }
+
+    bundle = extract_locked_paper93(frozen_evidence, verified_mask_qc)
+
+    assert "round1_frozen_semantic_sha256" not in bundle.images.attrs
+    require_paper93_preflight(bundle, formal=False)

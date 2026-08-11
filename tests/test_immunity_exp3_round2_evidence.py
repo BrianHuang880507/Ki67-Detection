@@ -432,6 +432,19 @@ def test_frozen_mask_validation_accepts_exact_pc_and_embedded_provenance(tmp_pat
 
     qc = validate_frozen_masks(evidence)
 
+    assert qc.columns.tolist() == [
+        "image_key",
+        "pc_path",
+        "mask_path",
+        "expected_pc_sha256",
+        "actual_pc_sha256",
+        "expected_provenance_hash",
+        "actual_provenance_hash",
+        "cell_mask_sha256",
+        "nucleus_mask_sha256",
+        "status",
+        "reason",
+    ]
     assert qc["status"].tolist() == ["passed", "passed"]
     assert qc["reason"].tolist() == ["verified", "verified"]
     assert qc["actual_pc_sha256"].tolist() == qc["expected_pc_sha256"].tolist()
@@ -484,6 +497,39 @@ def test_frozen_mask_failure_does_not_change_cache_bytes_or_create_segmenter(tmp
     assert qc.loc[0, "status"] == "failed"
     assert mask_path.read_bytes() == before
     assert calls == 0
+
+
+def test_frozen_mask_qc_binds_dtype_shape_and_contiguous_array_bytes(
+    tmp_path: Path,
+) -> None:
+    evidence = load_round1_evidence(_write_round1_fixture(tmp_path))
+    image_key = "B1_P1_C01_F01"
+
+    original = validate_frozen_masks(evidence, [image_key])
+
+    assert original.loc[0, "cell_mask_sha256"] == (
+        "5c561f876f432cee885d05c80d723da8e7d104a6ae33631428b1b4a5cd20bf6c"
+    )
+    assert original.loc[0, "nucleus_mask_sha256"] == (
+        "5c561f876f432cee885d05c80d723da8e7d104a6ae33631428b1b4a5cd20bf6c"
+    )
+    mask_path = Path(original.loc[0, "mask_path"])
+    with np.load(mask_path, allow_pickle=False) as cached:
+        arrays = {name: np.asarray(cached[name]) for name in cached.files}
+    changed = arrays["cell_mask"].copy()
+    changed[0, 0] = 9
+    arrays["cell_mask"] = changed
+    np.savez(mask_path, **arrays)
+
+    fresh = validate_frozen_masks(evidence, [image_key])
+
+    assert fresh.loc[0, "status"] == "passed"
+    assert fresh.loc[0, "cell_mask_sha256"] == (
+        "6b85a4b5b20f14c66d3a8d1c062d97435145a22b8781493e261e3564e0e38e65"
+    )
+    assert fresh.loc[0, "nucleus_mask_sha256"] == original.loc[
+        0, "nucleus_mask_sha256"
+    ]
 
 
 @pytest.fixture(scope="module")

@@ -64,6 +64,8 @@ MASK_QC_COLUMNS = [
     "actual_pc_sha256",
     "expected_provenance_hash",
     "actual_provenance_hash",
+    "cell_mask_sha256",
+    "nucleus_mask_sha256",
     "status",
     "reason",
 ]
@@ -172,6 +174,7 @@ def extract_locked_paper93(
     fresh_qc = _unique_by_image(validate_frozen_masks(evidence, keys), "fresh mask_qc")
 
     selected_images = basic_images.loc[keys].reset_index(drop=True).copy()
+    selected_images.attrs = {}
     selected_cells = evidence.basic_cells[
         evidence.basic_cells["image_key"].astype(str).isin(keys)
     ].copy()

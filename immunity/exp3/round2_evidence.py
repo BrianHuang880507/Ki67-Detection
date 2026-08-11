@@ -94,6 +94,8 @@ _MASK_QC_COLUMNS = (
     "actual_pc_sha256",
     "expected_provenance_hash",
     "actual_provenance_hash",
+    "cell_mask_sha256",
+    "nucleus_mask_sha256",
     "status",
     "reason",
 )
@@ -425,6 +427,8 @@ def validate_frozen_masks(
             "actual_pc_sha256": "",
             "expected_provenance_hash": expected_provenance,
             "actual_provenance_hash": "",
+            "cell_mask_sha256": "",
+            "nucleus_mask_sha256": "",
             "status": "failed",
             "reason": "",
         }
@@ -444,6 +448,10 @@ def validate_frozen_masks(
                 nucleus_mask = np.asarray(cached["nucleus_mask"])
                 if cell_mask.ndim != 2 or nucleus_mask.ndim != 2 or cell_mask.shape != nucleus_mask.shape:
                     raise ValueError("mask arrays 必須是相同 shape 的二維陣列")
+                result["cell_mask_sha256"] = _canonical_array_sha256(cell_mask)
+                result["nucleus_mask_sha256"] = _canonical_array_sha256(
+                    nucleus_mask
+                )
                 provenance_json = _npz_text(cached, "provenance_json")
                 embedded_hash = _npz_text(cached, "provenance_hash")
             result["actual_provenance_hash"] = embedded_hash
@@ -1024,6 +1032,30 @@ def _npz_text(cached: Any, name: str) -> str:
         raise ValueError(f"mask cache {name} 必須是文字 scalar")
     item = value.item()
     return item.decode("utf-8") if isinstance(item, bytes) else str(item)
+
+
+def _canonical_array_sha256(array: np.ndarray) -> str:
+    """計算綁定 dtype、shape 與 C-order bytes 的 canonical SHA-256。
+
+    Args:
+        array: 要鎖定內容 identity 的 NumPy array。
+
+    Returns:
+        使用版本前綴與 length-delimited metadata／bytes 計算的 SHA-256。
+    """
+    value = np.asarray(array)
+    digest = hashlib.sha256()
+    digest.update(b"exp3-mask-array-v1\0")
+    dtype_bytes = value.dtype.str.encode("utf-8")
+    digest.update(len(dtype_bytes).to_bytes(8, "big"))
+    digest.update(dtype_bytes)
+    digest.update(value.ndim.to_bytes(8, "big"))
+    for dimension in value.shape:
+        digest.update(int(dimension).to_bytes(8, "big"))
+    contiguous_bytes = np.ascontiguousarray(value).tobytes(order="C")
+    digest.update(len(contiguous_bytes).to_bytes(8, "big"))
+    digest.update(contiguous_bytes)
+    return digest.hexdigest()
 
 
 def _strict_json_object(payload: str, name: str) -> dict[str, Any]:
