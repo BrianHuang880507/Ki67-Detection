@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +54,29 @@ _JSON_NAMES = {
     "baseline_provenance.json",
     "run_metadata.json",
 }
+
+
+def test_round2_reporting_can_be_imported_in_fresh_interpreter() -> None:
+    """Fresh interpreter 可直接匯入 standalone validator。"""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from immunity.exp3.round2_reporting import "
+                "validate_round2_bundle; "
+                "assert callable(validate_round2_bundle); "
+                "print(validate_round2_bundle.__name__)"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "validate_round2_bundle"
 
 
 def _allowed_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:

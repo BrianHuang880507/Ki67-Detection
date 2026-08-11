@@ -16,7 +16,6 @@ from typing import Any
 
 import pandas as pd
 
-import immunity.exp3.run_round2_paper93 as run_module
 from immunity.exp3.feature_sets import PAPER_STYLE_FOV_FEATURES, PRIMARY_FOV_FEATURES
 
 
@@ -418,6 +417,8 @@ def build_round2_experiment_record(context: Mapping[str, Any]) -> str:
 
 def _resolve_allowed_output(candidate: Path) -> Path:
     """以 Task 1 resolver 驗證 formal root 或 smoke child。"""
+    import immunity.exp3.run_round2_paper93 as run_module
+
     root = Path(run_module.ROUND2_OUTPUT_ROOT)
     candidate_absolute = Path(os.path.abspath(candidate))
     root_absolute = Path(os.path.abspath(root))
@@ -453,6 +454,8 @@ def _validate_staging_directory(staging: Path) -> tuple[Path, Path]:
 
 def _validate_bundle_directory(directory: Path) -> tuple[Path, Path]:
     """接受已發布 target 或 target 內的 staging directory。"""
+    import immunity.exp3.run_round2_paper93 as run_module
+
     absolute = Path(os.path.abspath(directory))
     root = Path(os.path.abspath(run_module.ROUND2_OUTPUT_ROOT))
     smoke = root / "smoke"
