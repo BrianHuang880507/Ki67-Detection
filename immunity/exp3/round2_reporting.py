@@ -390,7 +390,9 @@ def build_round2_experiment_record(context: Mapping[str, Any]) -> str:
         "## Predictor 範圍",
         (
             "模型只使用 93 個已註冊的 phase-derived morphology predictors；這是 "
-            "phase-only paper-style approximation。Target、實驗條件、路徑與批次資訊均不進入 predictor matrix。"
+            "phase-only paper-style approximation。Target、實驗條件、路徑與批次資訊均不進入 "
+            "predictor matrix。Predictors 不包含 donor label/identifier、IFN/TNF dose、"
+            "condition、IDO channel 或 `IDO_score` target；IDO 僅作 target。"
         ),
         "## Data lock",
         (
@@ -404,9 +406,19 @@ def build_round2_experiment_record(context: Mapping[str, Any]) -> str:
             "current nucleus，因此同一 cell 的其他 nuclei 仍保留在 pair-specific cytoplasm。"
         ),
         "33 vs 93 的解讀只限於相同 frozen pair roster，不代表 unique cells 的獨立樣本比較。",
+        "## 評估指標",
+        (
+            "MAE 是 primary（越低越好）；RMSE、R²、Spearman 是 secondary（RMSE "
+            "越低越好，R² 與 Spearman 越高越好）。"
+        ),
         "## 33 vs 93 比較",
         comparison,
         "## Eligibility gates 與 tie decision",
+        (
+            "Strict tie：只有 `average_rank - R* < 0.25` 才屬同一 band；等於 `0.25` 不算。"
+            "若同一 algorithm 的 33-feature 與 93-feature 都在 band，保留 33-feature、"
+            "淘汰 93-feature。"
+        ),
         eligibility,
         "## Feature QC 與 extraction",
         f"Feature QC：{feature_qc}\n\nExtraction failures：{extraction_failures}。",

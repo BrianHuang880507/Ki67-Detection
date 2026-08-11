@@ -1386,7 +1386,34 @@ def test_round2_record_states_target_scope_and_approximation() -> None:
     assert "其他 nuclei 仍保留在 pair-specific cytoplasm" in text
     assert "相同 frozen pair roster" in text
     predictor_section = text.split("## Predictor 範圍", maxsplit=1)[1].split("##", maxsplit=1)[0]
-    assert "donor" not in predictor_section.lower()
+    assert (
+        "donor label/identifier、IFN/TNF dose、condition、IDO channel 或 "
+        "`IDO_score` target"
+    ) in predictor_section
+    assert "IDO 僅作 target" in predictor_section
+
+
+def test_round2_record_states_metric_roles_and_directions() -> None:
+    """正式 record 必須明示 primary/secondary 指標與正確方向。"""
+    text = build_round2_experiment_record(_formal_record_context())
+
+    assert "MAE 是 primary（越低越好）" in text
+    assert "RMSE、R²、Spearman 是 secondary" in text
+    assert "RMSE 越低越好" in text
+    assert "R² 與 Spearman 越高越好" in text
+
+
+def test_round2_record_states_strict_tie_decision_rules() -> None:
+    """正式 record 必須明示 strict boundary 與同 algorithm 的簡潔性規則。"""
+    text = build_round2_experiment_record(_formal_record_context())
+    decision_section = text.split(
+        "## Eligibility gates 與 tie decision", maxsplit=1
+    )[1].split("##", maxsplit=1)[0]
+
+    assert "`average_rank - R* < 0.25`" in decision_section
+    assert "等於 `0.25` 不算" in decision_section
+    assert "同一 algorithm 的 33-feature 與 93-feature 都在 band" in decision_section
+    assert "保留 33-feature、淘汰 93-feature" in decision_section
 
 
 def test_smoke_record_starts_with_no_scientific_conclusion() -> None:
