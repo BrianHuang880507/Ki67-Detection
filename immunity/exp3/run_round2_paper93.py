@@ -170,7 +170,11 @@ def build_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
-    parser.add_argument("--smoke-fovs-per-condition", type=int, default=None)
+    parser.add_argument(
+        "--smoke-fovs-per-condition",
+        type=_positive_int_argument,
+        default=None,
+    )
     return parser
 
 
@@ -319,17 +323,32 @@ def run_round2(
         if not record.is_file():
             raise RuntimeError("EXPERIMENT_RECORD.md 未成功發布")
         return record
-    except BaseException as error:
+    except BaseException:
         error_info = sys.exc_info()
-        _restore_failure_qc(generation.staging_dir, mask_qc, bundle)
-        _append_failure_evidence(log_path, error_info, generation.staging_dir)
+        try:
+            _restore_failure_qc(generation.staging_dir, mask_qc, bundle)
+        except BaseException as restore_error:
+            _append_secondary_failure_evidence(
+                log_path,
+                "restore_failure_qc",
+                restore_error,
+            )
+        try:
+            _append_failure_evidence(log_path, error_info, generation.staging_dir)
+        except BaseException as append_error:
+            _append_secondary_failure_evidence(
+                log_path,
+                "append_failure_evidence",
+                append_error,
+            )
         try:
             if generation.staging_dir.exists():
                 quarantine_round2_generation(generation)
         except BaseException as quarantine_error:
-            error.add_note(
-                "Round 2 failed-generation quarantine error: "
-                f"{type(quarantine_error).__name__}: {quarantine_error}"
+            _append_secondary_failure_evidence(
+                log_path,
+                "quarantine_round2_generation",
+                quarantine_error,
             )
         raise
 
@@ -376,6 +395,17 @@ class _Tee:
         self._log.flush()
 
 
+def _positive_int_argument(value: str) -> int:
+    """將 CLI 值解析為正整數，供 argparse 在 pipeline 前拒絕無效輸入。"""
+    try:
+        converted = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("必須是正整數") from error
+    if converted < 1:
+        raise argparse.ArgumentTypeError("必須是正整數")
+    return converted
+
+
 def _required_mapping(config: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     """取得必要 mapping 設定。"""
     value = config.get(key)
@@ -399,7 +429,10 @@ def _select_smoke_image_keys(images: pd.DataFrame, count: int | None) -> list[st
     missing = sorted(required - set(images.columns))
     if missing:
         raise ValueError(f"smoke images 缺少必要欄位：{missing}")
-    ordered = images.assign(_image_key=images["image_key"].astype(str)).sort_values(
+    source_keys = images["image_key"].astype(str).tolist()
+    if len(source_keys) != len(set(source_keys)):
+        raise ValueError("smoke source image_key 必須唯一")
+    ordered = images.assign(_image_key=source_keys).sort_values(
         ["group_id", "condition_index", "fov", "_image_key"], kind="stable"
     )
     selected = ordered.groupby(
@@ -407,7 +440,12 @@ def _select_smoke_image_keys(images: pd.DataFrame, count: int | None) -> list[st
     ).head(count)
     if selected.empty:
         raise ValueError("smoke image subset 不可為空")
-    return selected["_image_key"].tolist()
+    selected_keys = selected["_image_key"].tolist()
+    if len(selected_keys) != len(set(selected_keys)):
+        raise ValueError("smoke selected image_key 必須唯一")
+    if len(selected_keys) >= len(source_keys):
+        raise ValueError("smoke 必須是完整 frozen roster 的 strict subset")
+    return selected_keys
 
 
 def _require_mask_qc(mask_qc: pd.DataFrame) -> None:
@@ -458,11 +496,17 @@ def _restore_failure_qc(
         "extraction_qc.csv": getattr(bundle, "extraction_qc", None),
         "feature_qc.csv": getattr(bundle, "feature_qc", None),
     }
+    failures: list[BaseException] = []
     for name, frame in frames.items():
         path = staging / name
         if path.exists() or not isinstance(frame, pd.DataFrame):
             continue
-        frame.to_csv(path, index=False, lineterminator="\n")
+        try:
+            frame.to_csv(path, index=False, lineterminator="\n")
+        except BaseException as error:  # noqa: BLE001 - 其餘 QC 仍須 best-effort 寫入
+            failures.append(error)
+    if failures:
+        raise failures[0]
 
 
 def _effective_config(
@@ -671,6 +715,23 @@ def _append_failure_evidence(
             os.fsync(log_handle.fileno())
     except OSError:
         traceback.print_exception(*error_info)
+
+
+def _append_secondary_failure_evidence(
+    log_path: Path,
+    stage: str,
+    error: BaseException,
+) -> None:
+    """以 Python 3.10-safe 方式記錄 cleanup error，且永不掩蓋原始錯誤。"""
+    message = f"secondary cleanup failure [{stage}]: {type(error).__name__}: {error}\n"
+    try:
+        with log_path.open("a", encoding="utf-8", newline="\n") as log_handle:
+            log_handle.write(message)
+    except BaseException:  # noqa: BLE001 - secondary evidence 不得取代 pipeline error
+        try:
+            sys.stderr.write(message)
+        except BaseException:  # noqa: BLE001 - 原始 exception 永遠優先
+            pass
 
 
 def _validate_round2_config(config: dict[str, Any]) -> None:

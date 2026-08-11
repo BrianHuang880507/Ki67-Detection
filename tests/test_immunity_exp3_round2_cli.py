@@ -69,16 +69,16 @@ def _patch_round2_stages(
     monkeypatch.setattr(run_module, "ROUND2_OUTPUT_ROOT", root)
     images = pd.DataFrame(
         {
-            "image_key": ["B1_C1_F02", "B1_C1_F01"],
-            "group_id": ["G1", "G1"],
-            "condition_index": [1, 1],
-            "fov": [2, 1],
-            "IDO_score": [0.2, 0.1],
+            "image_key": ["B1_C1_F02", "B1_C1_F01", "B1_C1_F03"],
+            "group_id": ["G1", "G1", "G1"],
+            "condition_index": [1, 1, 1],
+            "fov": [2, 1, 3],
+            "IDO_score": [0.2, 0.1, 0.3],
         }
     )
     evidence = SimpleNamespace(
         basic_images=images,
-        basic_cells=pd.DataFrame({"image_key": ["B1_C1_F02", "B1_C1_F01"]}),
+        basic_cells=pd.DataFrame({"image_key": images["image_key"]}),
         split_manifest=pd.DataFrame({"image_key": images["image_key"]}),
         artifact_hashes={"source.csv": "b" * 64},
         metadata={"winner": "extra_trees__basic_median"},
@@ -89,10 +89,10 @@ def _patch_round2_stages(
     mask_qc = pd.DataFrame(
         {
             "image_key": images["image_key"],
-            "pc_path": ["pc-2.tif", "pc-1.tif"],
-            "mask_path": ["mask-2.npz", "mask-1.npz"],
-            "status": ["passed", "passed"],
-            "reason": ["", ""],
+            "pc_path": ["pc-2.tif", "pc-1.tif", "pc-3.tif"],
+            "mask_path": ["mask-2.npz", "mask-1.npz", "mask-3.npz"],
+            "status": ["passed", "passed", "passed"],
+            "reason": ["", "", ""],
         }
     )
     bundle = SimpleNamespace(
@@ -100,7 +100,10 @@ def _patch_round2_stages(
         paper_cells=pd.DataFrame({"image_key": images["image_key"]}),
         valid_counts=pd.DataFrame({"image_key": images["image_key"]}),
         extraction_qc=pd.DataFrame(
-            {"image_key": images["image_key"], "status": ["passed", "passed"]}
+            {
+                "image_key": images["image_key"],
+                "status": ["passed", "passed", "passed"],
+            }
         ),
         feature_qc=pd.DataFrame({"feature": ["f1"], "status": ["passed"]}),
         predictor_columns=("f1",),
@@ -423,6 +426,66 @@ def test_round2_smoke_emits_parseable_empty_diagnostic_tables(
         pd.read_csv(StringIO(payload))
 
 
+def test_round2_smoke_rejects_full_roster_before_downstream_stages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Smoke count 若選滿 693-row roster，必須在 mask validation 前拒絕。"""
+    calls: list[str] = []
+    captures = _patch_round2_stages(monkeypatch, tmp_path, calls)
+    evidence = captures["evidence"]
+    evidence.basic_images = pd.DataFrame(
+        {
+            "image_key": [f"image-{index:03d}" for index in range(693)],
+            "group_id": [f"group-{index // 99}" for index in range(693)],
+            "condition_index": [0] * 693,
+            "fov": list(range(693)),
+        }
+    )
+    validate = Mock(side_effect=AssertionError("mask validation must not run"))
+    extract = Mock(side_effect=AssertionError("feature extraction must not run"))
+    benchmark = Mock(side_effect=AssertionError("benchmark must not run"))
+    monkeypatch.setattr(run_module, "validate_frozen_masks", validate)
+    monkeypatch.setattr(run_module, "extract_locked_paper93", extract)
+    monkeypatch.setattr(run_module, "run_paper93_benchmark", benchmark)
+
+    with pytest.raises(ValueError, match="smoke.*subset|strict.*subset|完整"):
+        run_module.run_round2(
+            _synthetic_config(tmp_path), smoke_fovs_per_condition=100
+        )
+
+    validate.assert_not_called()
+    extract.assert_not_called()
+    benchmark.assert_not_called()
+
+
+@pytest.mark.parametrize("count", [0, -1])
+def test_round2_parser_and_runner_reject_nonpositive_smoke_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    count: int,
+) -> None:
+    """CLI parser 與 direct runner 都必須在建立 generation 前拒絕非正數。"""
+    begin = Mock(side_effect=AssertionError("generation must not begin"))
+    monkeypatch.setattr(run_module, "begin_round2_generation", begin)
+
+    with pytest.raises(SystemExit):
+        run_module.build_parser().parse_args(
+            [
+                "--config",
+                "round2.yaml",
+                "--smoke-fovs-per-condition",
+                str(count),
+            ]
+        )
+    with pytest.raises(ValueError, match="正整數"):
+        run_module.run_round2(
+            _synthetic_config(tmp_path), smoke_fovs_per_condition=count
+        )
+
+    begin.assert_not_called()
+
+
 def test_round2_bundle_validation_failure_restores_qc_before_quarantine(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -448,6 +511,143 @@ def test_round2_bundle_validation_failure_restores_qc_before_quarantine(
     assert (failed[0] / "feature_valid_counts.csv").is_file()
     assert (failed[0] / "extraction_qc.csv").is_file()
     assert (failed[0] / "feature_qc.csv").is_file()
+
+
+def test_round2_quarantine_failure_preserves_original_pipeline_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Python 3.10 下 quarantine secondary failure 不得取代原始錯誤。"""
+    calls: list[str] = []
+    _patch_round2_stages(monkeypatch, tmp_path, calls)
+    original = ValueError("B8_P7_C08_F03 original preflight failure")
+    monkeypatch.setattr(
+        run_module,
+        "require_paper93_preflight",
+        Mock(side_effect=original),
+    )
+    monkeypatch.setattr(
+        run_module,
+        "quarantine_round2_generation",
+        Mock(side_effect=OSError("secondary quarantine failure")),
+    )
+
+    with pytest.raises(ValueError) as caught:
+        run_module.run_round2(_synthetic_config(tmp_path))
+
+    assert caught.value is original
+    staging = next(
+        (_formal_output(tmp_path).resolve() / "_generations").glob("staging-*")
+    )
+    log = (staging / "run.log").read_text(encoding="utf-8")
+    assert "original preflight failure" in log
+    assert "secondary quarantine failure" in log
+
+
+def test_round2_restore_failure_still_appends_original_and_attempts_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """QC restore secondary failure 不得阻止 traceback append 或 closed-log move。"""
+    calls: list[str] = []
+    _patch_round2_stages(monkeypatch, tmp_path, calls)
+    original = ValueError("B8_P7_C08_F03 original pipeline failure")
+    monkeypatch.setattr(
+        run_module,
+        "require_paper93_preflight",
+        Mock(side_effect=original),
+    )
+    monkeypatch.setattr(
+        run_module,
+        "_restore_failure_qc",
+        Mock(side_effect=OSError("secondary restore failure")),
+    )
+    moved: list[Path] = []
+
+    def quarantine(generation: object) -> Path:
+        log = generation.staging_dir / "run.log"
+        probe = generation.staging_dir / "run-log-closed.probe"
+        os.replace(log, probe)
+        os.replace(probe, log)
+        moved.append(log)
+        return generation.staging_dir
+
+    monkeypatch.setattr(run_module, "quarantine_round2_generation", quarantine)
+
+    with pytest.raises(ValueError) as caught:
+        run_module.run_round2(_synthetic_config(tmp_path))
+
+    assert caught.value is original
+    assert len(moved) == 1
+    log = moved[0].read_text(encoding="utf-8")
+    assert "original pipeline failure" in log
+    assert "secondary restore failure" in log
+
+
+def test_restore_failure_qc_attempts_remaining_tables_after_one_write_fails(
+    tmp_path: Path,
+) -> None:
+    """單一 QC 寫入失敗後仍須 best-effort 還原其他可用 tables。"""
+
+    class FailingCsvFrame(pd.DataFrame):
+        """模擬單一 failure-evidence CSV 無法寫入。"""
+
+        def to_csv(self, *args: object, **kwargs: object) -> None:
+            raise OSError("synthetic mask QC restore failure")
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    bundle = SimpleNamespace(
+        valid_counts=pd.DataFrame({"image_key": ["image-001"]}),
+        extraction_qc=pd.DataFrame({"image_key": ["image-001"]}),
+        feature_qc=pd.DataFrame({"feature": ["f1"]}),
+    )
+
+    with pytest.raises(OSError, match="mask QC restore failure"):
+        run_module._restore_failure_qc(
+            staging,
+            FailingCsvFrame({"image_key": ["image-001"]}),
+            bundle,
+        )
+
+    assert (staging / "feature_valid_counts.csv").is_file()
+    assert (staging / "extraction_qc.csv").is_file()
+    assert (staging / "feature_qc.csv").is_file()
+
+
+def test_round2_append_failure_still_attempts_quarantine_and_reraises_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Traceback append secondary failure 不得阻止 quarantine 或取代原始錯誤。"""
+    calls: list[str] = []
+    _patch_round2_stages(monkeypatch, tmp_path, calls)
+    original = ValueError("original benchmark failure")
+    monkeypatch.setattr(
+        run_module,
+        "require_paper93_preflight",
+        Mock(side_effect=original),
+    )
+    monkeypatch.setattr(
+        run_module,
+        "_append_failure_evidence",
+        Mock(side_effect=OSError("secondary append failure")),
+    )
+    quarantined: list[Path] = []
+
+    def quarantine(generation: object) -> Path:
+        quarantined.append(generation.staging_dir)
+        return generation.staging_dir
+
+    monkeypatch.setattr(run_module, "quarantine_round2_generation", quarantine)
+
+    with pytest.raises(ValueError) as caught:
+        run_module.run_round2(_synthetic_config(tmp_path))
+
+    assert caught.value is original
+    assert len(quarantined) == 1
+    log = (quarantined[0] / "run.log").read_text(encoding="utf-8")
+    assert "secondary append failure" in log
 
 
 @pytest.mark.parametrize(("published", "expected"), [(True, 0), (False, 1)])
