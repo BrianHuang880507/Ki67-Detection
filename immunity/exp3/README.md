@@ -27,6 +27,30 @@ Smoke run 會在每個 `group_id × condition_index` 依 FOV 排序取第一張�
 8 conditions = 72 張。所有 smoke artifacts 都隔離在
 `immunity/outputs/exp3/smoke/`，不得作為 full-run ranking 或 winner。
 
+## Round 2：Paper-style 93 特徵
+
+Round 2 只從 phase 影像建立 93 個 paper-style approximation predictors，並只新訓練
+`extra_trees` 與 `random_forest`。Round 1 的 33-feature 結果與 Dummy evidence 僅供唯讀引用，
+不會重跑七個模型。
+
+### 正式執行
+
+```powershell
+conda run --no-capture-output -n ki67dtc python -m immunity.exp3.run_round2_paper93 --config immunity/configs/exp3_round2_paper93.yaml
+```
+
+### 流程 smoke
+
+```powershell
+conda run --no-capture-output -n ki67dtc python -m immunity.exp3.run_round2_paper93 --config immunity/configs/exp3_round2_paper93.yaml --smoke-fovs-per-condition 1
+```
+
+正式結果只會寫入 `immunity/outputs/exp3/round2_paper93/`；smoke 只會寫入其
+`smoke/` 子目錄。Smoke 僅驗證流程，不可用於 33 vs 93 的科學比較或 recommendation。
+
+IDO 只作亮度 target；結果不是免疫力 label，也不建立 donor label。Mask 或 frozen evidence
+不一致時，流程會停止並保留具名 QC；不會自動重新 segmentation、重寫 cache 或增加 exclusion。
+
 ## 特徵與模型範圍
 
 - Primary `basic_median` 固定為 33 個 PC-only morphology medians。
