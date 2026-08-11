@@ -57,6 +57,12 @@ IDO 只作亮度 target；結果不是免疫力 label，也不建立 donor label
 不一致時，流程同樣停止，原因寫入 quarantined `run.log`，但此階段不保證存在 QC CSV。兩種情況
 都不會自動重新 segmentation、重寫 cache 或增加 exclusion。
 
+Round 2 沿用的 23,976 rows 是 frozen nucleus–cell pair observations，不是 23,976 個 unique
+cells。同一 FOV 內若多個 nuclei 對應相同 cell label，whole-cell descriptors 會依 nucleus 數量
+重複加權；每列 pair-specific cytoplasm 只排除該列 current nucleus，因此同一 cell 的其他 nuclei
+仍保留在 cytoplasm。此 patch 不去重、不重新配對，也不重切 segmentation；33 vs 93 的解讀只限於
+相同 frozen pair roster。
+
 ## 特徵與模型範圍
 
 - Primary `basic_median` 固定為 33 個 PC-only morphology medians。

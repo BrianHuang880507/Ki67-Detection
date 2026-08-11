@@ -355,7 +355,12 @@ def build_round2_experiment_record(context: Mapping[str, Any]) -> str:
             plain = "是否優於 33 predictors 只依 eligibility 與 strict tie rule 判定。"
 
     images = _display(context.get("analyzed_images", 693))
-    cells = _display(context.get("valid_cells", 23976))
+    pairs = _display_count(
+        context.get(
+            "valid_pair_observations",
+            context.get("valid_cells", 23976),
+        )
+    )
     exclusions = _display(context.get("exclusions", 26))
     seed = _display(context.get("seed", 20260804))
     runtime = _display(context.get("runtime_seconds", "未提供"))
@@ -363,6 +368,7 @@ def build_round2_experiment_record(context: Mapping[str, Any]) -> str:
     eligibility = _markdown_context(context.get("eligibility"))
     feature_qc = _markdown_context(context.get("feature_qc"))
     extraction_failures = _display(context.get("extraction_failures", "未提供"))
+    pair_mapping = _markdown_context(context.get("pair_mapping_summary"))
     importance_completeness = _importance_completeness_text(
         context.get("feature_importance_completeness")
     )
@@ -384,7 +390,17 @@ def build_round2_experiment_record(context: Mapping[str, Any]) -> str:
             "phase-only paper-style approximation。Target、實驗條件、路徑與批次資訊均不進入 predictor matrix。"
         ),
         "## Data lock",
-        f"固定資料：{images} FOV、{cells} frozen valid cells、{exclusions} exclusions；seed={seed}。",
+        (
+            f"固定資料：{images} FOV、{pairs} frozen nucleus–cell pair observations、"
+            f"{exclusions} exclusions；seed={seed}。\n\nPair mapping summary：{pair_mapping}"
+        ),
+        "## Pair aggregation limitation",
+        (
+            "每列 aggregation unit 是 frozen nucleus–cell pair。重複 cell label 會依 "
+            "nucleus 數量加權 whole-cell descriptors；pair-specific cytoplasm 僅排除該列 "
+            "current nucleus，因此同一 cell 的其他 nuclei 仍保留在 pair-specific cytoplasm。"
+        ),
+        "33 vs 93 的解讀只限於相同 frozen pair roster，不代表 unique cells 的獨立樣本比較。",
         "## 33 vs 93 比較",
         comparison,
         "## Eligibility gates 與 tie decision",
@@ -1111,6 +1127,17 @@ def _display(value: Any) -> str:
             return "NA"
         return f"{value:.6g}"
     return str(value)
+
+
+def _display_count(value: Any) -> str:
+    """以千分位顯示整數 observation count，其他值沿用 scalar formatter。"""
+    if isinstance(value, bool):
+        return str(value)
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return _display(value)
+    return f"{numeric:,}"
 
 
 __all__ = [

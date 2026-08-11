@@ -340,6 +340,7 @@ def _formal_record_context() -> dict[str, Any]:
         "paper93_better_than_basic": False,
         "analyzed_images": 693,
         "valid_cells": 23976,
+        "valid_pair_observations": 23976,
         "exclusions": 26,
         "seed": 20260804,
         "runtime_seconds": 12.5,
@@ -359,6 +360,19 @@ def _formal_record_context() -> dict[str, Any]:
         ),
         "feature_qc": {"constant_features": 0, "failed_features": 0},
         "extraction_failures": 0,
+        "pair_mapping_summary": {
+            "aggregation_unit": "frozen_nucleus_cell_pair",
+            "image_count": 693,
+            "pair_observation_count": 23976,
+            "unique_cell_count": 23012,
+            "unique_nucleus_count": 23976,
+            "multi_nucleus_cell_count": 938,
+            "multi_nucleus_pair_count": 1902,
+            "max_nuclei_per_cell": 3,
+            "retained_outside_pair_count": 211,
+            "max_retained_outside_fraction": 0.05,
+            "max_nucleus_outside_fraction": 0.05,
+        },
     }
 
 
@@ -1225,6 +1239,11 @@ def test_round2_record_states_target_scope_and_approximation() -> None:
     assert "不是免疫力" in text
     assert "phase-only paper-style approximation" in text
     assert "不改寫 Round 1 winner" in text
+    assert "23,976 frozen nucleus–cell pair observations" in text
+    assert "重複 cell label" in text
+    assert "依 nucleus 數量加權 whole-cell descriptors" in text
+    assert "其他 nuclei 仍保留在 pair-specific cytoplasm" in text
+    assert "相同 frozen pair roster" in text
     predictor_section = text.split("## Predictor 範圍", maxsplit=1)[1].split("##", maxsplit=1)[0]
     assert "donor" not in predictor_section.lower()
 

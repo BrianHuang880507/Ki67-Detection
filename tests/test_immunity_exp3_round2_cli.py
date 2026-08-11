@@ -97,7 +97,19 @@ def _patch_round2_stages(
     )
     bundle = SimpleNamespace(
         images=images,
-        paper_cells=pd.DataFrame({"image_key": images["image_key"]}),
+        paper_cells=pd.DataFrame(
+            {
+                "image_key": [
+                    "B1_C1_F02",
+                    "B1_C1_F02",
+                    "B1_C1_F01",
+                    "B1_C1_F03",
+                ],
+                "cell_label": [1, 1, 1, 1],
+                "nucleus_label": [1, 2, 1, 1],
+                "nucleus_outside_fraction": [0.0, 0.05, 0.0, 0.0],
+            }
+        ),
         valid_counts=pd.DataFrame({"image_key": images["image_key"]}),
         extraction_qc=pd.DataFrame(
             {
@@ -107,6 +119,7 @@ def _patch_round2_stages(
         ),
         feature_qc=pd.DataFrame({"feature": ["f1"], "status": ["passed"]}),
         predictor_columns=("f1",),
+        max_nucleus_outside_fraction=0.05,
     )
     result = SimpleNamespace(
         fold_metrics=pd.DataFrame({"model": ["extra_trees"]}),
@@ -424,6 +437,37 @@ def test_round2_smoke_emits_parseable_empty_diagnostic_tables(
         payload = tables[name].to_csv(index=False, lineterminator="\n")
         assert payload.strip(), name
         pd.read_csv(StringIO(payload))
+
+
+def test_round2_metadata_and_record_context_include_computed_pair_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner 必須由 pair rows 計算 metadata 與 record 共用的 mapping summary。"""
+    calls: list[str] = []
+    captures = _patch_round2_stages(monkeypatch, tmp_path, calls)
+
+    run_module.run_round2(_synthetic_config(tmp_path))
+
+    expected = {
+        "aggregation_unit": "frozen_nucleus_cell_pair",
+        "image_count": 3,
+        "pair_observation_count": 4,
+        "unique_cell_count": 3,
+        "unique_nucleus_count": 4,
+        "multi_nucleus_cell_count": 1,
+        "multi_nucleus_pair_count": 2,
+        "max_nuclei_per_cell": 2,
+        "retained_outside_pair_count": 1,
+        "max_retained_outside_fraction": 0.05,
+        "max_nucleus_outside_fraction": 0.05,
+    }
+    metadata = captures["payloads"]["run_metadata.json"]
+    assert metadata["aggregation_unit"] == "frozen_nucleus_cell_pair"
+    assert metadata["valid_pair_observations"] == 4
+    assert metadata["pair_mapping_summary"] == expected
+    assert captures["context"]["valid_pair_observations"] == 4
+    assert captures["context"]["pair_mapping_summary"] == expected
 
 
 def test_round2_smoke_rejects_full_roster_before_downstream_stages(

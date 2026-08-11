@@ -14,6 +14,7 @@ from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any, TextIO
 
+import numpy as np
 import pandas as pd
 import yaml
 
@@ -616,12 +617,16 @@ def _round2_json_payloads(
 ) -> dict[str, Mapping[str, Any]]:
     """建立 predictor、來源 provenance 與執行模式 JSON artifacts。"""
     expected = _required_mapping(_required_mapping(config, "round1"), "expected")
+    pair_summary = _pair_mapping_summary(bundle)
     metadata = {
         "mode": "smoke" if smoke else "formal",
         "smoke": smoke,
         "seed": int(_required_mapping(effective_config, "benchmark")["seed"]),
         "analyzed_images": len(bundle.images),
         "valid_cells": len(bundle.paper_cells),
+        "aggregation_unit": pair_summary["aggregation_unit"],
+        "valid_pair_observations": pair_summary["pair_observation_count"],
+        "pair_mapping_summary": pair_summary,
         "exclusions": int(expected.get("exclusions", 26)),
         "diagnostic_splits": smoke,
         "non_formal": smoke,
@@ -660,6 +665,7 @@ def _round2_record_context(
 ) -> dict[str, Any]:
     """建立正式結論或 smoke 無科學結論的繁體中文 record context。"""
     expected = _required_mapping(_required_mapping(config, "round1"), "expected")
+    pair_summary = _pair_mapping_summary(bundle)
     failed = bundle.extraction_qc[
         ~bundle.extraction_qc["status"].astype(str).eq("passed")
     ]
@@ -673,6 +679,8 @@ def _round2_record_context(
         ),
         "analyzed_images": len(bundle.images),
         "valid_cells": len(bundle.paper_cells),
+        "valid_pair_observations": pair_summary["pair_observation_count"],
+        "pair_mapping_summary": pair_summary,
         "exclusions": int(expected.get("exclusions", 26)),
         "seed": int(_required_mapping(config, "benchmark")["seed"]),
         "runtime_seconds": runtime_seconds,
@@ -680,6 +688,76 @@ def _round2_record_context(
         "eligibility": "smoke: no ranking/recommendation" if smoke else ranking,
         "feature_qc": bundle.feature_qc,
         "extraction_failures": len(failed),
+    }
+
+
+def _pair_mapping_summary(bundle: Any) -> dict[str, Any]:
+    """由實際 pair rows 計算 metadata 與 record 共用的 mapping summary。"""
+    cells = getattr(bundle, "paper_cells", None)
+    images = getattr(bundle, "images", None)
+    if not isinstance(cells, pd.DataFrame) or not isinstance(images, pd.DataFrame):
+        raise TypeError("Paper93 bundle 必須包含 images 與 paper_cells DataFrame")
+    required = {
+        "image_key",
+        "cell_label",
+        "nucleus_label",
+        "nucleus_outside_fraction",
+    }
+    missing = sorted(required - set(cells.columns))
+    if missing:
+        raise ValueError(f"paper_cells 缺少 pair mapping 欄位：{missing}")
+    if "image_key" not in images:
+        raise ValueError("Paper93 images 缺少 image_key")
+    working = cells.loc[:, sorted(required)].copy()
+    working["image_key"] = working["image_key"].astype(str)
+    image_keys = images["image_key"].astype(str)
+    if image_keys.duplicated().any() or set(working["image_key"]) != set(image_keys):
+        raise ValueError("Paper93 pair mapping image_key identity 不一致")
+    for column in ("cell_label", "nucleus_label"):
+        numeric = pd.to_numeric(working[column], errors="coerce").to_numpy(dtype=float)
+        if (
+            not np.isfinite(numeric).all()
+            or not np.equal(numeric, np.floor(numeric)).all()
+            or (numeric < 1).any()
+        ):
+            raise ValueError(f"Paper93 pair mapping {column} 必須是正整數")
+        working[column] = numeric.astype(int)
+    if working.duplicated(["image_key", "cell_label", "nucleus_label"]).any():
+        raise ValueError("Paper93 pair mapping full triple 不可重複")
+    if working.duplicated(["image_key", "nucleus_label"]).any():
+        raise ValueError("Paper93 pair mapping nucleus identity 不可重複")
+
+    threshold = float(getattr(bundle, "max_nucleus_outside_fraction", np.nan))
+    outside = pd.to_numeric(
+        working["nucleus_outside_fraction"],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+    if (
+        not np.isfinite(threshold)
+        or not 0.0 <= threshold <= 1.0
+        or not np.isfinite(outside).all()
+        or ((outside < 0.0) | (outside > threshold)).any()
+    ):
+        raise ValueError("Paper93 pair mapping outside fraction 不合法")
+    cell_counts = working.groupby(
+        ["image_key", "cell_label"],
+        sort=False,
+    ).size()
+    multi = cell_counts[cell_counts > 1]
+    return {
+        "aggregation_unit": "frozen_nucleus_cell_pair",
+        "image_count": int(image_keys.nunique()),
+        "pair_observation_count": int(len(working)),
+        "unique_cell_count": int(len(cell_counts)),
+        "unique_nucleus_count": int(
+            len(working.drop_duplicates(["image_key", "nucleus_label"]))
+        ),
+        "multi_nucleus_cell_count": int(len(multi)),
+        "multi_nucleus_pair_count": int(multi.sum()),
+        "max_nuclei_per_cell": int(cell_counts.max()),
+        "retained_outside_pair_count": int(np.count_nonzero(outside > 0.0)),
+        "max_retained_outside_fraction": float(np.max(outside, initial=0.0)),
+        "max_nucleus_outside_fraction": threshold,
     }
 
 
