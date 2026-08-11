@@ -169,13 +169,17 @@ def build_round2_comparison(
     failures = _combine_candidate_frames(
         baseline_failures, paper93_result.failures
     )
-    actual_configurations = set(
-        fold_metrics.get("configuration_id", pd.Series(dtype=str)).astype(str)
-    )
-    if actual_configurations != set(_CONFIGURATION_CONTRACT):
-        raise ValueError(
-            "Round 2 comparison 必須精確包含四組 candidate configurations："
-            f"{sorted(actual_configurations)}"
+    for table_name, frame in (
+        ("fold_metrics", fold_metrics),
+        ("predictions", predictions),
+        ("hyperparameters", hyperparameters),
+        ("feature_importance", feature_importance),
+        ("failures", failures),
+    ):
+        _validate_candidate_table_identity(
+            table_name,
+            frame,
+            require_all_configurations=table_name == "fold_metrics",
         )
 
     dummy_metrics = _round1_dummy_rows(evidence.selected_metrics)
@@ -575,6 +579,55 @@ def _combine_candidate_frames(
     )
 
 
+def _validate_candidate_table_identity(
+    table: str,
+    frame: pd.DataFrame,
+    *,
+    require_all_configurations: bool,
+) -> None:
+    """逐列驗證 candidate table 的 configuration identity mapping。
+
+    Args:
+        table: 供錯誤訊息識別的 comparison table 名稱。
+        frame: 已組合的 Round 1/Round 2 candidate rows。
+        require_all_configurations: 是否要求四組 configuration 都至少出現一列。
+
+    Raises:
+        ValueError: Schema 缺失、出現 rogue configuration，或 model/feature
+            set/source round 與 configuration contract 不一致時拋出。
+    """
+    identity_columns = (
+        "configuration_id",
+        "model",
+        "feature_set",
+        "source_round",
+    )
+    _require_columns(frame, identity_columns, table)
+    invalid: list[dict[str, str]] = []
+    for row in frame.loc[:, identity_columns].itertuples(index=False):
+        configuration_id = str(row.configuration_id)
+        expected = _CONFIGURATION_CONTRACT.get(configuration_id)
+        actual = (str(row.model), str(row.feature_set), str(row.source_round))
+        if expected is None or actual != expected:
+            invalid.append(
+                {
+                    "configuration_id": configuration_id,
+                    "model": actual[0],
+                    "feature_set": actual[1],
+                    "source_round": actual[2],
+                }
+            )
+    actual_configurations = set(frame["configuration_id"].astype(str))
+    if invalid or (
+        require_all_configurations
+        and actual_configurations != set(_CONFIGURATION_CONTRACT)
+    ):
+        raise ValueError(
+            f"{table} candidate identity 不符合精確四設定 contract："
+            f"configurations={sorted(actual_configurations)}, invalid={invalid[:3]}"
+        )
+
+
 def _round1_simplicity_ranks(model_ranking: pd.DataFrame) -> dict[str, int]:
     """讀取既有 Round 1 simplicity rank，缺欄時使用固定 published order。"""
     ranks = dict(_DEFAULT_SIMPLICITY_RANKS)
@@ -821,30 +874,44 @@ def _completeness_issues(
 def _feature_importance_issues(
     comparison: Round2Comparison, configuration_id: str
 ) -> list[str]:
-    """列出成功 folds 缺少 diagnostic importance 的 identities。"""
+    """逐成功 fold 比對 authoritative feature-importance roster。"""
     successful = comparison.fold_metrics[
         comparison.fold_metrics["configuration_id"].eq(configuration_id)
         & comparison.fold_metrics["status"].eq("ok")
     ]
-    if {
-        "configuration_id",
-        "split_id",
-    }.issubset(comparison.feature_importance.columns):
-        importance_ids = set(
-            comparison.feature_importance.loc[
-                comparison.feature_importance["configuration_id"].eq(
-                    configuration_id
-                ),
-                "split_id",
-            ].astype(str)
-        )
-    else:
-        importance_ids = set()
-    return [
-        f"missing_feature_importance:{split_id}"
-        for split_id in successful["split_id"].astype(str)
-        if split_id not in importance_ids
-    ]
+    _require_columns(
+        comparison.feature_importance,
+        ("configuration_id", "split_id", "feature"),
+        "feature_importance",
+    )
+    rows = comparison.feature_importance[
+        comparison.feature_importance["configuration_id"].eq(configuration_id)
+    ].copy()
+    feature_set = _CONFIGURATION_CONTRACT[configuration_id][1]
+    expected_features = (
+        PRIMARY_FOV_FEATURES
+        if feature_set == _ROUND1_FEATURE_SET
+        else PAPER_STYLE_FOV_FEATURES
+    )
+    expected_set = set(expected_features)
+    successful_ids = set(successful["split_id"].astype(str))
+    issues: list[str] = []
+    for split_id in successful["split_id"].astype(str):
+        split_rows = rows[rows["split_id"].astype(str).eq(split_id)]
+        counts = split_rows["feature"].astype(str).value_counts()
+        for feature in expected_features:
+            count = int(counts.get(feature, 0))
+            if count == 0:
+                issues.append(f"missing_feature_importance:{split_id}:{feature}")
+            elif count > 1:
+                issues.append(
+                    f"duplicate_feature_importance:{split_id}:{feature}:count={count}"
+                )
+        for feature in sorted(set(counts.index) - expected_set):
+            issues.append(f"unexpected_feature_importance:{split_id}:{feature}")
+    for split_id in sorted(set(rows["split_id"].astype(str)) - successful_ids):
+        issues.append(f"feature_importance_without_successful_fold:{split_id}")
+    return issues
 
 
 def _median_fold_value(

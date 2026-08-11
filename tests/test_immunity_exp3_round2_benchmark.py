@@ -465,22 +465,28 @@ def _comparison_rows(
                     "configuration_id": configuration_id,
                 }
             )
-            importance.append(
-                {
-                    "validation": validation,
-                    "fold": fold,
-                    "split_id": split_id,
-                    "model": model,
-                    "role": "candidate",
-                    "feature_set": feature_set,
-                    "feature": "diagnostic_feature",
-                    "importance_type": "outer_test_permutation_diagnostic",
-                    "importance": 0.1,
-                    "importance_sd": 0.01,
-                    "source_round": source_round,
-                    "configuration_id": configuration_id,
-                }
+            features = (
+                PRIMARY_FOV_FEATURES
+                if feature_set == "basic_median"
+                else PAPER_STYLE_FOV_FEATURES
             )
+            for feature in features:
+                importance.append(
+                    {
+                        "validation": validation,
+                        "fold": fold,
+                        "split_id": split_id,
+                        "model": model,
+                        "role": "candidate",
+                        "feature_set": feature_set,
+                        "feature": feature,
+                        "importance_type": "outer_test_permutation_diagnostic",
+                        "importance": 0.1,
+                        "importance_sd": 0.01,
+                        "source_round": source_round,
+                        "configuration_id": configuration_id,
+                    }
+                )
             for image_index, observed in enumerate((0.0, 10.0)):
                 predictions.append(
                     {
@@ -628,6 +634,26 @@ def _round2_result_fixture(*, failed: bool = False) -> BenchmarkResult:
     )
 
 
+def _round2_result_with_identity_drift(
+    table: str,
+    drift: str,
+) -> BenchmarkResult:
+    """在單一 Task 4 table 追加 rogue 或不一致 identity row。"""
+    result = _round2_result_fixture(failed=table == "failures")
+    frame = getattr(result, table).copy(deep=True)
+    changed = frame.iloc[[0]].copy(deep=True)
+    if drift == "rogue_configuration":
+        changed["configuration_id"] = "rogue_model__paper_style_median"
+    elif drift == "model":
+        changed["model"] = "random_forest"
+    elif drift == "feature_set":
+        changed["feature_set"] = "basic_median"
+    else:
+        changed["source_round"] = "round1"
+    changed = pd.concat([frame, changed], ignore_index=True)
+    return replace(result, **{table: changed})
+
+
 def _predictor_sets() -> dict[str, Sequence[str]]:
     """回傳 33/93 authoritative predictor whitelists。"""
     return {
@@ -680,6 +706,34 @@ def test_round2_comparison_contains_exactly_four_candidate_configurations() -> N
     assert len(comparison.hyperparameters) == 92
     assert len(comparison.dummy_metrics) == 23
     pd.testing.assert_frame_equal(evidence.selected_metrics, before)
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        "fold_metrics",
+        "predictions",
+        "hyperparameters",
+        "feature_importance",
+        "failures",
+    ],
+)
+@pytest.mark.parametrize(
+    "drift",
+    ["rogue_configuration", "model", "feature_set", "source_round"],
+)
+def test_round2_comparison_rejects_rogue_or_mismatched_identity_in_every_table(
+    table: str,
+    drift: str,
+) -> None:
+    result = _round2_result_with_identity_drift(table, drift)
+
+    with pytest.raises(ValueError, match=rf"{table}.*identity"):
+        build_round2_comparison(
+            _round1_evidence_fixture(),
+            result,
+            _expected_split_ids(),
+        )
 
 
 def test_round2_eligibility_uses_frozen_dummy_fold_median_mae() -> None:
@@ -776,6 +830,57 @@ def test_round2_missing_feature_importance_is_recorded_without_changing_eligibil
     assert "leave_one_passage_out:2" in ranking.loc[
         "random_forest__paper_style_median", "feature_importance_issues_json"
     ]
+
+
+def test_round2_complete_feature_importance_roster_has_no_diagnostic_issues() -> None:
+    ranking = rank_round2_configurations(
+        _comparison_fixture(), _predictor_sets()
+    )
+
+    assert ranking["feature_importance_issues_json"].tolist() == ["[]"] * 4
+
+
+@pytest.mark.parametrize(
+    ("drift", "expected_reason"),
+    [
+        ("missing", "missing_feature_importance"),
+        ("duplicate", "duplicate_feature_importance"),
+        ("rogue", "unexpected_feature_importance"),
+    ],
+)
+def test_round2_feature_importance_qc_requires_exact_unique_authoritative_roster(
+    drift: str,
+    expected_reason: str,
+) -> None:
+    comparison = _comparison_fixture()
+    importance = comparison.feature_importance.copy(deep=True)
+    configuration_id = "extra_trees__basic_median"
+    split_id = "leave_one_b_out:1"
+    selected = importance["configuration_id"].eq(
+        configuration_id
+    ) & importance["split_id"].eq(split_id)
+    first_feature = PRIMARY_FOV_FEATURES[0]
+    target = selected & importance["feature"].eq(first_feature)
+    if drift == "missing":
+        importance = importance.loc[~target].copy()
+    elif drift == "duplicate":
+        importance = pd.concat(
+            [importance, importance.loc[target].iloc[[0]].copy()],
+            ignore_index=True,
+        )
+    else:
+        rogue = importance.loc[target].iloc[[0]].copy()
+        rogue["feature"] = "IDO_score"
+        importance = pd.concat([importance, rogue], ignore_index=True)
+
+    ranking = rank_round2_configurations(
+        replace(comparison, feature_importance=importance), _predictor_sets()
+    ).set_index("configuration_id")
+
+    assert ranking.loc[configuration_id, "eligible"]
+    issue = ranking.loc[configuration_id, "feature_importance_issues_json"]
+    assert expected_reason in issue
+    assert split_id in issue
 
 
 def test_round2_prediction_sd_gate_requires_five_percent_in_every_family() -> None:
