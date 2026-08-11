@@ -222,9 +222,16 @@ def write_round2_bundle(
         payloads[name] = frame.to_csv(index=False, lineterminator="\n").encode("utf-8")
     for name in ROUND2_JSON_NAMES:
         payloads[name] = _strict_json_bytes(json_payloads[name], name)
-    payloads["EXPERIMENT_RECORD.md"] = build_round2_experiment_record(record_context).encode(
-        "utf-8"
+    record_data = dict(record_context)
+    record_data["feature_importance_completeness"] = (
+        _feature_importance_completeness(
+            tables["fold_metrics.csv"],
+            tables["feature_importance.csv"],
+        )
     )
+    payloads["EXPERIMENT_RECORD.md"] = build_round2_experiment_record(
+        record_data
+    ).encode("utf-8")
 
     destinations = [staging / name for name in (*_HASHED_ARTIFACT_NAMES, "artifact_hashes.json")]
     for destination in destinations:
@@ -284,10 +291,15 @@ def validate_round2_bundle(directory: Path, *, smoke: bool) -> None:
     if (output.name == "smoke") != smoke:
         raise ValueError("Bundle mode 必須與 formal root 或 smoke child boundary 一致")
     entries = {path.name for path in bundle.iterdir()}
-    if entries != set(_BUNDLE_FILE_NAMES):
-        missing = sorted(set(_BUNDLE_FILE_NAMES) - entries)
-        extra = sorted(entries - set(_BUNDLE_FILE_NAMES))
+    expected_entries = set(_BUNDLE_FILE_NAMES)
+    if bundle == output:
+        expected_entries.add("_generations")
+    if entries != expected_entries:
+        missing = sorted(expected_entries - entries)
+        extra = sorted(entries - expected_entries)
         raise ValueError(f"Round 2 bundle artifact keys 不符；missing={missing}, extra={extra}")
+    if bundle == output:
+        _assert_safe_directory(output, output / "_generations")
     for name in _BUNDLE_FILE_NAMES:
         _assert_regular_file(output, bundle / name)
     _validate_hash_manifest(bundle)
@@ -351,6 +363,9 @@ def build_round2_experiment_record(context: Mapping[str, Any]) -> str:
     eligibility = _markdown_context(context.get("eligibility"))
     feature_qc = _markdown_context(context.get("feature_qc"))
     extraction_failures = _display(context.get("extraction_failures", "未提供"))
+    importance_completeness = _importance_completeness_text(
+        context.get("feature_importance_completeness")
+    )
 
     sections = [
         opening,
@@ -379,7 +394,7 @@ def build_round2_experiment_record(context: Mapping[str, Any]) -> str:
         "## Provenance、hashes、runtime 與限制",
         (
             f"Runtime seconds：{runtime}。完整 SHA-256 與 byte length 見 artifact_hashes.json；"
-            "Round 1 artifacts 為唯讀。Feature importance 是 diagnostic，缺少時不替代 publication gates。"
+            f"Round 1 artifacts 為唯讀。{importance_completeness}"
         ),
     ]
     return "\n\n".join(sections).rstrip() + "\n"
@@ -552,10 +567,18 @@ def _write_sibling_temp(destination: Path, payload: bytes) -> Path:
     """以 exclusive create 寫入 destination 同層 temp。"""
     #Windows 未啟用 long-path policy 時仍有 MAX_PATH；staging 已唯一，可安全重用短名稱。
     temp = destination.with_name(".tmp")
-    with temp.open("xb") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
+    created = False
+    try:
+        handle = temp.open("xb")
+        created = True
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        if created:
+            temp.unlink(missing_ok=True)
+        raise
     return temp
 
 
@@ -707,6 +730,12 @@ def _validate_formal_tables(
     if not failed and (len(predictions) != 11088 or len(hyperparameters) != 92):
         raise ValueError("Failure-free formal bundle 必須有 11,088 OOF 與 92 hyperparameters")
 
+    _validate_feature_importance(
+        metrics,
+        tables["feature_importance.csv"],
+        failed,
+    )
+
     _validate_dummy_tables(tables, split_membership)
     _validate_formal_ranking(tables, failed)
 
@@ -782,21 +811,29 @@ def _validate_oof_coverage(
     if predictions.duplicated(["configuration_id", "validation", "image_key"]).any():
         raise ValueError("OOF predictions 含 duplicate configuration/family/image identity")
     prediction_ids = _identity_pairs(predictions)
-    if prediction_ids & failed:
-        raise ValueError("failed fold 不可含 OOF predictions")
+    metric_ids = _identity_pairs(metrics)
+    successful_ids = metric_ids - failed
+    if prediction_ids != successful_ids:
+        missing = sorted(successful_ids - prediction_ids)
+        extra = sorted(prediction_ids - successful_ids)
+        raise ValueError(
+            "OOF identity set 必須精確等於 successful metric identities；"
+            f"missing={missing}, extra={extra}"
+        )
     for row in metrics.itertuples(index=False):
         identity = (str(row.configuration_id), str(row.split_id))
         selected = predictions[
             predictions["configuration_id"].astype(str).eq(identity[0])
             & predictions["split_id"].astype(str).eq(identity[1])
         ]
-        expected_keys = set() if identity in failed else expected_membership[identity[1]]
-        actual_keys = set(selected["image_key"].astype(str))
-        expected_count = 0 if identity in failed else int(row.n_test)
-        if expected_count != len(expected_keys):
+        frozen_keys = expected_membership[identity[1]]
+        if int(row.n_test) != len(frozen_keys):
             raise ValueError(
                 f"fold n_test 與 frozen test membership 不一致：{identity}"
             )
+        expected_keys = set() if identity in failed else frozen_keys
+        actual_keys = set(selected["image_key"].astype(str))
+        expected_count = len(expected_keys)
         if len(selected) != expected_count or actual_keys != expected_keys:
             raise ValueError(
                 f"OOF frozen test membership 不符：{identity}; "
@@ -854,6 +891,111 @@ def _validate_dummy_tables(
             or set(selected["image_key"].astype(str)) != expected_keys
         ):
             raise ValueError("Dummy OOF frozen test membership 與 fold 不一致")
+
+
+def _validate_feature_importance(
+    metrics: pd.DataFrame,
+    importance: pd.DataFrame,
+    failed: set[tuple[str, str]],
+) -> None:
+    """驗證 importance identity；缺漏只保留為 diagnostic warning。"""
+    _require_columns(
+        importance,
+        _IDENTITY_COLUMNS + ("feature",),
+        "feature_importance",
+    )
+    if len(importance) > 5796:
+        raise ValueError("feature_importance 總列數不可超過 5796")
+    if importance.empty:
+        return
+    _validate_candidate_identities(importance, "feature_importance")
+    successful_ids = _identity_pairs(metrics) - failed
+    importance_ids = _identity_pairs(importance)
+    unexpected_ids = importance_ids - successful_ids
+    if unexpected_ids:
+        raise ValueError(
+            "feature_importance 只能屬於 successful fold identities："
+            f"{sorted(unexpected_ids)}"
+        )
+    if importance.duplicated(["configuration_id", "split_id", "feature"]).any():
+        raise ValueError("feature_importance 每個 successful fold/feature 必須唯一")
+    feature_rosters = {
+        "basic_median": set(PRIMARY_FOV_FEATURES),
+        "paper_style_median": set(PAPER_STYLE_FOV_FEATURES),
+    }
+    invalid = importance[
+        ~importance.apply(
+            lambda row: str(row["feature"])
+            in feature_rosters[str(row["feature_set"])],
+            axis=1,
+        )
+    ]
+    if not invalid.empty:
+        raise ValueError(
+            "feature_importance feature 不在 configuration authoritative roster："
+            f"{invalid.iloc[0]['feature']}"
+        )
+
+
+def _feature_importance_completeness(
+    metrics: pd.DataFrame,
+    importance: pd.DataFrame,
+) -> dict[str, int]:
+    """依實際成功 metrics 計算 diagnostic completeness 摘要。"""
+    required_metrics = {"configuration_id", "split_id", "feature_set", "status"}
+    required_importance = {"configuration_id", "split_id", "feature"}
+    if not required_metrics.issubset(metrics.columns):
+        return {"actual": len(importance), "expected": 0, "missing": 0, "incomplete": 0}
+    successful = metrics[metrics["status"].astype(str).eq("ok")]
+    feature_counts = {"basic_median": 33, "paper_style_median": 93}
+    expected = int(
+        successful["feature_set"].astype(str).map(feature_counts).fillna(0).sum()
+    )
+    if not required_importance.issubset(importance.columns):
+        return {
+            "actual": len(importance),
+            "expected": expected,
+            "missing": max(expected - len(importance), 0),
+            "incomplete": len(successful),
+        }
+    actual_counts = importance.groupby(
+        ["configuration_id", "split_id"], dropna=False
+    )["feature"].nunique()
+    incomplete = 0
+    for row in successful.itertuples(index=False):
+        expected_count = feature_counts.get(str(row.feature_set), 0)
+        actual_count = int(
+            actual_counts.get((str(row.configuration_id), str(row.split_id)), 0)
+        )
+        if actual_count != expected_count:
+            incomplete += 1
+    actual = len(importance)
+    return {
+        "actual": actual,
+        "expected": expected,
+        "missing": max(expected - actual, 0),
+        "incomplete": incomplete,
+    }
+
+
+def _importance_completeness_text(value: Any) -> str:
+    """依實際 completeness 摘要產生明確 diagnostic 訊息。"""
+    if not isinstance(value, Mapping):
+        return "Feature importance diagnostic completeness 未提供。"
+    actual = int(value.get("actual", 0))
+    expected = int(value.get("expected", 0))
+    missing = int(value.get("missing", max(expected - actual, 0)))
+    incomplete = int(value.get("incomplete", 0))
+    if missing or incomplete or actual != expected:
+        return (
+            "Feature importance diagnostic completeness warning："
+            f"actual={actual}, expected={expected}, missing={missing}, "
+            f"incomplete_fold_identities={incomplete}；缺漏不作 publication hard gate。"
+        )
+    return (
+        "Feature importance diagnostic completeness complete："
+        f"actual={actual}, expected={expected}。"
+    )
 
 
 def _validate_formal_ranking(

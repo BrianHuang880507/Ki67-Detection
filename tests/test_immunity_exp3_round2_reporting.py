@@ -13,7 +13,7 @@ import pandas as pd
 import pytest
 
 import immunity.exp3.run_round2_paper93 as run_module
-from immunity.exp3.feature_sets import PAPER_STYLE_FOV_FEATURES
+from immunity.exp3.feature_sets import PAPER_STYLE_FOV_FEATURES, PRIMARY_FOV_FEATURES
 from immunity.exp3.round2_reporting import (
     ROUND2_TABLE_NAMES,
     begin_round2_generation,
@@ -270,6 +270,47 @@ def _formal_tables() -> dict[str, pd.DataFrame]:
     }
 
 
+def _formal_tables_with_failed_fold() -> dict[str, pd.DataFrame]:
+    """建立一個 candidate outer fold 失敗且證據一致的正式 fixture。"""
+    tables = _formal_tables()
+    configuration = "extra_trees__paper_style_median"
+    split_id = "leave_one_b_out:1"
+    failed = tables["fold_metrics.csv"]["configuration_id"].eq(configuration) & tables[
+        "fold_metrics.csv"
+    ]["split_id"].eq(split_id)
+    tables["fold_metrics.csv"].loc[failed, "status"] = "failed"
+    tables["fold_metrics.csv"].loc[
+        failed, ["mae", "rmse", "r2", "spearman"]
+    ] = np.nan
+    for name in ("oof_predictions.csv", "hyperparameters.csv", "feature_importance.csv"):
+        frame = tables[name]
+        keep = ~(
+            frame["configuration_id"].eq(configuration)
+            & frame["split_id"].eq(split_id)
+        )
+        tables[name] = frame.loc[keep].copy()
+    tables["model_failures.csv"] = pd.DataFrame(
+        [
+            {
+                "validation": "leave_one_b_out",
+                "fold": "1",
+                "split_id": split_id,
+                "model": "extra_trees",
+                "feature_set": "paper_style_median",
+                "source_round": "round2_paper93",
+                "configuration_id": configuration,
+                "exception_type": "ValueError",
+                "message": "synthetic",
+            }
+        ]
+    )
+    tables["eligibility.csv"].loc[
+        tables["eligibility.csv"]["configuration_id"].eq(configuration),
+        ["eligible", "recommended"],
+    ] = [False, False]
+    return tables
+
+
 def _formal_json_payloads() -> dict[str, dict[str, Any]]:
     """建立三個固定 JSON artifacts。"""
     return {
@@ -376,6 +417,65 @@ def test_round2_writer_publishes_exact_required_artifacts_atomically(
         "EXPERIMENT_RECORD.md",
         "run.log",
     }
+
+
+def test_round2_validator_accepts_published_root_with_managed_generations_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Published root 只額外允許安全的 `_generations` 管理目錄。"""
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    publish_round2_generation(generation)
+
+    validate_round2_bundle(generation.output_dir, smoke=False)
+
+
+def test_round2_published_root_rejects_other_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Published root 除 `_generations` 外不可有其他 directory。"""
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    publish_round2_generation(generation)
+    (generation.output_dir / "other").mkdir()
+
+    with pytest.raises(ValueError, match="artifact keys|extra|other"):
+        validate_round2_bundle(generation.output_dir, smoke=False)
+
+
+def test_round2_published_root_rejects_reparse_generations_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Published `_generations` 若被換成 symlink/junction 必須 fail-closed。"""
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    publish_round2_generation(generation)
+    managed = generation.output_dir / "_generations"
+    managed.rmdir()
+    outside = tmp_path / "outside-generations"
+    outside.mkdir()
+    try:
+        managed.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"此環境無法建立 directory symlink：{error}")
+
+    with pytest.raises(ValueError, match="symlink|junction|reparse|逃逸"):
+        validate_round2_bundle(generation.output_dir, smoke=False)
 
 
 def test_round2_validator_rejects_unexpected_directory_artifact(
@@ -602,37 +702,8 @@ def test_round2_validator_reconciles_failed_fold_and_ineligibility(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """failed metric 必須一對一對應 failure、缺少證據與 ineligible 設定。"""
-    tables = _formal_tables()
+    tables = _formal_tables_with_failed_fold()
     configuration = "extra_trees__paper_style_median"
-    split_id = "leave_one_b_out:1"
-    failed = tables["fold_metrics.csv"]["configuration_id"].eq(configuration) & tables[
-        "fold_metrics.csv"
-    ]["split_id"].eq(split_id)
-    tables["fold_metrics.csv"].loc[failed, "status"] = "failed"
-    tables["fold_metrics.csv"].loc[failed, ["mae", "rmse", "r2", "spearman"]] = np.nan
-    for name in ("oof_predictions.csv", "hyperparameters.csv", "feature_importance.csv"):
-        frame = tables[name]
-        keep = ~(frame["configuration_id"].eq(configuration) & frame["split_id"].eq(split_id))
-        tables[name] = frame.loc[keep].copy()
-    tables["model_failures.csv"] = pd.DataFrame(
-        [
-            {
-                "validation": "leave_one_b_out",
-                "fold": "1",
-                "split_id": split_id,
-                "model": "extra_trees",
-                "feature_set": "paper_style_median",
-                "source_round": "round2_paper93",
-                "configuration_id": configuration,
-                "exception_type": "ValueError",
-                "message": "synthetic",
-            }
-        ]
-    )
-    tables["eligibility.csv"].loc[
-        tables["eligibility.csv"]["configuration_id"].eq(configuration),
-        ["eligible", "recommended"],
-    ] = [False, False]
     generation = _write_bundle(
         _allowed_output(tmp_path, monkeypatch),
         tables,
@@ -655,6 +726,178 @@ def test_round2_validator_reconciles_failed_fold_and_ineligibility(
         validate_round2_bundle(bad.staging_dir, smoke=False)
 
 
+def test_failed_fold_validator_rejects_oof_identity_outside_success_metrics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed mode 不得接受任何成功 metric identities 以外的 OOF split。"""
+    tables = _formal_tables_with_failed_fold()
+    rogue = tables["oof_predictions.csv"].iloc[[0]].copy()
+    rogue[["validation", "fold", "split_id", "image_key"]] = [
+        "leave_one_b_out",
+        "999",
+        "leave_one_b_out:999",
+        "rogue-image",
+    ]
+    tables["oof_predictions.csv"] = pd.concat(
+        [tables["oof_predictions.csv"], rogue], ignore_index=True
+    )
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        tables,
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+
+    with pytest.raises(ValueError, match="OOF.*identity|unknown.*split|成功"):
+        validate_round2_bundle(generation.staging_dir, smoke=False)
+
+
+def test_failed_fold_validator_uses_frozen_n_test_for_failed_metric(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed fold 雖無 OOF，metric n_test 仍須等於 frozen test membership。"""
+    tables = _formal_tables_with_failed_fold()
+    failed = tables["fold_metrics.csv"]["status"].eq("failed")
+    tables["fold_metrics.csv"].loc[failed, "n_test"] = 0
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        tables,
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+
+    with pytest.raises(ValueError, match="n_test.*frozen|frozen.*n_test"):
+        validate_round2_bundle(generation.staging_dir, smoke=False)
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ["unknown_configuration", "missing_success", "failed_identity_row"],
+)
+def test_failed_fold_validator_requires_exact_successful_oof_identities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+) -> None:
+    """Failed mode 的 OOF 只能且必須對應每個 successful metric identity。"""
+    tables = _formal_tables_with_failed_fold()
+    predictions = tables["oof_predictions.csv"].copy()
+    success = (
+        predictions["configuration_id"].eq("extra_trees__basic_median")
+        & predictions["split_id"].eq("leave_one_b_out:1")
+    )
+    if drift == "unknown_configuration":
+        predictions.loc[predictions.index[0], "configuration_id"] = "rogue__paper93"
+    elif drift == "missing_success":
+        predictions = predictions.loc[~success].copy()
+    else:
+        original = _formal_tables()["oof_predictions.csv"]
+        failed_rows = original.loc[
+            original["configuration_id"].eq("extra_trees__paper_style_median")
+            & original["split_id"].eq("leave_one_b_out:1")
+        ]
+        predictions = pd.concat([predictions, failed_rows], ignore_index=True)
+    tables["oof_predictions.csv"] = predictions
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        tables,
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+
+    with pytest.raises(ValueError, match="OOF|configuration identity"):
+        validate_round2_bundle(generation.staging_dir, smoke=False)
+
+
+class _FailingBinaryHandle:
+    """在指定 binary file operation 注入單次失敗。"""
+
+    def __init__(self, handle: Any, operation: str) -> None:
+        self._handle = handle
+        self._operation = operation
+
+    def __enter__(self) -> "_FailingBinaryHandle":
+        self._handle.__enter__()
+        return self
+
+    def __exit__(self, *args: object) -> object:
+        return self._handle.__exit__(*args)
+
+    def write(self, payload: bytes) -> int:
+        if self._operation == "write":
+            raise OSError("injected write failure")
+        return int(self._handle.write(payload))
+
+    def flush(self) -> None:
+        if self._operation == "flush":
+            raise OSError("injected flush failure")
+        self._handle.flush()
+
+    def fileno(self) -> int:
+        return int(self._handle.fileno())
+
+
+@pytest.mark.parametrize("operation", ["write", "flush", "fsync"])
+def test_round2_temp_writer_removes_partial_file_after_io_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    """本次建立的 temp 在 write/flush/fsync 失敗後不可殘留。"""
+    import immunity.exp3.round2_reporting as reporting
+
+    generation = begin_round2_generation(_allowed_output(tmp_path, monkeypatch))
+    if operation == "fsync":
+        monkeypatch.setattr(
+            reporting.os,
+            "fsync",
+            lambda _: (_ for _ in ()).throw(OSError("injected fsync failure")),
+        )
+    else:
+        real_open = Path.open
+
+        def failing_open(path: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+            handle = real_open(path, mode, *args, **kwargs)
+            if path.name == ".tmp" and mode == "xb":
+                return _FailingBinaryHandle(handle, operation)
+            return handle
+
+        monkeypatch.setattr(Path, "open", failing_open)
+
+    with pytest.raises(OSError, match=f"injected {operation} failure"):
+        write_round2_bundle(
+            generation.staging_dir,
+            _formal_tables(),
+            _formal_json_payloads(),
+            _formal_record_context(),
+        )
+
+    assert not (generation.staging_dir / ".tmp").exists()
+    assert list(generation.staging_dir.iterdir()) == []
+
+
+def test_round2_temp_writer_never_deletes_preexisting_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exclusive-create collision 不是本次檔案，失敗 cleanup 不得刪除。"""
+    generation = begin_round2_generation(_allowed_output(tmp_path, monkeypatch))
+    temp = generation.staging_dir / ".tmp"
+    temp.write_bytes(b"caller-owned")
+
+    with pytest.raises(FileExistsError):
+        write_round2_bundle(
+            generation.staging_dir,
+            _formal_tables(),
+            _formal_json_payloads(),
+            _formal_record_context(),
+        )
+
+    assert temp.read_bytes() == b"caller-owned"
+
+
 def test_round2_validator_requires_dummy_and_four_ranking_rows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -670,6 +913,130 @@ def test_round2_validator_requires_dummy_and_four_ranking_rows(
     )
 
     with pytest.raises(ValueError, match="2,772|2772|Dummy"):
+        validate_round2_bundle(generation.staging_dir, smoke=False)
+
+
+def test_round2_validator_rejects_unregistered_feature_importance_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Importance feature 必須屬於該 configuration 的 authoritative roster。"""
+    tables = _formal_tables()
+    tables["feature_importance.csv"] = pd.DataFrame(
+        [
+            {
+                "validation": "leave_one_b_out",
+                "fold": "1",
+                "split_id": "leave_one_b_out:1",
+                "model": "extra_trees",
+                "feature_set": "basic_median",
+                "source_round": "round1",
+                "configuration_id": "extra_trees__basic_median",
+                "feature": "rogue_feature",
+                "importance": 0.1,
+            }
+        ]
+    )
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        tables,
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+
+    with pytest.raises(ValueError, match="feature_importance.*feature|authoritative"):
+        validate_round2_bundle(generation.staging_dir, smoke=False)
+
+
+def test_round2_record_reports_actual_feature_importance_completeness_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Importance 缺漏不阻擋 publication，但 record 必須列出實際 completeness。"""
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+
+    validate_round2_bundle(generation.staging_dir, smoke=False)
+    record = (generation.staging_dir / "EXPERIMENT_RECORD.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Feature importance diagnostic completeness warning" in record
+    assert "actual=0" in record
+    assert "expected=5796" in record
+    assert "missing=5796" in record
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "configuration",
+        "model",
+        "source",
+        "failed_fold",
+        "duplicate",
+        "too_many",
+    ],
+)
+def test_round2_validator_rejects_invalid_feature_importance_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+) -> None:
+    """Importance 必須屬於成功 fold、identity 精確、feature 唯一且不超過上限。"""
+    tables = (
+        _formal_tables_with_failed_fold()
+        if drift == "failed_fold"
+        else _formal_tables()
+    )
+    row = {
+        "validation": "leave_one_b_out",
+        "fold": "1",
+        "split_id": "leave_one_b_out:1",
+        "model": "extra_trees",
+        "feature_set": "basic_median",
+        "source_round": "round1",
+        "configuration_id": "extra_trees__basic_median",
+        "feature": PRIMARY_FOV_FEATURES[0],
+        "importance": 0.1,
+    }
+    if drift == "configuration":
+        row["configuration_id"] = "rogue__basic_median"
+    elif drift == "model":
+        row["model"] = "random_forest"
+    elif drift == "source":
+        row["source_round"] = "round2_paper93"
+    elif drift == "failed_fold":
+        row.update(
+            {
+                "feature_set": "paper_style_median",
+                "source_round": "round2_paper93",
+                "configuration_id": "extra_trees__paper_style_median",
+                "feature": PAPER_STYLE_FOV_FEATURES[0],
+            }
+        )
+    if drift == "too_many":
+        importance = pd.DataFrame([row] * 5797)
+    elif drift == "duplicate":
+        importance = pd.DataFrame([row, row])
+    else:
+        importance = pd.DataFrame([row])
+    tables["feature_importance.csv"] = importance
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        tables,
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="feature_importance|configuration identity|successful fold|5796|唯一",
+    ):
         validate_round2_bundle(generation.staging_dir, smoke=False)
 
 
