@@ -1475,6 +1475,15 @@ def _finite_float(value: object, name: str) -> float:
     return numeric
 
 
+def _canonical_csv_float(value: object, name: str) -> float:
+    """將 metadata float 正規化為 Round 2 CSV 輸出後的 pandas parse 值。"""
+    numeric = _finite_float(value, name)
+    payload = pd.DataFrame({"value": [numeric]}).to_csv(
+        index=False, lineterminator="\n"
+    )
+    return float(pd.read_csv(StringIO(payload)).iloc[0, 0])
+
+
 def _validate_common_tables(
     tables: Mapping[str, pd.DataFrame],
     metadata: Mapping[str, Any],
@@ -1718,7 +1727,7 @@ def _validate_pair_metadata_totals(
     if summary["aggregation_unit"] != "frozen_nucleus_cell_pair":
         raise ValueError("metadata aggregation unit 不合法")
     if (
-        _finite_float(summary["max_retained_outside_fraction"], "summary outside")
+        _canonical_csv_float(summary["max_retained_outside_fraction"], "summary outside")
         != maximum_outside
         or _finite_float(summary["max_nucleus_outside_fraction"], "summary threshold")
         != 0.05

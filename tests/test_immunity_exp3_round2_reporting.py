@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 from typing import Any
 
@@ -1941,6 +1942,100 @@ def test_round2_validator_rejects_median_fov_name_substitution_in_valid_counts(
 
     with pytest.raises(ValueError, match="feature valid-count.*60 extras"):
         validate_round2_bundle(generation.staging_dir, smoke=False)
+
+
+def _roundtrip_extraction_qc(frame: pd.DataFrame) -> pd.DataFrame:
+    """模擬 production writer 的 pandas CSV emit 與 validator parse 邊界。"""
+    return pd.read_csv(StringIO(frame.to_csv(index=False, lineterminator="\n")))
+
+
+def _single_image_extraction_qc(value: float) -> pd.DataFrame:
+    """建立通過拓樸與 threshold gate 的單張 extraction QC row。"""
+    return pd.DataFrame(
+        [
+            {
+                "image_key": "image-001",
+                "aggregation_unit": "frozen_nucleus_cell_pair",
+                "roster_pair_count": 1,
+                "extracted_pair_count": 1,
+                "unique_cell_count": 1,
+                "unique_nucleus_count": 1,
+                "multi_nucleus_cell_count": 0,
+                "multi_nucleus_pair_count": 0,
+                "max_nuclei_per_cell": 1,
+                "retained_outside_pair_count": 1,
+                "max_retained_outside_fraction": value,
+                "max_nucleus_outside_fraction": 0.05,
+                "status": "passed",
+            }
+        ]
+    )
+
+
+def _pair_metadata(value: float, *, threshold: float = 0.05) -> dict[str, object]:
+    """建立與單張 extraction QC row 對應的 metadata summary。"""
+    return {
+        "analyzed_images": 1,
+        "valid_cells": 1,
+        "valid_pair_observations": 1,
+        "aggregation_unit": "frozen_nucleus_cell_pair",
+        "pair_mapping_summary": {
+            "aggregation_unit": "frozen_nucleus_cell_pair",
+            "image_count": 1,
+            "pair_observation_count": 1,
+            "unique_cell_count": 1,
+            "unique_nucleus_count": 1,
+            "multi_nucleus_cell_count": 0,
+            "multi_nucleus_pair_count": 0,
+            "max_nuclei_per_cell": 1,
+            "retained_outside_pair_count": 1,
+            "max_retained_outside_fraction": value,
+            "max_nucleus_outside_fraction": threshold,
+        }
+    }
+
+
+def test_published_extraction_qc_accepts_metadata_value_after_canonical_csv_roundtrip() -> None:
+    """metadata 與 production CSV parse 的同值不得因浮點表示差異被拒絕。"""
+    metadata_value = 0.044444444444444446
+    extraction_qc = _roundtrip_extraction_qc(_single_image_extraction_qc(metadata_value))
+
+    reporting_module._validate_published_extraction_qc(
+        extraction_qc,
+        {"image-001"},
+        {"image-001": 1},
+        _pair_metadata(metadata_value),
+    )
+
+
+def test_published_extraction_qc_rejects_meaningful_metadata_outside_fraction_drift() -> None:
+    """metadata 的 outside fraction 即使僅偏移 1e-12 仍須與 CSV evidence 一致。"""
+    metadata_value = 0.044444444444444446
+    extraction_qc = _roundtrip_extraction_qc(_single_image_extraction_qc(metadata_value))
+    metadata = _pair_metadata(metadata_value + 1e-12)
+
+    with pytest.raises(ValueError, match="metadata outside fraction summary"):
+        reporting_module._validate_published_extraction_qc(
+            extraction_qc,
+            {"image-001"},
+            {"image-001": 1},
+            metadata,
+        )
+
+
+def test_published_extraction_qc_keeps_metadata_outside_threshold_exact() -> None:
+    """metadata outside threshold 偏移 1e-12 仍須被 exact gate 拒絕。"""
+    metadata_value = 0.044444444444444446
+    extraction_qc = _roundtrip_extraction_qc(_single_image_extraction_qc(metadata_value))
+    metadata = _pair_metadata(metadata_value, threshold=0.05 + 1e-12)
+
+    with pytest.raises(ValueError, match="metadata outside fraction summary"):
+        reporting_module._validate_published_extraction_qc(
+            extraction_qc,
+            {"image-001"},
+            {"image-001": 1},
+            metadata,
+        )
 
 
 def test_formal_validator_rehashes_round1_artifacts_at_derived_sibling_root(
