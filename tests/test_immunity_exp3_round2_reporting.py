@@ -190,13 +190,9 @@ def _synthetic_round1_authority(root: Path) -> dict[str, Any]:
         ]
 
         def raw(frame: pd.DataFrame) -> pd.DataFrame:
-            result = frame.drop(
+            return frame.drop(
                 columns=["source_round", "configuration_id"], errors="ignore"
             ).reset_index(drop=True)
-            #模擬 authority CSV loader；此 synthetic fixture 的 fold 全為數字。
-            if "fold" in result:
-                result["fold"] = pd.to_numeric(result["fold"])
-            return result
 
         _SYNTHETIC_AUTHORITY_CACHE = {
             "basic_images": pd.read_csv(
@@ -2195,6 +2191,230 @@ def test_relative_round1_dir_is_resolved_from_fixed_project_root(
     monkeypatch.chdir(elsewhere)
 
     validate_round2_bundle(generation.staging_dir, smoke=False)
+
+
+def test_round1_relative_declaration_rejects_parent_traversal_before_resolve(
+    tmp_path: Path,
+) -> None:
+    """即使 ``..`` 正規化後仍在 project root，也必須先以 lexical gate 拒絕。"""
+    project_root = tmp_path / "project"
+    target = project_root / "immunity" / "outputs" / "exp3"
+    target.mkdir(parents=True)
+    declaration = "immunity/outputs/exp3/../exp3"
+
+    with pytest.raises(ValueError, match=r"traversal|\.\.|lexical|相對"):
+        reporting_module._resolve_round1_declaration(declaration, project_root)
+
+
+def test_round1_relative_declaration_rejects_windows_rooted_relative(
+    tmp_path: Path,
+) -> None:
+    """Windows rooted-relative path 不得繼承 project drive 後逃離 anchor 語意。"""
+    project_root = tmp_path / "project"
+    target = project_root / "immunity" / "outputs" / "exp3"
+    target.mkdir(parents=True)
+    rooted_relative = str(target)[len(target.drive) :]
+    assert rooted_relative.startswith(("\\", "/"))
+
+    with pytest.raises(ValueError, match="rooted-relative|rooted|相對"):
+        reporting_module._resolve_round1_declaration(rooted_relative, project_root)
+
+
+def test_round1_relative_declaration_rejects_drive_relative(
+    tmp_path: Path,
+) -> None:
+    """Windows drive-relative path 不得依賴該 drive 的 process working directory。"""
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    declaration = f"{project_root.drive}immunity\\outputs\\exp3"
+
+    with pytest.raises(ValueError, match="drive-relative|drive|相對"):
+        reporting_module._resolve_round1_declaration(declaration, project_root)
+
+
+def test_round1_relative_declaration_rejects_reparse_component_before_resolve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relative declaration 的 lexical symlink/junction component 必須 fail closed。"""
+    project_root = tmp_path / "project"
+    reparse = project_root / "linked"
+    target = reparse / "immunity" / "outputs" / "exp3"
+    target.mkdir(parents=True)
+    monkeypatch.setattr(
+        reporting_module,
+        "_is_reparse_point",
+        lambda path: Path(path) == reparse,
+    )
+
+    with pytest.raises(ValueError, match="symlink|junction|reparse|lexical"):
+        reporting_module._resolve_round1_declaration(
+            "linked/immunity/outputs/exp3",
+            project_root,
+        )
+
+
+def test_round1_raw_evidence_accepts_canonical_csv_loader_dtypes() -> None:
+    """Text identity 與 integral CSV dtype 可正規化，但 canonical values 必須相同。"""
+    expected = pd.DataFrame(
+        {
+            "validation": pd.Series(["leave_one_b_out"], dtype="object"),
+            "fold": pd.Series(["1"], dtype="object"),
+            "n_test": pd.Series([3], dtype="int64"),
+            "mae": pd.Series([0.125], dtype="float64"),
+        }
+    )
+    published = pd.DataFrame(
+        {
+            "validation": pd.Series(["leave_one_b_out"], dtype="string"),
+            "fold": pd.Series([1], dtype="int64"),
+            "n_test": pd.Series([3.0], dtype="float64"),
+            "mae": pd.Series([0.125], dtype="object"),
+        }
+    )
+
+    reporting_module._compare_round1_raw_evidence(
+        published,
+        expected,
+        "CSV dtype normalization",
+    )
+
+
+@pytest.mark.parametrize("drift", ["nextafter", "boolean_integer"])
+def test_round1_raw_evidence_rejects_exact_numeric_or_dtype_drift(
+    drift: str,
+) -> None:
+    """Canonical compare 不可用 tolerance 接受微小數值或 boolean dtype 偽裝。"""
+    expected = pd.DataFrame(
+        {
+            "validation": ["leave_one_b_out"],
+            "fold": ["1"],
+            "n_test": pd.Series([1], dtype="int64"),
+            "mae": pd.Series([0.125], dtype="float64"),
+        }
+    )
+    published = expected.copy(deep=True)
+    if drift == "nextafter":
+        published.loc[0, "mae"] = np.nextafter(0.125, np.inf)
+    else:
+        published["n_test"] = pd.Series([True], dtype="bool")
+
+    with pytest.raises(ValueError, match="exact|canonical|numeric|dtype|pinned"):
+        reporting_module._compare_round1_raw_evidence(
+            published,
+            expected,
+            "exact numeric contract",
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "dummy_metrics_oof",
+        "hyperparameters",
+        "importance",
+        "failures",
+    ],
+)
+def test_formal_validator_rejects_each_coordinated_round1_raw_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    """各類 baseline raw table 即使下游自洽，仍須逐表對回 pinned authority。"""
+    output = _allowed_output(tmp_path, monkeypatch)
+    tables = _formal_tables()
+    if mutation == "dummy_metrics_oof":
+        tables["dummy_oof_predictions.csv"]["predicted_ido_score"] += 0.25
+        _synchronize_metrics_from_oof(tables)
+    elif mutation == "hyperparameters":
+        baseline = tables["hyperparameters.csv"]["source_round"].eq("round1")
+        tables["hyperparameters.csv"].loc[
+            tables["hyperparameters.csv"].index[baseline][0], "best_params_json"
+        ] = '{"forged":true}'
+    elif mutation == "importance":
+        identity = {
+            "validation": "leave_one_b_out",
+            "fold": "1",
+            "split_id": "leave_one_b_out:1",
+            "model": "extra_trees",
+            "role": "candidate",
+            "feature_set": "basic_median",
+            "source_round": "round1",
+            "configuration_id": "extra_trees__basic_median",
+            "feature": PRIMARY_FOV_FEATURES[0],
+            "importance_type": "outer_test_permutation_diagnostic",
+            "importance": 0.25,
+            "importance_sd": 0.01,
+            "round": "primary_round_1",
+        }
+        tables["feature_importance.csv"] = pd.DataFrame([identity])
+        authority = _synthetic_round1_authority(output.parent)
+        authority["selected_importance"] = pd.DataFrame(
+            [{key: value for key, value in identity.items() if key not in {
+                "source_round", "configuration_id"
+            }}]
+        )
+        authority["selected_importance"].loc[0, "importance"] = 0.125
+        monkeypatch.setattr(
+            reporting_module,
+            "_load_round1_authority",
+            lambda root: {
+                name: value.copy(deep=True)
+                if isinstance(value, pd.DataFrame)
+                else value
+                for name, value in authority.items()
+            },
+        )
+    else:
+        configuration = "extra_trees__basic_median"
+        split_id = "leave_one_b_out:1"
+        failed = tables["fold_metrics.csv"]["configuration_id"].eq(
+            configuration
+        ) & tables["fold_metrics.csv"]["split_id"].eq(split_id)
+        metric = tables["fold_metrics.csv"].loc[failed].iloc[0]
+        tables["fold_metrics.csv"].loc[failed, "status"] = "failed"
+        tables["fold_metrics.csv"].loc[
+            failed, ["mae", "rmse", "r2", "spearman"]
+        ] = np.nan
+        for name in ("oof_predictions.csv", "hyperparameters.csv"):
+            frame = tables[name]
+            tables[name] = frame.loc[
+                ~(
+                    frame["configuration_id"].eq(configuration)
+                    & frame["split_id"].eq(split_id)
+                )
+            ].copy()
+        tables["model_failures.csv"] = pd.DataFrame(
+            [
+                {
+                    **{
+                        column: metric[column]
+                        for column in (
+                            "validation",
+                            "fold",
+                            "split_id",
+                            "model",
+                            "feature_set",
+                            "source_round",
+                            "configuration_id",
+                        )
+                    },
+                    "exception_type": "ValueError",
+                    "message": "coordinated forged baseline failure",
+                }
+            ]
+        )
+    _refresh_ranking_tables(tables)
+    generation = _write_bundle(
+        output,
+        tables,
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+
+    with pytest.raises(ValueError, match="Round 1 baseline raw evidence|pinned baseline"):
+        validate_round2_bundle(generation.staging_dir, smoke=False)
 
 
 def test_round2_validator_requires_11088_oof_when_all_model_folds_succeed(

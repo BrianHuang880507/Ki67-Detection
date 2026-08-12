@@ -11,7 +11,8 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from io import StringIO
+from pathlib import Path, PureWindowsPath
 from typing import Any, BinaryIO
 
 import numpy as np
@@ -1125,12 +1126,49 @@ def _validate_baseline_provenance(
 
 
 def _resolve_round1_declaration(value: str, project_root: Path) -> Path:
-    """將相對 Round 1 聲明固定解析於專案根，不依賴 process CWD。"""
-    declared = Path(value)
-    if declared.drive and not declared.is_absolute():
+    """安全解析 Round 1 root 聲明。
+
+    Args:
+        value: Bundle 或 config 宣告的 Round 1 root。
+        project_root: 由核准 output boundary 推導的固定專案根。
+
+    Returns:
+        已存在且解析完成的絕對路徑。
+
+    Raises:
+        ValueError: Relative path 含 traversal、Windows 特殊 root 或 reparse
+            component，或解析後逃離專案根時拋出。
+        OSError: 路徑不存在或無法解析時拋出。
+    """
+    windows_path = PureWindowsPath(value)
+    if windows_path.drive and not windows_path.root:
         raise ValueError("Round 1 root 不可使用 drive-relative 路徑")
-    lexical = declared if declared.is_absolute() else project_root / declared
-    return lexical.resolve(strict=True)
+    if windows_path.root and not windows_path.drive:
+        raise ValueError("Round 1 root 不可使用 Windows rooted-relative 路徑")
+    declared = Path(value)
+    if declared.is_absolute():
+        return declared.resolve(strict=True)
+    if any(part == ".." for part in windows_path.parts):
+        raise ValueError("Round 1 relative root 不可含 .. traversal")
+
+    project_absolute = Path(os.path.abspath(project_root))
+    project_resolved = project_absolute.resolve(strict=True)
+    lexical = project_absolute / declared
+    current = project_absolute
+    for part in declared.parts:
+        if part in ("", "."):
+            continue
+        current /= part
+        if (current.exists() or current.is_symlink()) and _is_reparse_point(current):
+            raise ValueError(
+                "Round 1 relative root 不可包含 symlink/junction/reparse component"
+            )
+    resolved = lexical.resolve(strict=True)
+    try:
+        resolved.relative_to(project_resolved)
+    except ValueError as error:
+        raise ValueError("Round 1 relative root 經解析後逃逸 project boundary") from error
+    return resolved
 
 
 def _load_round1_authority(root: Path) -> dict[str, Any]:
@@ -1247,9 +1285,23 @@ def _compare_round1_raw_evidence(
     expected: pd.DataFrame,
     name: str,
 ) -> None:
-    """以 authority 原始欄位與 stable identity order 比對 Round 1 evidence。"""
+    """以 canonical dtype 與 exact values 比對 Round 1 raw evidence。"""
     columns = list(expected.columns)
     _require_columns(published, columns, f"Round 1 baseline {name}")
+    #Round 2 publisher 會把已載入的 Round 1 table 再寫成一次 CSV；只將
+    #authority 投影成該 canonical emission，published values 不可再次 round-trip。
+    emitted_authority = pd.read_csv(StringIO(expected.to_csv(index=False)))
+    schema = emitted_authority.dtypes.to_dict()
+    actual = _canonical_round1_raw_frame(
+        published.loc[:, columns],
+        schema,
+        f"published {name}",
+    )
+    canonical = _canonical_round1_raw_frame(
+        emitted_authority.loc[:, columns],
+        schema,
+        f"authority {name}",
+    )
     sort_columns = [
         column
         for column in (
@@ -1262,12 +1314,12 @@ def _compare_round1_raw_evidence(
         )
         if column in columns
     ]
-    actual = published.loc[:, columns].sort_values(
+    actual = actual.sort_values(
         sort_columns,
         kind="stable",
         na_position="first",
     ).reset_index(drop=True)
-    canonical = expected.loc[:, columns].sort_values(
+    canonical = canonical.sort_values(
         sort_columns,
         kind="stable",
         na_position="first",
@@ -1276,15 +1328,86 @@ def _compare_round1_raw_evidence(
         pd.testing.assert_frame_equal(
             actual,
             canonical,
-            check_dtype=False,
-            check_exact=False,
-            rtol=1e-12,
-            atol=1e-12,
+            check_dtype=True,
+            check_exact=True,
         )
     except AssertionError as error:
         raise ValueError(
             f"Round 1 baseline raw evidence 偏離 pinned baseline（{name}）：{error}"
         ) from error
+
+
+def _canonical_round1_raw_frame(
+    frame: pd.DataFrame,
+    schema: Mapping[str, Any],
+    name: str,
+) -> pd.DataFrame:
+    """依 authority dtype 將 CSV loader 差異正規化為 exact comparison frame。
+
+    Args:
+        frame: 要正規化的 raw evidence table。
+        schema: Authority 每欄的 pandas dtype。
+        name: 錯誤訊息使用的表格名稱。
+
+    Returns:
+        Text 統一為 pandas string、integer 統一為 int64、floating point
+        統一為 float64 的新表格。
+
+    Raises:
+        ValueError: Numeric 欄含 bool、non-numeric、non-finite integer、fractional
+            integer 或不支援的 dtype 時拋出。
+    """
+    normalized: dict[str, pd.Series] = {}
+    for column, dtype in schema.items():
+        values = frame[column].reset_index(drop=True)
+        if pd.api.types.is_bool_dtype(dtype):
+            if not pd.api.types.is_bool_dtype(values.dtype):
+                raise ValueError(f"{name} {column} canonical boolean dtype 不一致")
+            normalized[column] = values.astype(bool)
+            continue
+        if pd.api.types.is_integer_dtype(dtype):
+            if pd.api.types.is_bool_dtype(values.dtype) or values.map(
+                lambda value: isinstance(value, (bool, np.bool_))
+            ).any():
+                raise ValueError(f"{name} {column} canonical integer 不可接受 boolean")
+            try:
+                numeric = pd.to_numeric(values, errors="raise")
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(
+                    f"{name} {column} canonical integer dtype 不合法"
+                ) from error
+            array = numeric.to_numpy(dtype=float)
+            if (
+                not np.isfinite(array).all()
+                or not np.equal(array, np.floor(array)).all()
+            ):
+                raise ValueError(f"{name} {column} canonical integer value 不合法")
+            try:
+                normalized[column] = numeric.astype("int64")
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(
+                    f"{name} {column} canonical integer 超出 int64"
+                ) from error
+            continue
+        if pd.api.types.is_float_dtype(dtype):
+            if pd.api.types.is_bool_dtype(values.dtype) or values.map(
+                lambda value: isinstance(value, (bool, np.bool_))
+            ).any():
+                raise ValueError(f"{name} {column} canonical numeric 不可接受 boolean")
+            try:
+                normalized[column] = pd.to_numeric(values, errors="raise").astype(
+                    "float64"
+                )
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(
+                    f"{name} {column} canonical floating dtype 不合法"
+                ) from error
+            continue
+        if pd.api.types.is_object_dtype(dtype) or pd.api.types.is_string_dtype(dtype):
+            normalized[column] = values.astype("string")
+            continue
+        raise ValueError(f"{name} {column} authority dtype 不支援：{dtype}")
+    return pd.DataFrame(normalized, columns=list(schema))
 
 
 def _validate_authoritative_data_snapshot(
