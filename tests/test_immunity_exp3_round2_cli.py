@@ -15,6 +15,7 @@ import pandas as pd
 import pytest
 import yaml
 
+import immunity.exp3.round2_reporting as reporting_module
 import immunity.exp3.run_round2_paper93 as run_module
 from immunity.exp3.run_round2_paper93 import (
     load_round2_config,
@@ -272,8 +273,9 @@ def _patch_round2_stages(
         calls.append("validate_round2_bundle")
         captures["validated_smoke"] = smoke
 
-    def publish(generation: object) -> None:
+    def publish(generation: object, *, on_publish_failure=None) -> None:
         calls.append("publish_round2_generation")
+        assert callable(on_publish_failure)
         output = generation.output_dir
         output.mkdir(parents=True, exist_ok=True)
         os.replace(generation.staging_dir / "run.log", output / "run.log")
@@ -689,6 +691,106 @@ def test_round2_bundle_validation_failure_restores_qc_before_quarantine(
         (_formal_output(tmp_path).resolve() / "_generations").glob("failed-*")
     )
     assert len(failed) == 1
+    assert (failed[0] / "mask_provenance_qc.csv").is_file()
+    assert (failed[0] / "feature_valid_counts.csv").is_file()
+    assert (failed[0] / "extraction_qc.csv").is_file()
+    assert (failed[0] / "feature_qc.csv").is_file()
+
+
+def test_round2_publication_failure_restores_root_and_quarantines_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Publication rollback 後須保留原錯誤與證據，並隔離唯一 staging。"""
+    calls: list[str] = []
+    _patch_round2_stages(monkeypatch, tmp_path, calls)
+    output = _formal_output(tmp_path).resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    bundle_names = (
+        *run_module.ROUND2_TABLE_NAMES,
+        *run_module.ROUND2_JSON_NAMES,
+        "EXPERIMENT_RECORD.md",
+        "artifact_hashes.json",
+        "run.log",
+    )
+    for name in bundle_names:
+        (output / name).write_bytes(f"old:{name}\n".encode("utf-8"))
+    old_root = {
+        path.name: path.read_bytes() for path in output.iterdir() if path.is_file()
+    }
+
+    def write_publishable_bundle(
+        staging: Path,
+        tables: object,
+        payloads: object,
+        context: object,
+    ) -> Path:
+        calls.append("write_round2_bundle")
+        for name in bundle_names:
+            if name != "run.log":
+                (staging / name).write_bytes(f"new:{name}\n".encode("utf-8"))
+        return staging / "EXPERIMENT_RECORD.md"
+
+    monkeypatch.setattr(run_module, "write_round2_bundle", write_publishable_bundle)
+    monkeypatch.setattr(
+        reporting_module,
+        "validate_round2_bundle",
+        lambda directory, *, smoke: None,
+    )
+    original = RuntimeError("synthetic publication failure")
+    real_publish = reporting_module.publish_round2_generation
+
+    def fail_after_publish(root: Path, archive: Path | None) -> None:
+        assert root == output
+        assert archive is not None
+        raise original
+
+    def publish(generation: object, *, on_publish_failure=None) -> None:
+        calls.append("publish_round2_generation")
+        real_publish(
+            generation,
+            post_publish_check=fail_after_publish,
+            on_publish_failure=on_publish_failure,
+        )
+
+    monkeypatch.setattr(run_module, "publish_round2_generation", publish)
+    real_restore = run_module._restore_failure_qc
+    restore_calls: list[Path] = []
+
+    def restore_failure_qc(
+        staging: Path,
+        mask_qc: pd.DataFrame | None,
+        bundle: object,
+    ) -> None:
+        restore_calls.append(staging)
+        real_restore(staging, mask_qc, bundle)
+
+    monkeypatch.setattr(run_module, "_restore_failure_qc", restore_failure_qc)
+    real_quarantine = reporting_module.quarantine_round2_generation
+    quarantine_calls: list[object] = []
+
+    def quarantine(generation: object) -> Path:
+        quarantine_calls.append(generation)
+        return real_quarantine(generation)
+
+    monkeypatch.setattr(run_module, "quarantine_round2_generation", quarantine)
+
+    with pytest.raises(RuntimeError) as caught:
+        run_module.run_round2(_synthetic_config(tmp_path))
+
+    assert caught.value is original
+    assert {
+        path.name: path.read_bytes() for path in output.iterdir() if path.is_file()
+    } == old_root
+    failed = list((output / "_generations").glob("failed-*"))
+    assert len(failed) == 1
+    assert not list((output / "_generations").glob("staging-*"))
+    assert not list((output / "_generations").glob("archive-*"))
+    assert len(quarantine_calls) == 1
+    assert restore_calls == [quarantine_calls[0].staging_dir]
+    log = (failed[0] / "run.log").read_text(encoding="utf-8")
+    assert log.count("synthetic publication failure") == 1
+    assert "Traceback" in log
     assert (failed[0] / "mask_provenance_qc.csv").is_file()
     assert (failed[0] / "feature_valid_counts.csv").is_file()
     assert (failed[0] / "extraction_qc.csv").is_file()

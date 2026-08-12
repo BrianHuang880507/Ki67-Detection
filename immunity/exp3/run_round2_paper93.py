@@ -48,6 +48,7 @@ from immunity.exp3.round2_features import (
 from immunity.exp3.round2_reporting import (
     ROUND2_JSON_NAMES,
     ROUND2_TABLE_NAMES,
+    Round2Generation,
     begin_round2_generation,
     publish_round2_generation,
     quarantine_round2_generation,
@@ -373,6 +374,30 @@ def run_round2(
     log_path = generation.staging_dir / "run.log"
     mask_qc: pd.DataFrame | None = None
     bundle: Any = None
+    publish_failure_handled = False
+
+    def handle_publish_failure(
+        failed_generation: Round2Generation,
+        original_error: BaseException,
+    ) -> None:
+        """在 publication ownership 內保存失敗證據並隔離 generation。
+
+        Args:
+            failed_generation: 已完成 rollback、仍持有 ownership 的 generation。
+            original_error: 必須由 runner 原樣重新拋出的 publication 例外。
+        """
+        nonlocal publish_failure_handled
+        publish_failure_handled = True
+        _preserve_round2_failure(
+            failed_generation,
+            mask_qc,
+            bundle,
+            (
+                type(original_error),
+                original_error,
+                original_error.__traceback__,
+            ),
+        )
 
     try:
         with log_path.open("w", encoding="utf-8", newline="\n") as log_handle:
@@ -487,39 +512,65 @@ def run_round2(
                 validate_round2_bundle(generation.staging_dir, smoke=smoke)
 
         #Windows 上已開啟的 handle 不可安全搬移；發布只能發生在 with 之外。
-        publish_round2_generation(generation)
+        publish_round2_generation(
+            generation,
+            on_publish_failure=handle_publish_failure,
+        )
         record = output_dir / "EXPERIMENT_RECORD.md"
         if not record.is_file():
             raise RuntimeError("EXPERIMENT_RECORD.md 未成功發布")
         return record
     except BaseException:
-        error_info = sys.exc_info()
-        try:
-            _restore_failure_qc(generation.staging_dir, mask_qc, bundle)
-        except BaseException as restore_error:
-            _append_secondary_failure_evidence(
-                log_path,
-                "restore_failure_qc",
-                restore_error,
-            )
-        try:
-            _append_failure_evidence(log_path, error_info, generation.staging_dir)
-        except BaseException as append_error:
-            _append_secondary_failure_evidence(
-                log_path,
-                "append_failure_evidence",
-                append_error,
-            )
-        try:
-            if generation.staging_dir.exists():
-                quarantine_round2_generation(generation)
-        except BaseException as quarantine_error:
-            _append_secondary_failure_evidence(
-                log_path,
-                "quarantine_round2_generation",
-                quarantine_error,
+        if not publish_failure_handled:
+            _preserve_round2_failure(
+                generation,
+                mask_qc,
+                bundle,
+                sys.exc_info(),
             )
         raise
+
+
+def _preserve_round2_failure(
+    generation: Round2Generation,
+    mask_qc: pd.DataFrame | None,
+    bundle: Any,
+    error_info: tuple[Any, Any, Any],
+) -> None:
+    """Best-effort 保存 runner failure evidence 並隔離 generation。
+
+    Args:
+        generation: 尚待隔離的 active generation。
+        mask_qc: 失敗前已取得的 mask QC；尚未建立時為 ``None``。
+        bundle: 失敗前已取得的 feature bundle；尚未建立時為 ``None``。
+        error_info: 原始例外的 ``(type, value, traceback)`` 三元組。
+    """
+    log_path = generation.staging_dir / "run.log"
+    try:
+        _restore_failure_qc(generation.staging_dir, mask_qc, bundle)
+    except BaseException as restore_error:
+        _append_secondary_failure_evidence(
+            log_path,
+            "restore_failure_qc",
+            restore_error,
+        )
+    try:
+        _append_failure_evidence(log_path, error_info, generation.staging_dir)
+    except BaseException as append_error:
+        _append_secondary_failure_evidence(
+            log_path,
+            "append_failure_evidence",
+            append_error,
+        )
+    try:
+        if generation.staging_dir.exists():
+            quarantine_round2_generation(generation)
+    except BaseException as quarantine_error:
+        _append_secondary_failure_evidence(
+            log_path,
+            "quarantine_round2_generation",
+            quarantine_error,
+        )
 
 
 def main() -> int:
