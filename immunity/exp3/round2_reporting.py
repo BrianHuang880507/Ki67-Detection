@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy.stats import spearmanr
 
 from immunity.exp3.feature_sets import PAPER_STYLE_FOV_FEATURES, PRIMARY_FOV_FEATURES
 from immunity.exp3.round2_benchmark import (
@@ -71,6 +72,23 @@ _CONFIGURATIONS = {
     ),
 }
 _ROUND2_MODELS = {"extra_trees", "random_forest"}
+_ROUND1_REQUIRED_ARTIFACTS = (
+    "pairing_qc.csv",
+    "data_manifest.csv",
+    "segmentation_qc.csv",
+    "outer_splits.csv",
+    "feature_cache/image_level_basic.csv",
+    "feature_cache/cell_level_basic.csv",
+    "fold_metrics.csv",
+    "oof_predictions.csv",
+    "model_ranking.csv",
+    "hyperparameters.csv",
+    "feature_importance.csv",
+    "model_failures.csv",
+    "feature_sets.json",
+    "run_metadata.json",
+)
+_METRIC_COLUMNS = ("mae", "rmse", "r2", "spearman")
 
 
 @dataclass(frozen=True)
@@ -354,13 +372,26 @@ def validate_round2_bundle(directory: Path, *, smoke: bool) -> None:
     baseline_provenance = _read_json_mapping(bundle / "baseline_provenance.json")
     metadata = _read_json_mapping(bundle / "run_metadata.json")
     _validate_reproducibility_metadata(metadata)
-    _validate_baseline_provenance(baseline_provenance, metadata)
+    authority = _validate_baseline_provenance(
+        baseline_provenance,
+        metadata,
+        output,
+    )
     _validate_predictor_registry(feature_sets)
     _validate_common_tables(tables, metadata)
+    _validate_authoritative_data_snapshot(
+        tables["data_snapshot.csv"],
+        authority["basic_images"],
+        smoke=smoke,
+    )
     if smoke:
         _validate_smoke_tables(tables, metadata, bundle)
     else:
-        _validate_formal_tables(tables, metadata)
+        _validate_formal_tables(
+            tables,
+            metadata,
+            authority_split_manifest=authority["outer_splits"],
+        )
 
 
 def build_round2_experiment_record(context: Mapping[str, Any]) -> str:
@@ -800,8 +831,21 @@ def _parse_utc_timestamp(value: object, name: str) -> datetime:
 def _validate_baseline_provenance(
     provenance: Mapping[str, Any],
     metadata: Mapping[str, Any],
-) -> None:
-    """驗證 read-only Round 1 hash pins 與 original/effective config evidence。"""
+    output: Path,
+) -> dict[str, pd.DataFrame]:
+    """由核准 output 推導 Round 1 authority，重驗 bytes 並載入語意錨點。
+
+    Args:
+        provenance: Bundle 聲明的 Round 1 provenance。
+        metadata: Bundle 的 original/effective config evidence。
+        output: 已由 boundary resolver 核准的 formal root 或 smoke child。
+
+    Returns:
+        權威 ``image_level_basic`` 與 ``outer_splits`` 表格。
+
+    Raises:
+        ValueError: Root、pin、bytes 或必要權威表格不一致時拋出。
+    """
     expected_keys = {
         "round1_root",
         "read_only",
@@ -815,8 +859,10 @@ def _validate_baseline_provenance(
     roster = provenance.get("roster_sha256")
     if not isinstance(root, str) or not root.strip():
         raise ValueError("baseline provenance round1_root 不合法")
-    if not isinstance(artifacts, Mapping) or not artifacts:
-        raise ValueError("baseline provenance artifact_sha256 不合法")
+    if not isinstance(artifacts, Mapping) or set(artifacts) != set(
+        _ROUND1_REQUIRED_ARTIFACTS
+    ):
+        raise ValueError("baseline provenance artifact_sha256 必須精確列出 14 個 artifacts")
     if not all(
         isinstance(name, str) and name
         and isinstance(digest, str)
@@ -831,6 +877,15 @@ def _validate_baseline_provenance(
         and all(character in "0123456789abcdefABCDEF" for character in roster)
     ):
         raise ValueError("baseline provenance roster hash identity 不合法")
+    formal_output = output.parent if output.name == "smoke" else output
+    authority_root = formal_output.parent.resolve(strict=True)
+    try:
+        declared_root = Path(root).resolve(strict=True)
+    except OSError as error:
+        raise ValueError("baseline provenance Round 1 root 不存在") from error
+    if declared_root != authority_root:
+        raise ValueError("baseline provenance Round 1 root 必須是 output 推導的 sibling root")
+
     for config_name in ("original_config", "effective_config"):
         config = metadata.get(config_name)
         round1 = config.get("round1") if isinstance(config, Mapping) else None
@@ -844,13 +899,104 @@ def _validate_baseline_provenance(
         configured_root = round1.get("dir")
         if not isinstance(configured_root, str) or not configured_root.strip():
             raise ValueError(f"baseline provenance {config_name} round1.dir 不合法")
-        normalized_root = root.replace("\\", "/").rstrip("/").casefold()
-        normalized_config = configured_root.replace("\\", "/").strip("/").casefold()
-        if not (
-            normalized_root == normalized_config
-            or normalized_root.endswith("/" + normalized_config)
-        ):
-            raise ValueError(f"baseline provenance round1_root 與 {config_name} 不一致")
+        try:
+            resolved_config_root = Path(configured_root).resolve(strict=True)
+        except OSError as error:
+            raise ValueError(
+                f"baseline provenance {config_name} Round 1 root 不存在"
+            ) from error
+        if resolved_config_root != authority_root:
+            raise ValueError(
+                f"baseline provenance {config_name} Round 1 root 不是推導的 sibling root"
+            )
+
+    paths: dict[str, Path] = {}
+    for relative in _ROUND1_REQUIRED_ARTIFACTS:
+        path = authority_root / Path(relative)
+        _assert_regular_file(authority_root, path)
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual != str(artifacts[relative]).lower():
+            raise ValueError(
+                f"Round 1 artifact {relative} SHA-256 不符合 pin："
+                f"expected={artifacts[relative]}, actual={actual}"
+            )
+        paths[relative] = path
+    authority = _load_round1_authority(authority_root)
+    if set(authority) != {"basic_images", "outer_splits"}:
+        raise ValueError("Round 1 authority loader contract 不合法")
+    return authority
+
+
+def _load_round1_authority(root: Path) -> dict[str, pd.DataFrame]:
+    """以程式碼固定 pins 載入完整 Round 1 evidence，拒絕 bundle 自行 repin。"""
+    from immunity.exp3 import round2_evidence as evidence_module
+
+    expected = {
+        "raw_pc": 720,
+        "raw_ido": 719,
+        "paired": 719,
+        "exclusions": 26,
+        "analyzed_images": 693,
+        "valid_cells": 23976,
+        "outer_folds": 23,
+        "seed": 20260804,
+        "manifest_hash": evidence_module._FROZEN_ARTIFACT_HASHES[
+            "data_manifest.csv"
+        ],
+        "config_hash": "b7590ed3438cdb5062b2588e525e603dd0b7610d397322c761facdaea5b54bc0",
+    }
+    evidence = evidence_module.load_round1_evidence(
+        {
+            "round1": {
+                "dir": root,
+                "expected": expected,
+                "roster_sha256": evidence_module._FROZEN_ROSTER_HASH,
+                "artifact_sha256": dict(
+                    evidence_module._FROZEN_ARTIFACT_HASHES
+                ),
+            }
+        }
+    )
+    evidence_module.require_formal_round1_evidence(evidence)
+    return {
+        "basic_images": evidence.basic_images.copy(deep=True),
+        "outer_splits": evidence.split_manifest.copy(deep=True),
+    }
+
+
+def _validate_authoritative_data_snapshot(
+    data: pd.DataFrame,
+    authority: pd.DataFrame,
+    *,
+    smoke: bool,
+) -> None:
+    """以 Round 1 image cache 鎖定 image keys、target 與 33 basic predictors。"""
+    columns = ("image_key", "IDO_score", *PRIMARY_FOV_FEATURES)
+    _require_columns(authority, columns, "Round 1 image_level_basic authority")
+    authority_keys = authority["image_key"].astype(str)
+    data_keys = data["image_key"].astype(str)
+    if authority_keys.duplicated().any() or data_keys.duplicated().any():
+        raise ValueError("Round 1 authority/data_snapshot image_key 不可重複")
+    if smoke:
+        if not set(data_keys) < set(authority_keys):
+            raise ValueError("Smoke data_snapshot 必須是 Round 1 authority strict subset")
+    elif set(data_keys) != set(authority_keys) or len(data) != len(authority):
+        raise ValueError("Formal data_snapshot image keys 必須等於 Round 1 authority")
+    expected = authority.assign(_image_key=authority_keys).set_index("_image_key")
+    actual = data.assign(_image_key=data_keys).set_index("_image_key")
+    ordered = expected.loc[actual.index, ["IDO_score", *PRIMARY_FOV_FEATURES]]
+    actual_numeric = actual.loc[:, ["IDO_score", *PRIMARY_FOV_FEATURES]].apply(
+        pd.to_numeric, errors="coerce"
+    )
+    expected_numeric = ordered.apply(pd.to_numeric, errors="coerce")
+    if not np.isclose(
+        actual_numeric.to_numpy(dtype=float),
+        expected_numeric.to_numpy(dtype=float),
+        rtol=0.0,
+        atol=1e-12,
+        equal_nan=False,
+    ).all():
+        raise ValueError("data_snapshot target/basic predictors 偏離 Round 1 authority")
 
 
 def _strict_integer(value: object, name: str, *, minimum: int = 0) -> int:
@@ -1151,7 +1297,10 @@ _IDENTITY_COLUMNS = (
 
 
 def _validate_formal_tables(
-    tables: Mapping[str, pd.DataFrame], metadata: Mapping[str, Any]
+    tables: Mapping[str, pd.DataFrame],
+    metadata: Mapping[str, Any],
+    *,
+    authority_split_manifest: pd.DataFrame,
 ) -> None:
     """驗證正式 693-FOV publication gates。"""
     data = tables["data_snapshot.csv"]
@@ -1169,6 +1318,12 @@ def _validate_formal_tables(
     split_membership = _formal_split_membership(
         tables["outer_splits.csv"], set(data["image_key"].astype(str))
     )
+    authority_membership = _formal_split_membership(
+        authority_split_manifest,
+        set(data["image_key"].astype(str)),
+    )
+    if split_membership != authority_membership:
+        raise ValueError("Published outer_splits membership 偏離 Round 1 authority")
     splits = set(split_membership)
     expected_metric_identities = {
         (configuration, split_id)
@@ -1209,6 +1364,11 @@ def _validate_formal_tables(
         split_membership,
         expected_total=11088,
     )
+    verified_metrics = _validate_and_recompute_fold_metrics(
+        metrics,
+        predictions,
+        "candidate fold_metrics",
+    )
     hyperparameters = tables["hyperparameters.csv"]
     _validate_candidate_identities(hyperparameters, "hyperparameters")
     hyper_ids = _identity_pairs(hyperparameters)
@@ -1229,7 +1389,18 @@ def _validate_formal_tables(
         "Dummy OOF",
     )
     _validate_dummy_tables(tables, split_membership)
-    _validate_formal_ranking(tables, failed, split_membership)
+    verified_dummy_metrics = _validate_and_recompute_fold_metrics(
+        tables["dummy_fold_metrics.csv"],
+        tables["dummy_oof_predictions.csv"],
+        "Dummy fold_metrics",
+    )
+    _validate_formal_ranking(
+        tables,
+        failed,
+        split_membership,
+        verified_metrics=verified_metrics,
+        verified_dummy_metrics=verified_dummy_metrics,
+    )
 
 
 def _formal_split_membership(
@@ -1371,6 +1542,106 @@ def _validate_oof_coverage(
                 f"expected={expected_count}, actual={len(selected)}; "
                 f"failure-free total={expected_total:,}"
             )
+
+
+def _validate_and_recompute_fold_metrics(
+    metrics: pd.DataFrame,
+    predictions: pd.DataFrame,
+    name: str,
+) -> pd.DataFrame:
+    """由 successful fold OOF 獨立重算四項 regression metrics。
+
+    Args:
+        metrics: 含 status 與四項 published metrics 的 fold table。
+        predictions: 與 successful metric identities 對齊的 OOF rows。
+        name: 錯誤訊息使用的表格名稱。
+
+    Returns:
+        將 successful rows 替換為已驗證重算值的 table 副本。
+
+    Raises:
+        ValueError: OOF 不存在、數值非法或 published metric 漂移時拋出。
+    """
+    _require_columns(metrics, ("status", *_METRIC_COLUMNS), name)
+    verified = metrics.copy()
+    for index, row in verified.iterrows():
+        if str(row["status"]) != "ok":
+            continue
+        selected = predictions[
+            predictions["configuration_id"].astype(str).eq(
+                str(row["configuration_id"])
+            )
+            & predictions["split_id"].astype(str).eq(str(row["split_id"]))
+        ]
+        if selected.empty:
+            raise ValueError(f"{name} successful fold 缺少 OOF rows")
+        observed = pd.to_numeric(
+            selected["observed_ido_score"], errors="coerce"
+        ).to_numpy(dtype=float)
+        predicted = pd.to_numeric(
+            selected["predicted_ido_score"], errors="coerce"
+        ).to_numpy(dtype=float)
+        recomputed = _independent_regression_metrics(observed, predicted)
+        for field, expected in recomputed.items():
+            try:
+                actual = float(row[field])
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(
+                    f"{name} {field} 必須與 OOF 重算 metric 一致"
+                ) from error
+            equal = (
+                math.isnan(expected) and math.isnan(actual)
+            ) or (
+                math.isfinite(expected)
+                and math.isfinite(actual)
+                and math.isclose(actual, expected, rel_tol=1e-12, abs_tol=1e-12)
+            )
+            if not equal:
+                raise ValueError(
+                    f"{name} {field} 與 OOF 重算 metric 不一致："
+                    f"published={actual}, recomputed={expected}"
+                )
+            verified.loc[index, field] = expected
+    return verified
+
+
+def _independent_regression_metrics(
+    observed: np.ndarray,
+    predicted: np.ndarray,
+) -> dict[str, float]:
+    """以 raw vectors 計算 MAE、RMSE、R² 與 Spearman。"""
+    if (
+        observed.ndim != 1
+        or predicted.ndim != 1
+        or observed.size == 0
+        or observed.size != predicted.size
+        or not np.isfinite(observed).all()
+        or not np.isfinite(predicted).all()
+    ):
+        raise ValueError("fold OOF vectors 必須等長、非空且 finite")
+    residual = observed - predicted
+    observed_constant = bool(np.all(observed == observed[0]))
+    predicted_constant = bool(np.all(predicted == predicted[0]))
+    r2 = (
+        np.nan
+        if observed.size < 2 or observed_constant
+        else float(
+            1.0
+            - np.sum(residual**2)
+            / np.sum((observed - np.mean(observed)) ** 2)
+        )
+    )
+    spearman = (
+        np.nan
+        if observed.size < 2 or observed_constant or predicted_constant
+        else float(spearmanr(observed, predicted).statistic)
+    )
+    return {
+        "mae": float(np.mean(np.abs(residual))),
+        "rmse": float(np.sqrt(np.mean(residual**2))),
+        "r2": r2,
+        "spearman": spearman,
+    }
 
 
 def _validate_dummy_tables(
@@ -1540,6 +1811,9 @@ def _validate_formal_ranking(
     tables: Mapping[str, pd.DataFrame],
     failed: set[tuple[str, str]],
     split_membership: Mapping[str, set[str]],
+    *,
+    verified_metrics: pd.DataFrame,
+    verified_dummy_metrics: pd.DataFrame,
 ) -> None:
     """由 raw evidence 重算並逐欄驗證 ranking、gates 與 recommendation。"""
     comparison = tables["feature_set_comparison.csv"]
@@ -1591,13 +1865,13 @@ def _validate_formal_ranking(
         )
         for validation in _VALIDATIONS
     }
-    raw_metrics = tables["fold_metrics.csv"].copy()
+    raw_metrics = verified_metrics.copy()
     raw_metrics.attrs["round2_expected_splits"] = expected_splits
     recomputed = rank_round2_configurations(
         Round2Comparison(
             fold_metrics=raw_metrics,
             predictions=tables["oof_predictions.csv"].copy(),
-            dummy_metrics=tables["dummy_fold_metrics.csv"].copy(),
+            dummy_metrics=verified_dummy_metrics.copy(),
             dummy_predictions=tables["dummy_oof_predictions.csv"].copy(),
             hyperparameters=tables["hyperparameters.csv"].copy(),
             feature_importance=tables["feature_importance.csv"].copy(),
@@ -1651,7 +1925,7 @@ def _validate_smoke_tables(
     metadata: Mapping[str, Any],
     directory: Path,
 ) -> None:
-    """驗證 smoke subset schema、兩模型、status 與無 recommendation。"""
+    """驗證 smoke diagnostic split、fold、OOF 與 failure evidence 一致性。"""
     data = tables["data_snapshot.csv"]
     if data.empty or len(data) >= 693:
         raise ValueError("Smoke data_snapshot 必須是非空 subset")
@@ -1672,7 +1946,77 @@ def _validate_smoke_tables(
         raise ValueError("Smoke 必須只執行 paper_style_median")
     if set(metrics["source_round"].astype(str)) != {"round2_paper93"}:
         raise ValueError("Smoke source_round identity 不合法")
+    split_membership = _smoke_split_membership(
+        tables["outer_splits.csv"],
+        set(data["image_key"].astype(str)),
+    )
+    split_ids = set(split_membership)
+    smoke_configurations = {
+        "extra_trees__paper_style_median",
+        "random_forest__paper_style_median",
+    }
+    expected_metrics = {
+        (configuration, split_id)
+        for configuration in smoke_configurations
+        for split_id in split_ids
+    }
+    _validate_candidate_identities(metrics, "Smoke fold_metrics")
+    metric_ids = _identity_pairs(metrics)
+    if len(metrics) != 46 or len(metric_ids) != len(metrics) or metric_ids != expected_metrics:
+        raise ValueError("Smoke 必須精確包含兩組 Paper93 configurations × 23 splits")
+    statuses = set(metrics["status"].astype(str))
+    if not statuses.issubset({"ok", "failed"}):
+        raise ValueError("Smoke fold_metrics status 只能是 ok/failed")
+    failed = _identity_pairs(metrics[metrics["status"].astype(str).eq("failed")])
+
+    failures = tables["model_failures.csv"]
+    _require_columns(failures, _IDENTITY_COLUMNS, "Smoke model_failures")
+    if not failures.empty:
+        _validate_candidate_identities(failures, "Smoke model_failures")
+    failure_ids = _identity_pairs(failures)
+    if len(failure_ids) != len(failures) or failure_ids != failed:
+        raise ValueError("Smoke failed folds 必須與 model_failures 一對一對齊")
+
+    predictions = tables["oof_predictions.csv"]
+    _validate_candidate_identities(predictions, "Smoke OOF")
+    _validate_oof_coverage(
+        metrics,
+        predictions,
+        failed,
+        split_membership,
+        expected_total=576,
+    )
+    _validate_and_recompute_fold_metrics(metrics, predictions, "Smoke fold_metrics")
+
+    hyperparameters = tables["hyperparameters.csv"]
+    _validate_candidate_identities(hyperparameters, "Smoke hyperparameters")
+    hyper_ids = _identity_pairs(hyperparameters)
+    successful = expected_metrics - failed
+    if len(hyper_ids) != len(hyperparameters) or hyper_ids != successful:
+        raise ValueError("Smoke hyperparameters 必須逐一對應 successful folds")
+    _validate_feature_importance(metrics, tables["feature_importance.csv"], failed)
+
+    if not tables["dummy_fold_metrics.csv"].empty or not tables[
+        "dummy_oof_predictions.csv"
+    ].empty:
+        raise ValueError("Smoke Dummy artifacts 必須為空")
+    if not tables["feature_set_comparison.csv"].empty:
+        raise ValueError("Smoke feature-set comparison 必須為空")
     eligibility = tables["eligibility.csv"]
+    expected_eligibility = {
+        configuration: _CONFIGURATIONS[configuration]
+        for configuration in smoke_configurations
+    }
+    if len(eligibility) != 2 or set(
+        eligibility["configuration_id"].astype(str)
+    ) != smoke_configurations:
+        raise ValueError("Smoke eligibility 必須精確包含兩組 Paper93 identities")
+    for row in eligibility.itertuples(index=False):
+        expected = expected_eligibility[str(row.configuration_id)]
+        if (str(row.model), str(row.feature_set), str(row.source_round)) != expected:
+            raise ValueError("Smoke eligibility configuration identity 不合法")
+    if _boolean_series(eligibility["eligible"], "eligible").any():
+        raise ValueError("Smoke eligibility 不可標示 eligible")
     if _boolean_series(eligibility["recommended"], "recommended").any():
         raise ValueError("smoke 不可產生 recommendation")
     if "status" not in eligibility or set(eligibility["status"].astype(str)) != {"smoke"}:
@@ -1680,6 +2024,46 @@ def _validate_smoke_tables(
     record = (directory / "EXPERIMENT_RECORD.md").read_text(encoding="utf-8")
     if "僅驗證流程，不是正式實驗結果" not in record or "不形成 33 vs 93 科學結論" not in record:
         raise ValueError("Smoke record 必須明示無科學結論")
+
+
+def _smoke_split_membership(
+    frame: pd.DataFrame,
+    image_keys: set[str],
+) -> dict[str, set[str]]:
+    """驗證 23 個 diagnostic splits 與每-family 一次 test coverage。"""
+    _require_columns(frame, ("validation", "fold", "image_key", "role"), "Smoke splits")
+    working = frame.copy()
+    for column in ("validation", "fold", "image_key", "role"):
+        working[column] = working[column].astype(str)
+    if working.duplicated(["validation", "fold", "image_key"]).any():
+        raise ValueError("Smoke split membership 含 duplicate 或 train/test overlap")
+    identities = working.loc[:, ["validation", "fold"]].drop_duplicates()
+    counts = identities.groupby("validation").size().to_dict()
+    if counts != _FOLD_COUNTS or len(identities) != 23:
+        raise ValueError("Smoke diagnostic splits 必須精確包含四 families 的 3/3/9/8 folds")
+    membership: dict[str, set[str]] = {}
+    for row in identities.itertuples(index=False):
+        subset = working[
+            working["validation"].eq(row.validation)
+            & working["fold"].eq(row.fold)
+        ]
+        if len(subset) != len(image_keys) or set(subset["image_key"]) != image_keys:
+            raise ValueError("Smoke 每個 split 必須完整 partition data_snapshot")
+        if set(subset["role"]) != {"train", "test"}:
+            raise ValueError("Smoke split 必須同時含非空 train/test roles")
+        split_id = f"{row.validation}:{row.fold}"
+        membership[split_id] = set(
+            subset.loc[subset["role"].eq("test"), "image_key"]
+        )
+    for validation in _VALIDATIONS:
+        test_rows = working[
+            working["validation"].eq(validation)
+            & working["role"].eq("test")
+        ]
+        counts_by_image = test_rows["image_key"].value_counts()
+        if set(counts_by_image.index) != image_keys or not counts_by_image.eq(1).all():
+            raise ValueError("Smoke 每個 family 的每張 image 必須恰好 test 一次")
+    return membership
 
 
 def _boolean_series(series: pd.Series, name: str) -> pd.Series:
