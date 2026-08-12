@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -874,6 +875,314 @@ def test_round2_writer_publishes_exact_required_artifacts_atomically(
     }
 
 
+def test_round2_generation_rejects_same_target_owner_in_real_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """另一個 process 持有同 target generation 時，begin 必須立即失敗。"""
+    output = _allowed_output(tmp_path, monkeypatch)
+    generation = begin_round2_generation(output)
+    script = "\n".join(
+        (
+            "import sys",
+            "from pathlib import Path",
+            "import immunity.exp3.run_round2_paper93 as run_module",
+            "from immunity.exp3.round2_reporting import begin_round2_generation",
+            "run_module.ROUND2_OUTPUT_ROOT = Path(sys.argv[1]).resolve()",
+            "try:",
+            "    begin_round2_generation(Path(sys.argv[1]))",
+            "except RuntimeError as error:",
+            "    print(error)",
+            "    raise SystemExit(17)",
+            "raise SystemExit(0)",
+        )
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(output)],
+        cwd=Path.cwd(),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 17, completed.stderr
+    assert "active" in completed.stdout.casefold() or "使用中" in completed.stdout
+    (generation.staging_dir / "run.log").write_text("closed\n", encoding="utf-8")
+    quarantine_round2_generation(generation)
+
+
+def test_round2_generation_allows_formal_and_smoke_owners_independently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Formal 與 smoke 是不同 publication target，彼此不得互相阻塞。"""
+    output = _allowed_output(tmp_path, monkeypatch)
+    formal = begin_round2_generation(output)
+    smoke = begin_round2_generation(output / "smoke")
+
+    assert formal.output_dir == output
+    assert smoke.output_dir == output / "smoke"
+    for generation in (smoke, formal):
+        (generation.staging_dir / "run.log").write_text(
+            "closed\n", encoding="utf-8"
+        )
+        quarantine_round2_generation(generation)
+
+
+def test_round2_generation_recovers_from_stale_lock_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """殘留 lock marker 沒有 OS owner 時，不得永久阻止新 generation。"""
+    output = _allowed_output(tmp_path, monkeypatch)
+    generations = output / "_generations"
+    generations.mkdir(parents=True)
+    marker = generations / ".publication.lock"
+    marker.write_bytes(b"stale-marker-from-crashed-process\n")
+
+    generation = begin_round2_generation(output)
+
+    (generation.staging_dir / "run.log").write_text("closed\n", encoding="utf-8")
+    quarantine_round2_generation(generation)
+    assert marker.read_bytes() == b"stale-marker-from-crashed-process\n"
+
+
+def test_round2_generation_process_crash_releases_os_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Owner process 未執行 cleanup 就終止時，OS 必須自動釋放 publication lock。"""
+    output = _allowed_output(tmp_path, monkeypatch)
+    script = "\n".join(
+        (
+            "import os",
+            "import sys",
+            "from pathlib import Path",
+            "import immunity.exp3.run_round2_paper93 as run_module",
+            "from immunity.exp3.round2_reporting import begin_round2_generation",
+            "run_module.ROUND2_OUTPUT_ROOT = Path(sys.argv[1]).resolve()",
+            "begin_round2_generation(Path(sys.argv[1]))",
+            "os._exit(23)",
+        )
+    )
+    crashed = subprocess.run(
+        [sys.executable, "-c", script, str(output)],
+        cwd=Path.cwd(),
+        check=False,
+        timeout=30,
+    )
+    assert crashed.returncode == 23
+    assert (output / "_generations" / ".publication.lock").is_file()
+
+    generation = begin_round2_generation(output)
+
+    (generation.staging_dir / "run.log").write_text("closed\n", encoding="utf-8")
+    quarantine_round2_generation(generation)
+
+
+def test_round2_begin_base_exception_releases_acquired_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Begin 取得 OS lock 後中斷，也必須讓下一個 owner 立即接手。"""
+    output = _allowed_output(tmp_path, monkeypatch)
+    interruption = KeyboardInterrupt("synthetic begin interruption")
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            reporting_module,
+            "_generation_suffix",
+            lambda: (_ for _ in ()).throw(interruption),
+        )
+        with pytest.raises(KeyboardInterrupt) as caught:
+            begin_round2_generation(output)
+    assert caught.value is interruption
+    assert (output / "_generations" / ".publication.lock").is_file()
+
+    generation = begin_round2_generation(output)
+
+    (generation.staging_dir / "run.log").write_text("closed\n", encoding="utf-8")
+    quarantine_round2_generation(generation)
+
+
+def test_round2_forged_and_stale_generations_cannot_publish_or_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """只有 begin 回傳的 active object 可完成 lifecycle，copy 與已釋放物件皆拒絕。"""
+    output = _allowed_output(tmp_path, monkeypatch)
+    publishable = _write_bundle(
+        output,
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    forged_publish = replace(publishable)
+
+    with pytest.raises(ValueError, match="owner|ownership|active|持有|已釋放"):
+        publish_round2_generation(forged_publish)
+    publish_round2_generation(publishable)
+    with pytest.raises(ValueError, match="owner|ownership|active|持有|已釋放"):
+        publish_round2_generation(publishable)
+
+    quarantinable = begin_round2_generation(output / "smoke")
+    (quarantinable.staging_dir / "run.log").write_text(
+        "closed\n", encoding="utf-8"
+    )
+    forged_quarantine = replace(quarantinable)
+    with pytest.raises(ValueError, match="owner|ownership|active|持有|已釋放"):
+        quarantine_round2_generation(forged_quarantine)
+    quarantine_round2_generation(quarantinable)
+    with pytest.raises(ValueError, match="owner|ownership|active|持有|已釋放"):
+        quarantine_round2_generation(quarantinable)
+
+
+def test_round2_publish_validation_failure_releases_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Staging validation 在首次 move 前失敗，也不得遺留 target ownership。"""
+    output = _allowed_output(tmp_path, monkeypatch)
+    invalid = begin_round2_generation(output)
+    (invalid.staging_dir / "run.log").write_text("closed\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        publish_round2_generation(invalid)
+
+    next_generation = begin_round2_generation(output)
+    (next_generation.staging_dir / "run.log").write_text(
+        "closed\n", encoding="utf-8"
+    )
+    quarantine_round2_generation(next_generation)
+
+
+def test_round2_quarantine_base_exception_releases_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Quarantine 搬移前遭 BaseException 中斷，也不得遺留 target ownership。"""
+    output = _allowed_output(tmp_path, monkeypatch)
+    interrupted = begin_round2_generation(output)
+    (interrupted.staging_dir / "run.log").write_text("closed\n", encoding="utf-8")
+    interruption = KeyboardInterrupt("synthetic quarantine interruption")
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            reporting_module,
+            "_generation_suffix",
+            lambda: (_ for _ in ()).throw(interruption),
+        )
+        with pytest.raises(KeyboardInterrupt) as caught:
+            quarantine_round2_generation(interrupted)
+    assert caught.value is interruption
+
+    next_generation = begin_round2_generation(output)
+    (next_generation.staging_dir / "run.log").write_text(
+        "closed\n", encoding="utf-8"
+    )
+    quarantine_round2_generation(next_generation)
+
+
+@pytest.mark.parametrize("interruption_type", [RuntimeError, KeyboardInterrupt])
+def test_round2_post_publish_check_failure_rolls_back_before_releasing_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption_type: type[BaseException],
+) -> None:
+    """Post-publish check 失敗須在同一 ownership 內還原舊 root 並重拋原物件。"""
+    output = _allowed_output(tmp_path, monkeypatch)
+    first = _write_bundle(
+        output,
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    (first.staging_dir / "run.log").write_bytes(b"old generation\n")
+    publish_round2_generation(first)
+    second = _write_bundle(
+        output,
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    (second.staging_dir / "run.log").write_bytes(b"new generation\n")
+    old_root = {
+        path.name: path.read_bytes() for path in output.iterdir() if path.is_file()
+    }
+    staged = _snapshot_files(second.staging_dir)
+    interruption = interruption_type("synthetic post-publish interruption")
+    calls: list[tuple[Path, Path | None]] = []
+
+    def reject_published_root(root: Path, archive: Path | None) -> None:
+        calls.append((root, archive))
+        assert root == output
+        assert archive is not None
+        assert (root / "run.log").read_bytes() == b"new generation\n"
+        assert (archive / "run.log").read_bytes() == b"old generation\n"
+        raise interruption
+
+    with pytest.raises(interruption_type) as caught:
+        publish_round2_generation(second, post_publish_check=reject_published_root)
+
+    assert caught.value is interruption
+    assert len(calls) == 1
+    assert {
+        path.name: path.read_bytes() for path in output.iterdir() if path.is_file()
+    } == old_root
+    assert _snapshot_files(second.staging_dir) == staged
+    assert not list((output / "_generations").glob("archive-*"))
+
+    next_generation = begin_round2_generation(output)
+    (next_generation.staging_dir / "run.log").write_text(
+        "closed\n", encoding="utf-8"
+    )
+    quarantine_round2_generation(next_generation)
+
+
+def test_round2_post_publish_check_receives_matching_archive_exactly_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """成功 hook 僅執行一次，且收到本 transaction 建立的 matching archive。"""
+    output = _allowed_output(tmp_path, monkeypatch)
+    first = _write_bundle(
+        output,
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    (first.staging_dir / "run.log").write_bytes(b"old generation\n")
+    publish_round2_generation(first)
+    old_root = {
+        path.name: path.read_bytes() for path in output.iterdir() if path.is_file()
+    }
+    second = _write_bundle(
+        output,
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    (second.staging_dir / "run.log").write_bytes(b"new generation\n")
+    calls: list[tuple[Path, Path | None]] = []
+
+    def verify_transaction(root: Path, archive: Path | None) -> None:
+        calls.append((root, archive))
+        assert root == output
+        assert archive is not None
+        assert {
+            path.name: path.read_bytes()
+            for path in archive.iterdir()
+            if path.is_file()
+        } == old_root
+        assert (root / "run.log").read_bytes() == b"new generation\n"
+
+    publish_round2_generation(second, post_publish_check=verify_transaction)
+
+    assert len(calls) == 1
+    assert calls[0][1] is not None
+    assert calls[0][1].is_dir()
+
+
 def test_round2_validator_accepts_published_root_with_managed_generations_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -996,6 +1305,7 @@ def test_round2_published_root_rejects_reparse_generations_directory(
     )
     publish_round2_generation(generation)
     managed = generation.output_dir / "_generations"
+    (managed / ".publication.lock").unlink()
     managed.rmdir()
     outside = tmp_path / "outside-generations"
     outside.mkdir()

@@ -8,11 +8,11 @@ import math
 import os
 import stat
 import uuid
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import numpy as np
 import pandas as pd
@@ -89,6 +89,7 @@ _ROUND1_REQUIRED_ARTIFACTS = (
     "run_metadata.json",
 )
 _METRIC_COLUMNS = ("mae", "rmse", "r2", "spearman")
+_PUBLICATION_LOCK_NAME = ".publication.lock"
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,21 @@ class Round2Generation:
 
     output_dir: Path
     staging_dir: Path
+    _owner_token: str = field(repr=False, compare=False)
+
+
+@dataclass
+class _PublicationOwnership:
+    """保存單一 process 內 active generation 的 OS lock ownership。"""
+
+    generation: Round2Generation
+    output_dir: Path
+    staging_dir: Path
+    lock_handle: BinaryIO
+    released: bool = False
+
+
+_ACTIVE_PUBLICATIONS: dict[str, _PublicationOwnership] = {}
 
 
 def begin_round2_generation(output_dir: Path) -> Round2Generation:
@@ -123,31 +139,60 @@ def begin_round2_generation(output_dir: Path) -> Round2Generation:
     _assert_safe_child(target, generations)
     generations.mkdir(exist_ok=True)
     _assert_safe_directory(target, generations)
-    staging = generations / f"staging-{_generation_suffix()}"
-    _assert_safe_child(target, staging)
-    staging.mkdir()
-    _assert_safe_directory(target, staging)
-    return Round2Generation(output_dir=target, staging_dir=staging)
+    lock_path = generations / _PUBLICATION_LOCK_NAME
+    _assert_safe_child(target, lock_path)
+    lock_handle = _acquire_publication_lock(target, lock_path)
+    try:
+        staging = generations / f"staging-{_generation_suffix()}"
+        _assert_safe_child(target, staging)
+        staging.mkdir()
+        _assert_safe_directory(target, staging)
+        owner_token = uuid.uuid4().hex
+        generation = Round2Generation(
+            output_dir=target,
+            staging_dir=staging,
+            _owner_token=owner_token,
+        )
+        _ACTIVE_PUBLICATIONS[owner_token] = _PublicationOwnership(
+            generation=generation,
+            output_dir=target,
+            staging_dir=staging,
+            lock_handle=lock_handle,
+        )
+        return generation
+    except BaseException:
+        _close_publication_lock(lock_handle)
+        raise
 
 
-def publish_round2_generation(generation: Round2Generation) -> None:
+def publish_round2_generation(
+    generation: Round2Generation,
+    *,
+    post_publish_check: Callable[[Path, Path | None], None] | None = None,
+) -> None:
     """封存 target 內舊版 Round 2 檔案，並發布已驗證 staging。
 
     Args:
-        generation: ``begin_round2_generation`` 建立的 generation。
+        generation: ``begin_round2_generation`` 建立的 active generation。
+        post_publish_check: 可選的唯讀 transaction hook。Built-in published-root
+            validation 完成後、刪除 staging 與釋放 OS lock 前，精確呼叫一次並傳入
+            published root 與本次建立的 matching archive（沒有舊 bundle 時為
+            ``None``）。Hook 拋出任何 ``BaseException`` 都會觸發原有 rollback。
 
     Raises:
         ValueError: Boundary、bundle 或現有 destination 不符合固定合約。
         OSError: 檔案搬移失敗且已完成安全 rollback 時拋出。
     """
-    output, staging = _validate_generation(generation)
-    validate_round2_bundle(staging, smoke=output.name == "smoke")
-    existing_files = _preflight_published_root(output)
-
+    ownership = _require_generation_ownership(generation)
     archive: Path | None = None
     archived: list[str] = []
     published: list[str] = []
     try:
+        output, staging = _validate_generation(generation, ownership)
+        if post_publish_check is not None and not callable(post_publish_check):
+            raise TypeError("post_publish_check 必須是 callable 或 None")
+        validate_round2_bundle(staging, smoke=output.name == "smoke")
+        existing_files = _preflight_published_root(output)
         if existing_files:
             archive = output / "_generations" / f"archive-{_generation_suffix()}"
             _assert_safe_child(output, archive)
@@ -166,6 +211,8 @@ def publish_round2_generation(generation: Round2Generation) -> None:
             os.replace(source, destination)
             published.append(name)
         validate_round2_bundle(output, smoke=output.name == "smoke")
+        if post_publish_check is not None:
+            post_publish_check(output, archive)
         staging.rmdir()
     except BaseException:
         for name in reversed(published):
@@ -189,6 +236,8 @@ def publish_round2_generation(generation: Round2Generation) -> None:
             except BaseException:  # noqa: BLE001 - rollback 不可掩蓋原始中斷
                 pass
         raise
+    finally:
+        _release_publication_ownership(ownership)
 
 
 def _preflight_published_root(output: Path) -> list[Path]:
@@ -234,15 +283,19 @@ def quarantine_round2_generation(generation: Round2Generation) -> Path:
     Raises:
         ValueError: Generation 越界、已消失，或 ``run.log`` 不安全。
     """
-    output, staging = _validate_generation(generation)
-    _assert_regular_file(staging, staging / "run.log")
-    failed = output / "_generations" / f"failed-{_generation_suffix()}"
-    _assert_safe_child(output, failed)
-    if failed.exists() or failed.is_symlink():
-        raise FileExistsError(f"Quarantine destination 已存在：{failed}")
-    os.replace(staging, failed)
-    _assert_safe_directory(output, failed)
-    return failed
+    ownership = _require_generation_ownership(generation)
+    try:
+        output, staging = _validate_generation(generation, ownership)
+        _assert_regular_file(staging, staging / "run.log")
+        failed = output / "_generations" / f"failed-{_generation_suffix()}"
+        _assert_safe_child(output, failed)
+        if failed.exists() or failed.is_symlink():
+            raise FileExistsError(f"Quarantine destination 已存在：{failed}")
+        os.replace(staging, failed)
+        _assert_safe_directory(output, failed)
+        return failed
+    finally:
+        _release_publication_ownership(ownership)
 
 
 def write_round2_bundle(
@@ -521,12 +574,114 @@ def _resolve_allowed_output(candidate: Path) -> Path:
     raise ValueError("Round 2 generation 必須位於固定 formal root 或 smoke child")
 
 
-def _validate_generation(generation: Round2Generation) -> tuple[Path, Path]:
+def _acquire_publication_lock(output: Path, lock_path: Path) -> BinaryIO:
+    """以 OS-held nonblocking exclusive lock 取得 target publication ownership。
+
+    Lock file 只是位於 ``_generations`` 的穩定 inode；真正 ownership 由 OS file
+    lock 持有，因此 process crash 會自動釋放，殘留 marker 不會永久阻塞。
+
+    Args:
+        output: 已核准的 formal 或 smoke target。
+        lock_path: Target ``_generations`` 內的固定 lock file。
+
+    Returns:
+        持有 exclusive lock、必須由 lifecycle 終點關閉的 binary handle。
+
+    Raises:
+        RuntimeError: 同一 target 已有 active owner，或 OS 不支援所需 lock。
+        ValueError: Lock path 不是安全的 target regular file。
+    """
+    try:
+        handle = lock_path.open("a+b")
+    except OSError as error:
+        raise RuntimeError(f"無法開啟 Round 2 publication lock：{lock_path}") from error
+    try:
+        _assert_regular_file(output, lock_path)
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as error:
+                raise RuntimeError(
+                    f"Round 2 publication target 已有 active owner：{output}"
+                ) from error
+        elif os.name == "posix":
+            import fcntl
+
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError) as error:
+                raise RuntimeError(
+                    f"Round 2 publication target 已有 active owner：{output}"
+                ) from error
+        else:
+            raise RuntimeError(f"此平台不支援 Round 2 publication lock：{os.name}")
+        return handle
+    except BaseException:
+        handle.close()
+        raise
+
+
+def _close_publication_lock(handle: BinaryIO) -> None:
+    """釋放 OS lock 並關閉 handle；重複呼叫不產生副作用。"""
+    if handle.closed:
+        return
+    try:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        elif os.name == "posix":
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def _require_generation_ownership(
+    generation: Round2Generation,
+) -> _PublicationOwnership:
+    """取得 active ownership，拒絕 forged、copied 或已完成的 generation。"""
+    if not isinstance(generation, Round2Generation):
+        raise TypeError("generation 必須是 Round2Generation")
+    ownership = _ACTIVE_PUBLICATIONS.get(generation._owner_token)
+    if (
+        ownership is None
+        or ownership.released
+        or ownership.generation is not generation
+        or ownership.lock_handle.closed
+    ):
+        raise ValueError("Round 2 generation 沒有 active publication ownership")
+    return ownership
+
+
+def _release_publication_ownership(ownership: _PublicationOwnership) -> None:
+    """從 registry 移除 ownership，並精確一次釋放其 OS lock。"""
+    if ownership.released:
+        return
+    ownership.released = True
+    token = ownership.generation._owner_token
+    if _ACTIVE_PUBLICATIONS.get(token) is ownership:
+        del _ACTIVE_PUBLICATIONS[token]
+    _close_publication_lock(ownership.lock_handle)
+
+
+def _validate_generation(
+    generation: Round2Generation,
+    ownership: _PublicationOwnership | None = None,
+) -> tuple[Path, Path]:
     """驗證 generation identity 與 staging boundary。"""
     if not isinstance(generation, Round2Generation):
         raise TypeError("generation 必須是 Round2Generation")
+    active = ownership or _require_generation_ownership(generation)
     output = _resolve_allowed_output(generation.output_dir)
     staging = Path(generation.staging_dir)
+    if active.output_dir != output or active.staging_dir != staging:
+        raise ValueError("Round 2 generation ownership identity 不合法")
     if staging.parent != output / "_generations" or not staging.name.startswith("staging-"):
         raise ValueError("Round 2 staging identity 不合法")
     _assert_safe_directory(output, output)
