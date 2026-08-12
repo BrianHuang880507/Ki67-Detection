@@ -1249,6 +1249,245 @@ def test_round2_post_publish_check_receives_matching_archive_exactly_once(
     assert calls[0][1].is_dir()
 
 
+@pytest.mark.parametrize("interruption_type", [RuntimeError, KeyboardInterrupt])
+def test_round2_publish_failure_handler_quarantines_after_exact_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption_type: type[BaseException],
+) -> None:
+    """Failure handler 必須在還原舊 root 後隔離 staging，且不取代原始例外。"""
+    output = _allowed_output(tmp_path, monkeypatch)
+    first = _write_bundle(
+        output,
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    (first.staging_dir / "run.log").write_bytes(b"old generation\n")
+    publish_round2_generation(first)
+    old_root = {
+        path.name: path.read_bytes() for path in output.iterdir() if path.is_file()
+    }
+    second = _write_bundle(
+        output,
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    (second.staging_dir / "run.log").write_bytes(b"new generation\n")
+    staged = _snapshot_files(second.staging_dir)
+    interruption = interruption_type("synthetic post-publish failure")
+    calls: list[tuple[object, BaseException]] = []
+    quarantined: list[Path] = []
+
+    def reject_published_root(root: Path, archive: Path | None) -> None:
+        assert root == output
+        assert archive is not None
+        raise interruption
+
+    def quarantine_failure(candidate: object, error: BaseException) -> None:
+        calls.append((candidate, error))
+        assert candidate is second
+        assert error is interruption
+        assert {
+            path.name: path.read_bytes()
+            for path in output.iterdir()
+            if path.is_file()
+        } == old_root
+        assert not list((output / "_generations").glob("archive-*"))
+        assert _snapshot_files(second.staging_dir) == staged
+        with (second.staging_dir / "run.log").open(
+            "a", encoding="utf-8", newline="\n"
+        ) as handle:
+            handle.write(f"publish failure: {type(error).__name__}: {error}\n")
+        quarantined.append(quarantine_round2_generation(second))
+
+    with pytest.raises(interruption_type) as caught:
+        publish_round2_generation(
+            second,
+            post_publish_check=reject_published_root,
+            on_publish_failure=quarantine_failure,
+        )
+
+    assert caught.value is interruption
+    assert calls == [(second, interruption)]
+    assert len(quarantined) == 1
+    assert not second.staging_dir.exists()
+    assert "publish failure" in (quarantined[0] / "run.log").read_text(
+        encoding="utf-8"
+    )
+    assert {
+        path.name: path.read_bytes() for path in output.iterdir() if path.is_file()
+    } == old_root
+    assert not list((output / "_generations").glob("archive-*"))
+
+    next_generation = begin_round2_generation(output)
+    (next_generation.staging_dir / "run.log").write_text(
+        "closed\n", encoding="utf-8"
+    )
+    quarantine_round2_generation(next_generation)
+
+
+def test_round2_publish_failure_handler_keeps_os_lock_until_public_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure handler 執行期間同 target begin 仍須 fail-fast，之後可立即接手。"""
+    output = _allowed_output(tmp_path, monkeypatch)
+    invalid = begin_round2_generation(output)
+    (invalid.staging_dir / "run.log").write_text("invalid bundle\n", encoding="utf-8")
+    child_results: list[subprocess.CompletedProcess[str]] = []
+    failed: list[Path] = []
+    script = "\n".join(
+        (
+            "import sys",
+            "from pathlib import Path",
+            "import immunity.exp3.run_round2_paper93 as run_module",
+            "from immunity.exp3.round2_reporting import begin_round2_generation",
+            "run_module.ROUND2_OUTPUT_ROOT = Path(sys.argv[1]).resolve()",
+            "try:",
+            "    begin_round2_generation(Path(sys.argv[1]))",
+            "except RuntimeError:",
+            "    raise SystemExit(17)",
+            "raise SystemExit(0)",
+        )
+    )
+
+    def quarantine_failure(candidate: object, error: BaseException) -> None:
+        assert candidate is invalid
+        assert isinstance(error, ValueError)
+        child_results.append(
+            subprocess.run(
+                [sys.executable, "-c", script, str(output)],
+                cwd=Path.cwd(),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        )
+        with (invalid.staging_dir / "run.log").open(
+            "a", encoding="utf-8", newline="\n"
+        ) as handle:
+            handle.write(f"validation failure: {error}\n")
+        failed.append(quarantine_round2_generation(invalid))
+
+    with pytest.raises(ValueError) as caught:
+        publish_round2_generation(
+            invalid,
+            on_publish_failure=quarantine_failure,
+        )
+
+    assert child_results[0].returncode == 17, child_results[0].stderr
+    assert "validation failure" in (failed[0] / "run.log").read_text(
+        encoding="utf-8"
+    )
+    assert isinstance(caught.value, ValueError)
+    next_generation = begin_round2_generation(output)
+    (next_generation.staging_dir / "run.log").write_text(
+        "closed\n", encoding="utf-8"
+    )
+    quarantine_round2_generation(next_generation)
+
+
+@pytest.mark.parametrize("secondary_type", [RuntimeError, KeyboardInterrupt])
+def test_round2_publish_failure_handler_error_never_replaces_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    secondary_type: type[BaseException],
+) -> None:
+    """Failure handler 自己失敗時，仍須保留 restored staging 並重拋原物件。"""
+    output = _allowed_output(tmp_path, monkeypatch)
+    generation = _write_bundle(
+        output,
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    staged = _snapshot_files(generation.staging_dir)
+    original = SystemExit("original publish interruption")
+    secondary = secondary_type("secondary failure-handler interruption")
+    calls: list[BaseException] = []
+
+    def reject_published_root(root: Path, archive: Path | None) -> None:
+        raise original
+
+    def fail_during_cleanup(candidate: object, error: BaseException) -> None:
+        assert candidate is generation
+        calls.append(error)
+        raise secondary
+
+    with pytest.raises(SystemExit) as caught:
+        publish_round2_generation(
+            generation,
+            post_publish_check=reject_published_root,
+            on_publish_failure=fail_during_cleanup,
+        )
+
+    assert caught.value is original
+    assert calls == [original]
+    assert _snapshot_files(generation.staging_dir) == staged
+    assert not any(path.is_file() for path in output.iterdir())
+    next_generation = begin_round2_generation(output)
+    (next_generation.staging_dir / "run.log").write_text(
+        "closed\n", encoding="utf-8"
+    )
+    quarantine_round2_generation(next_generation)
+
+
+def test_round2_success_does_not_call_publish_failure_handler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """成功 publication 不得觸發 failure-only callback。"""
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    calls: list[tuple[object, BaseException]] = []
+
+    publish_round2_generation(
+        generation,
+        on_publish_failure=lambda candidate, error: calls.append(
+            (candidate, error)
+        ),
+    )
+
+    assert calls == []
+
+
+def test_round2_noncallable_publish_failure_handler_fails_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-callable handler 必須在 archive/publish mutation 前終止並釋放 lock。"""
+    output = _allowed_output(tmp_path, monkeypatch)
+    generation = _write_bundle(
+        output,
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    staged = _snapshot_files(generation.staging_dir)
+
+    with pytest.raises(TypeError, match="on_publish_failure.*callable"):
+        publish_round2_generation(
+            generation,
+            on_publish_failure=object(),  # type: ignore[arg-type]
+        )
+
+    assert _snapshot_files(generation.staging_dir) == staged
+    assert not any(path.is_file() for path in output.iterdir())
+    assert not list((output / "_generations").glob("archive-*"))
+    next_generation = begin_round2_generation(output)
+    (next_generation.staging_dir / "run.log").write_text(
+        "closed\n", encoding="utf-8"
+    )
+    quarantine_round2_generation(next_generation)
+
+
 def test_round2_validator_accepts_published_root_with_managed_generations_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -173,6 +173,9 @@ def publish_round2_generation(
     generation: Round2Generation,
     *,
     post_publish_check: Callable[[Path, Path | None], None] | None = None,
+    on_publish_failure: (
+        Callable[[Round2Generation, BaseException], None] | None
+    ) = None,
 ) -> None:
     """封存 target 內舊版 Round 2 檔案，並發布已驗證 staging。
 
@@ -182,6 +185,10 @@ def publish_round2_generation(
             validation 完成後、刪除 staging 與釋放 OS lock 前，精確呼叫一次並傳入
             published root 與本次建立的 matching archive（沒有舊 bundle 時為
             ``None``）。Hook 拋出任何 ``BaseException`` 都會觸發原有 rollback。
+        on_publish_failure: 可選的失敗 lifecycle hook。任何 publication
+            ``BaseException`` 完成 rollback 後、仍持有相同 OS lock 時精確呼叫一次；
+            可寫入 staging failure evidence 並呼叫
+            ``quarantine_round2_generation``。Hook 自身失敗不會取代原始例外。
 
     Raises:
         ValueError: Boundary、bundle 或現有 destination 不符合固定合約。
@@ -195,6 +202,8 @@ def publish_round2_generation(
         output, staging = _validate_generation(generation, ownership)
         if post_publish_check is not None and not callable(post_publish_check):
             raise TypeError("post_publish_check 必須是 callable 或 None")
+        if on_publish_failure is not None and not callable(on_publish_failure):
+            raise TypeError("on_publish_failure 必須是 callable 或 None")
         validate_round2_bundle(staging, smoke=output.name == "smoke")
         existing_files = _preflight_published_root(output)
         if existing_files:
@@ -218,7 +227,7 @@ def publish_round2_generation(
         if post_publish_check is not None:
             post_publish_check(output, archive)
         staging.rmdir()
-    except BaseException:
+    except BaseException as original_error:
         for name in reversed(published):
             try:
                 destination = output / name
@@ -238,6 +247,11 @@ def publish_round2_generation(
                 if archive.exists() and not any(archive.iterdir()):
                     archive.rmdir()
             except BaseException:  # noqa: BLE001 - rollback 不可掩蓋原始中斷
+                pass
+        if callable(on_publish_failure):
+            try:
+                on_publish_failure(generation, original_error)
+            except BaseException:  # noqa: BLE001 - cleanup 不可取代原始 publish error
                 pass
         raise
     finally:
