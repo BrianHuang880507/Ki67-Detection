@@ -19,7 +19,11 @@ import pytest
 import immunity.exp3.run_round2_paper93 as run_module
 from immunity.exp3.benchmark import make_outer_splits, outer_split_manifest
 import immunity.exp3.round2_reporting as reporting_module
-from immunity.exp3.feature_sets import PAPER_STYLE_FOV_FEATURES, PRIMARY_FOV_FEATURES
+from immunity.exp3.feature_sets import (
+    PAPER_STYLE_EXTRA_FEATURES,
+    PAPER_STYLE_FOV_FEATURES,
+    PRIMARY_FOV_FEATURES,
+)
 from immunity.exp3.round2_benchmark import (
     Round2Comparison,
     rank_round2_configurations,
@@ -416,7 +420,7 @@ def _formal_tables() -> dict[str, pd.DataFrame]:
                 "status": "passed",
             }
             for image_key in image_keys
-            for feature in PAPER_STYLE_FOV_FEATURES[33:]
+            for feature in PAPER_STYLE_EXTRA_FEATURES
         ]
     )
     feature_qc = pd.DataFrame(
@@ -1916,6 +1920,27 @@ def test_round2_validator_requires_formal_counts_and_identities(
     validate_round2_bundle(generation.staging_dir, smoke=False)
 
     assert len(pd.read_csv(generation.staging_dir / "fold_metrics.csv")) == 92
+
+
+def test_round2_validator_rejects_median_fov_name_substitution_in_valid_counts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """valid-count 必須保留產生端使用的 cell-level extra feature identity。"""
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    path = generation.staging_dir / "feature_valid_counts.csv"
+    valid_counts = pd.read_csv(path)
+    valid_counts["feature"] = valid_counts["feature"].map(lambda name: f"{name}__median")
+    valid_counts.to_csv(path, index=False)
+    _rehash(generation.staging_dir, path.name)
+
+    with pytest.raises(ValueError, match="feature valid-count.*60 extras"):
+        validate_round2_bundle(generation.staging_dir, smoke=False)
 
 
 def test_formal_validator_rehashes_round1_artifacts_at_derived_sibling_root(

@@ -20,7 +20,11 @@ import pandas as pd
 from scipy.stats import spearmanr
 
 from immunity.exp3.benchmark import make_outer_splits, outer_split_manifest
-from immunity.exp3.feature_sets import PAPER_STYLE_FOV_FEATURES, PRIMARY_FOV_FEATURES
+from immunity.exp3.feature_sets import (
+    PAPER_STYLE_EXTRA_FEATURES,
+    PAPER_STYLE_FOV_FEATURES,
+    PRIMARY_FOV_FEATURES,
+)
 from immunity.exp3.round2_benchmark import (
     Round2Comparison,
     rank_round2_configurations,
@@ -1549,7 +1553,7 @@ def _validate_published_valid_counts(
         "status",
     )
     _require_columns(frame, required, "feature_valid_counts")
-    extras = set(PAPER_STYLE_FOV_FEATURES) - set(PRIMARY_FOV_FEATURES)
+    extras = set(PAPER_STYLE_EXTRA_FEATURES)
     identities = list(
         frame.loc[:, ["image_key", "feature"]].astype(str).itertuples(
             index=False, name=None
