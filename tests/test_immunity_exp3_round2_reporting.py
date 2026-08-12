@@ -17,6 +17,7 @@ import pandas as pd
 import pytest
 
 import immunity.exp3.run_round2_paper93 as run_module
+from immunity.exp3.benchmark import make_outer_splits, outer_split_manifest
 import immunity.exp3.round2_reporting as reporting_module
 from immunity.exp3.feature_sets import PAPER_STYLE_FOV_FEATURES, PRIMARY_FOV_FEATURES
 from immunity.exp3.round2_benchmark import (
@@ -61,6 +62,9 @@ _JSON_NAMES = {
     "baseline_provenance.json",
     "run_metadata.json",
 }
+_FROZEN_ROSTER_SHA256 = (
+    "a8333f12e1591d9e4c4174f5c6fe13dd31550124b19aea3522f4d0f812e0e426"
+)
 _ROUND1_REQUIRED_ARTIFACTS = (
     "pairing_qc.csv",
     "data_manifest.csv",
@@ -137,12 +141,7 @@ def _allowed_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(
         reporting_module,
         "_load_round1_authority",
-        lambda root: {
-            "basic_images": pd.read_csv(
-                root / "feature_cache" / "image_level_basic.csv"
-            ),
-            "outer_splits": pd.read_csv(root / "outer_splits.csv"),
-        },
+        lambda root: _synthetic_round1_authority(root),
     )
     return output
 
@@ -154,12 +153,73 @@ def _authoritative_basic_images() -> pd.DataFrame:
         {
             "image_key": image_keys,
             "IDO_score": np.linspace(0.0, 1.0, 693),
+            "b_id": [f"B{index % 3 + 1}" for index in range(693)],
+            "passage": [index % 3 + 5 for index in range(693)],
+            "group_id": [f"G{index % 9 + 1}" for index in range(693)],
+            "condition_index": [index % 8 + 1 for index in range(693)],
             **{
                 feature: np.full(693, float(index))
                 for index, feature in enumerate(PRIMARY_FOV_FEATURES)
             },
         }
     )
+
+
+_SYNTHETIC_AUTHORITY_CACHE: dict[str, Any] | None = None
+
+
+def _synthetic_round1_authority(root: Path) -> dict[str, Any]:
+    """回傳不信任 bundle 的 synthetic Round 1 raw evidence fresh copies。"""
+    global _SYNTHETIC_AUTHORITY_CACHE
+    if _SYNTHETIC_AUTHORITY_CACHE is None:
+        tables = _formal_tables()
+        baseline = tables["fold_metrics.csv"][
+            tables["fold_metrics.csv"]["source_round"].eq("round1")
+        ]
+        baseline_oof = tables["oof_predictions.csv"][
+            tables["oof_predictions.csv"]["source_round"].eq("round1")
+        ]
+        baseline_hyper = tables["hyperparameters.csv"][
+            tables["hyperparameters.csv"]["source_round"].eq("round1")
+        ]
+        baseline_importance = tables["feature_importance.csv"][
+            tables["feature_importance.csv"]["source_round"].eq("round1")
+        ]
+        baseline_failures = tables["model_failures.csv"][
+            tables["model_failures.csv"]["source_round"].eq("round1")
+        ]
+
+        def raw(frame: pd.DataFrame) -> pd.DataFrame:
+            result = frame.drop(
+                columns=["source_round", "configuration_id"], errors="ignore"
+            ).reset_index(drop=True)
+            #模擬 authority CSV loader；此 synthetic fixture 的 fold 全為數字。
+            if "fold" in result:
+                result["fold"] = pd.to_numeric(result["fold"])
+            return result
+
+        _SYNTHETIC_AUTHORITY_CACHE = {
+            "basic_images": pd.read_csv(
+                root / "feature_cache" / "image_level_basic.csv"
+            ),
+            "outer_splits": pd.read_csv(root / "outer_splits.csv"),
+            "selected_metrics": pd.concat(
+                [raw(baseline), raw(tables["dummy_fold_metrics.csv"])],
+                ignore_index=True,
+            ),
+            "selected_predictions": pd.concat(
+                [raw(baseline_oof), raw(tables["dummy_oof_predictions.csv"])],
+                ignore_index=True,
+            ),
+            "selected_hyperparameters": raw(baseline_hyper),
+            "selected_importance": raw(baseline_importance),
+            "selected_failures": raw(baseline_failures),
+            "roster_sha256": _FROZEN_ROSTER_SHA256,
+        }
+    return {
+        name: value.copy(deep=True) if isinstance(value, pd.DataFrame) else value
+        for name, value in _SYNTHETIC_AUTHORITY_CACHE.items()
+    }
 
 
 def _authoritative_outer_splits() -> pd.DataFrame:
@@ -544,7 +604,7 @@ def _formal_json_payloads() -> dict[str, dict[str, Any]]:
             "round1_root": "D:/evidence/immunity/outputs/exp3",
             "read_only": True,
             "artifact_sha256": {"source.csv": "b" * 64},
-            "roster_sha256": "a" * 64,
+            "roster_sha256": _FROZEN_ROSTER_SHA256,
         },
         "run_metadata.json": _run_metadata_payload(smoke=False),
     }
@@ -581,14 +641,14 @@ def _run_metadata_payload(*, smoke: bool) -> dict[str, Any]:
             "round1": {
                 "dir": "immunity/outputs/exp3",
                 "artifact_sha256": {"source.csv": "b" * 64},
-                "roster_sha256": "a" * 64,
+                "roster_sha256": _FROZEN_ROSTER_SHA256,
             }
         },
         "effective_config": {
             "round1": {
                 "dir": "immunity/outputs/exp3",
                 "artifact_sha256": {"source.csv": "b" * 64},
-                "roster_sha256": "a" * 64,
+                "roster_sha256": _FROZEN_ROSTER_SHA256,
             }
         },
         "reproducibility": {
@@ -719,27 +779,33 @@ def _smoke_bundle_inputs() -> tuple[
         ].copy()
 
     score_by_key = tables["data_snapshot.csv"].set_index("image_key")["IDO_score"]
-    split_rows: list[dict[str, object]] = []
+    authority_subset = _authoritative_basic_images().loc[
+        lambda frame: frame["image_key"].isin(keep_keys)
+    ].copy()
+    canonical_manifest = outer_split_manifest(
+        authority_subset,
+        make_outer_splits(authority_subset),
+    )
+    split_rows = canonical_manifest.loc[
+        :, ["validation", "fold", "image_key", "role"]
+    ].to_dict("records")
     metric_rows: list[dict[str, object]] = []
     prediction_rows: list[dict[str, object]] = []
     hyperparameter_rows: list[dict[str, object]] = []
     paper_configurations = [row for row in _CONFIGURATIONS if row[2] == "paper_style_median"]
     for validation, fold_count in _VALIDATIONS:
-        buckets = np.array_split(np.asarray(keep_keys, dtype=object), fold_count)
-        for fold_index, bucket in enumerate(buckets, start=1):
-            fold = str(fold_index)
-            test_keys = bucket.tolist()
+        family = canonical_manifest.loc[
+            canonical_manifest["validation"].eq(validation)
+        ]
+        assert family["fold"].nunique() == fold_count
+        for fold_value in sorted(family["fold"].astype(str).unique()):
+            fold = str(fold_value)
+            test_keys = family.loc[
+                family["fold"].astype(str).eq(fold)
+                & family["role"].eq("test"),
+                "image_key",
+            ].astype(str).tolist()
             split_id = f"{validation}:{fold}"
-            test_set = set(test_keys)
-            split_rows.extend(
-                {
-                    "validation": validation,
-                    "fold": fold,
-                    "image_key": image_key,
-                    "role": "test" if image_key in test_set else "train",
-                }
-                for image_key in keep_keys
-            )
             observed = score_by_key.loc[test_keys].to_numpy(dtype=float)
             values = _expected_regression_metrics(observed, observed)
             for configuration_id, model, feature_set, source_round in paper_configurations:
@@ -1767,6 +1833,131 @@ def test_formal_validator_anchors_split_despite_internal_relabeling(
         validate_round2_bundle(generation.staging_dir, smoke=False)
 
 
+def test_formal_validator_rejects_coordinated_round1_baseline_forgery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Basic33 OOF、metrics 與 ranking 同步改寫仍須偏離 pinned Round 1 raw evidence。"""
+    tables = _formal_tables()
+    baseline = tables["oof_predictions.csv"]["source_round"].eq("round1")
+    tables["oof_predictions.csv"].loc[baseline, "predicted_ido_score"] += 0.25
+    _synchronize_metrics_from_oof(tables)
+    _refresh_ranking_tables(tables)
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        tables,
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+
+    with pytest.raises(ValueError, match="Round 1 baseline raw evidence|pinned baseline"):
+        validate_round2_bundle(generation.staging_dir, smoke=False)
+
+
+def test_smoke_validator_rejects_internally_consistent_noncanonical_partition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Smoke split 與下游 fold 一起重新標號仍須偏離 authority metadata。"""
+    tables, payloads, context = _smoke_bundle_inputs()
+    validation = "leave_one_b_out"
+    folds = sorted(
+        tables["outer_splits.csv"].loc[
+            tables["outer_splits.csv"]["validation"].eq(validation), "fold"
+        ].astype(str).unique()
+    )
+    first, second = folds[:2]
+    fold_map = {first: second, second: first}
+    split_map = {
+        f"{validation}:{first}": f"{validation}:{second}",
+        f"{validation}:{second}": f"{validation}:{first}",
+    }
+    for name in (
+        "outer_splits.csv",
+        "fold_metrics.csv",
+        "oof_predictions.csv",
+        "hyperparameters.csv",
+    ):
+        frame = tables[name].copy()
+        selected = frame["validation"].eq(validation)
+        values = frame.loc[selected, "fold"].astype(str)
+        frame.loc[selected, "fold"] = values.map(fold_map).fillna(values)
+        if "split_id" in frame:
+            split_ids = frame.loc[selected, "split_id"].astype(str)
+            frame.loc[selected, "split_id"] = split_ids.map(split_map).fillna(split_ids)
+        tables[name] = frame
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch) / "smoke",
+        tables,
+        payloads,
+        context,
+    )
+
+    with pytest.raises(ValueError, match="canonical diagnostic|authority.*split"):
+        validate_round2_bundle(generation.staging_dir, smoke=True)
+
+
+def test_round2_validator_rejects_coordinated_roster_repin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provenance 與兩份 config 同步 repin 仍不得偏離 frozen roster。"""
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    forged = "c" * 64
+    provenance_path = generation.staging_dir / "baseline_provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["roster_sha256"] = forged
+    provenance_path.write_text(
+        json.dumps(provenance, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    metadata_path = generation.staging_dir / "run_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    for config_name in ("original_config", "effective_config"):
+        metadata[config_name]["round1"]["roster_sha256"] = forged
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _rehash(generation.staging_dir, "baseline_provenance.json")
+    _rehash(generation.staging_dir, "run_metadata.json")
+
+    with pytest.raises(ValueError, match="frozen roster|roster.*authority"):
+        validate_round2_bundle(generation.staging_dir, smoke=False)
+
+
+def test_relative_round1_dir_is_resolved_from_fixed_project_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Standalone validator 從非 repo CWD 執行仍正確解析凍結相對 root。"""
+    generation = _write_bundle(
+        _allowed_output(tmp_path, monkeypatch),
+        _formal_tables(),
+        _formal_json_payloads(),
+        _formal_record_context(),
+    )
+    metadata_path = generation.staging_dir / "run_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    for config_name in ("original_config", "effective_config"):
+        metadata[config_name]["round1"]["dir"] = "immunity/outputs/exp3"
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _rehash(generation.staging_dir, "run_metadata.json")
+    elsewhere = tmp_path / "different-cwd"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    validate_round2_bundle(generation.staging_dir, smoke=False)
+
+
 def test_round2_validator_requires_11088_oof_when_all_model_folds_succeed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2252,10 +2443,15 @@ def test_smoke_validator_reconciles_diagnostic_evidence(
     tables, payloads, context = _smoke_bundle_inputs()
     if mutation == "split_missing_image":
         split = tables["outer_splits.csv"]
+        first_fold = str(
+            split.loc[
+                split["validation"].eq("leave_one_b_out"), "fold"
+            ].iloc[0]
+        )
         tables["outer_splits.csv"] = split.drop(
             split.loc[
                 split["validation"].eq("leave_one_b_out")
-                & split["fold"].astype(str).eq("1")
+                & split["fold"].astype(str).eq(first_fold)
             ].index[0]
         )
     elif mutation == "split_train_test_overlap":

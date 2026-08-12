@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 
+from immunity.exp3.benchmark import make_outer_splits, outer_split_manifest
 from immunity.exp3.feature_sets import PAPER_STYLE_FOV_FEATURES, PRIMARY_FOV_FEATURES
 from immunity.exp3.round2_benchmark import (
     Round2Comparison,
@@ -72,6 +73,9 @@ _CONFIGURATIONS = {
     ),
 }
 _ROUND2_MODELS = {"extra_trees", "random_forest"}
+_FROZEN_ROUND1_ROSTER_SHA256 = (
+    "a8333f12e1591d9e4c4174f5c6fe13dd31550124b19aea3522f4d0f812e0e426"
+)
 _ROUND1_REQUIRED_ARTIFACTS = (
     "pairing_qc.csv",
     "data_manifest.csv",
@@ -438,13 +442,19 @@ def validate_round2_bundle(directory: Path, *, smoke: bool) -> None:
         smoke=smoke,
     )
     if smoke:
-        _validate_smoke_tables(tables, metadata, bundle)
+        _validate_smoke_tables(
+            tables,
+            metadata,
+            bundle,
+            authority_basic_images=authority["basic_images"],
+        )
     else:
         _validate_formal_tables(
             tables,
             metadata,
             authority_split_manifest=authority["outer_splits"],
         )
+        _validate_authoritative_round1_baselines(tables, authority)
 
 
 def build_round2_experiment_record(context: Mapping[str, Any]) -> str:
@@ -987,7 +997,7 @@ def _validate_baseline_provenance(
     provenance: Mapping[str, Any],
     metadata: Mapping[str, Any],
     output: Path,
-) -> dict[str, pd.DataFrame]:
+) -> dict[str, Any]:
     """由核准 output 推導 Round 1 authority，重驗 bytes 並載入語意錨點。
 
     Args:
@@ -1032,10 +1042,13 @@ def _validate_baseline_provenance(
         and all(character in "0123456789abcdefABCDEF" for character in roster)
     ):
         raise ValueError("baseline provenance roster hash identity 不合法")
+    if roster.lower() != _FROZEN_ROUND1_ROSTER_SHA256:
+        raise ValueError("baseline provenance roster 必須等於 frozen roster authority")
     formal_output = output.parent if output.name == "smoke" else output
     authority_root = formal_output.parent.resolve(strict=True)
+    project_root = authority_root.parents[2]
     try:
-        declared_root = Path(root).resolve(strict=True)
+        declared_root = _resolve_round1_declaration(root, project_root)
     except OSError as error:
         raise ValueError("baseline provenance Round 1 root 不存在") from error
     if declared_root != authority_root:
@@ -1055,7 +1068,10 @@ def _validate_baseline_provenance(
         if not isinstance(configured_root, str) or not configured_root.strip():
             raise ValueError(f"baseline provenance {config_name} round1.dir 不合法")
         try:
-            resolved_config_root = Path(configured_root).resolve(strict=True)
+            resolved_config_root = _resolve_round1_declaration(
+                configured_root,
+                project_root,
+            )
         except OSError as error:
             raise ValueError(
                 f"baseline provenance {config_name} Round 1 root 不存在"
@@ -1077,12 +1093,33 @@ def _validate_baseline_provenance(
             )
         paths[relative] = path
     authority = _load_round1_authority(authority_root)
-    if set(authority) != {"basic_images", "outer_splits"}:
+    expected_authority_keys = {
+        "basic_images",
+        "outer_splits",
+        "selected_metrics",
+        "selected_predictions",
+        "selected_hyperparameters",
+        "selected_importance",
+        "selected_failures",
+        "roster_sha256",
+    }
+    if set(authority) != expected_authority_keys:
         raise ValueError("Round 1 authority loader contract 不合法")
+    if str(authority["roster_sha256"]).lower() != roster.lower():
+        raise ValueError("baseline provenance roster 偏離 Round 1 authority")
     return authority
 
 
-def _load_round1_authority(root: Path) -> dict[str, pd.DataFrame]:
+def _resolve_round1_declaration(value: str, project_root: Path) -> Path:
+    """將相對 Round 1 聲明固定解析於專案根，不依賴 process CWD。"""
+    declared = Path(value)
+    if declared.drive and not declared.is_absolute():
+        raise ValueError("Round 1 root 不可使用 drive-relative 路徑")
+    lexical = declared if declared.is_absolute() else project_root / declared
+    return lexical.resolve(strict=True)
+
+
+def _load_round1_authority(root: Path) -> dict[str, Any]:
     """以程式碼固定 pins 載入完整 Round 1 evidence，拒絕 bundle 自行 repin。"""
     from immunity.exp3 import round2_evidence as evidence_module
 
@@ -1116,7 +1153,124 @@ def _load_round1_authority(root: Path) -> dict[str, pd.DataFrame]:
     return {
         "basic_images": evidence.basic_images.copy(deep=True),
         "outer_splits": evidence.split_manifest.copy(deep=True),
+        "selected_metrics": evidence.selected_metrics.copy(deep=True),
+        "selected_predictions": evidence.selected_predictions.copy(deep=True),
+        "selected_hyperparameters": evidence.selected_hyperparameters.copy(deep=True),
+        "selected_importance": evidence.selected_importance.copy(deep=True),
+        "selected_failures": evidence.selected_failures.copy(deep=True),
+        "roster_sha256": evidence_module._FROZEN_ROSTER_HASH,
     }
+
+
+def _validate_authoritative_round1_baselines(
+    tables: Mapping[str, pd.DataFrame],
+    authority: Mapping[str, Any],
+) -> None:
+    """將正式 bundle 的 Basic33／Dummy raw evidence 對回 frozen Round 1。"""
+    models = {"extra_trees", "random_forest"}
+
+    def selected(frame: pd.DataFrame, names: set[str]) -> pd.DataFrame:
+        return frame.loc[frame["model"].astype(str).isin(names)].copy()
+
+    published_metrics = tables["fold_metrics.csv"].loc[
+        tables["fold_metrics.csv"]["source_round"].astype(str).eq("round1")
+    ]
+    published_predictions = tables["oof_predictions.csv"].loc[
+        tables["oof_predictions.csv"]["source_round"].astype(str).eq("round1")
+    ]
+    published_hyperparameters = tables["hyperparameters.csv"].loc[
+        tables["hyperparameters.csv"]["source_round"].astype(str).eq("round1")
+    ]
+    published_importance = tables["feature_importance.csv"].loc[
+        tables["feature_importance.csv"]["source_round"].astype(str).eq("round1")
+    ]
+    published_failures = tables["model_failures.csv"].loc[
+        tables["model_failures.csv"]["source_round"].astype(str).eq("round1")
+    ]
+    comparisons = (
+        (
+            published_metrics,
+            selected(authority["selected_metrics"], models),
+            "candidate metrics",
+        ),
+        (
+            tables["dummy_fold_metrics.csv"],
+            selected(authority["selected_metrics"], {"dummy_median"}),
+            "Dummy metrics",
+        ),
+        (
+            published_predictions,
+            selected(authority["selected_predictions"], models),
+            "candidate OOF",
+        ),
+        (
+            tables["dummy_oof_predictions.csv"],
+            selected(authority["selected_predictions"], {"dummy_median"}),
+            "Dummy OOF",
+        ),
+        (
+            published_hyperparameters,
+            selected(authority["selected_hyperparameters"], models),
+            "hyperparameters",
+        ),
+        (
+            published_importance,
+            selected(authority["selected_importance"], models),
+            "feature importance",
+        ),
+        (
+            published_failures,
+            selected(authority["selected_failures"], models),
+            "model failures",
+        ),
+    )
+    for published, expected, name in comparisons:
+        _compare_round1_raw_evidence(published, expected, name)
+
+
+def _compare_round1_raw_evidence(
+    published: pd.DataFrame,
+    expected: pd.DataFrame,
+    name: str,
+) -> None:
+    """以 authority 原始欄位與 stable identity order 比對 Round 1 evidence。"""
+    columns = list(expected.columns)
+    _require_columns(published, columns, f"Round 1 baseline {name}")
+    sort_columns = [
+        column
+        for column in (
+            "validation",
+            "fold",
+            "split_id",
+            "model",
+            "image_key",
+            "feature",
+        )
+        if column in columns
+    ]
+    actual = published.loc[:, columns].sort_values(
+        sort_columns,
+        kind="stable",
+        na_position="first",
+    ).reset_index(drop=True)
+    canonical = expected.loc[:, columns].sort_values(
+        sort_columns,
+        kind="stable",
+        na_position="first",
+    ).reset_index(drop=True)
+    try:
+        pd.testing.assert_frame_equal(
+            actual,
+            canonical,
+            check_dtype=False,
+            check_exact=False,
+            rtol=1e-12,
+            atol=1e-12,
+        )
+    except AssertionError as error:
+        raise ValueError(
+            f"Round 1 baseline raw evidence 偏離 pinned baseline（{name}）：{error}"
+        ) from error
 
 
 def _validate_authoritative_data_snapshot(
@@ -2079,6 +2233,8 @@ def _validate_smoke_tables(
     tables: Mapping[str, pd.DataFrame],
     metadata: Mapping[str, Any],
     directory: Path,
+    *,
+    authority_basic_images: pd.DataFrame,
 ) -> None:
     """驗證 smoke diagnostic split、fold、OOF 與 failure evidence 一致性。"""
     data = tables["data_snapshot.csv"]
@@ -2104,6 +2260,11 @@ def _validate_smoke_tables(
     split_membership = _smoke_split_membership(
         tables["outer_splits.csv"],
         set(data["image_key"].astype(str)),
+    )
+    _validate_canonical_smoke_splits(
+        tables["outer_splits.csv"],
+        data,
+        authority_basic_images,
     )
     split_ids = set(split_membership)
     smoke_configurations = {
@@ -2219,6 +2380,40 @@ def _smoke_split_membership(
         if set(counts_by_image.index) != image_keys or not counts_by_image.eq(1).all():
             raise ValueError("Smoke 每個 family 的每張 image 必須恰好 test 一次")
     return membership
+
+
+def _validate_canonical_smoke_splits(
+    published: pd.DataFrame,
+    data: pd.DataFrame,
+    authority: pd.DataFrame,
+) -> None:
+    """由權威 metadata 重建 smoke grouped splits 並逐 membership 比對。"""
+    image_keys = set(data["image_key"].astype(str))
+    authority_keys = authority["image_key"].astype(str)
+    subset = authority.loc[authority_keys.isin(image_keys)].copy()
+    if len(subset) != len(image_keys) or set(subset["image_key"].astype(str)) != image_keys:
+        raise ValueError("Smoke authority subset image identity 不完整")
+    canonical = outer_split_manifest(subset, make_outer_splits(subset))
+    columns = ["validation", "fold", "image_key", "role"]
+
+    def normalized(frame: pd.DataFrame) -> pd.DataFrame:
+        _require_columns(frame, columns, "Smoke canonical diagnostic splits")
+        result = frame.loc[:, columns].copy()
+        for column in columns:
+            result[column] = result[column].astype(str)
+        return result.sort_values(columns, kind="stable").reset_index(drop=True)
+
+    try:
+        pd.testing.assert_frame_equal(
+            normalized(published),
+            normalized(canonical),
+            check_dtype=False,
+            check_exact=True,
+        )
+    except AssertionError as error:
+        raise ValueError(
+            "Smoke canonical diagnostic splits 偏離 authority metadata"
+        ) from error
 
 
 def _boolean_series(series: pd.Series, name: str) -> pd.Series:
