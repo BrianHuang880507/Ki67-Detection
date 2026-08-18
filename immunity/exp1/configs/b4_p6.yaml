@@ -1,4 +1,4 @@
-experiment_name: b4_p6_morphology_to_ido_proxy_exp2
+experiment_name: b4_p6_morphology_to_ido_proxy
 
 dataset:
   input_dir: "data/input/B4  p6"
@@ -22,7 +22,7 @@ segmentation:
   min_area_floor: 30
 
 analysis:
-  output_dir: immunity/outputs/b4_p6
+  output_dir: immunity/exp1/outputs/b4_p6
   feature_source: cleaned_csv
   cleaned_csv: "data/output/results/B4  p6/B4  p6_cleaned.csv"
   min_cells_per_image: 3

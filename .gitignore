@@ -57,3 +57,15 @@ scripts/generate_ki67_prediction_plots.py
 
 資料集/
 *.zip
+
+# Agent planning workspace (specs and tickets — see docs/agents/issue-tracker.md)
+.scratch/
+
+# Agent tooling (Codex / Claude) — not part of the project source
+.codex/
+AGENTS.md
+CODEX_PLUGIN_SETUP.md
+
+# Internal planning / spec documents
+docs/
+immunity/EXPERIMENT_PLAN.md

@@ -1,9 +1,8 @@
-# Immunity Analysis：Exp2
+# Exp1：Immunity Analysis（封存）
+
+> 本資料夾是 2026-07-28 封存的第一版實驗。既有程式、設定、模型與報告均保留於此；新版實驗位於 `immunity/` 根目錄。
 
 > 本資料夾用於存放 MSC morphology 與 IDO 反應相關的分析、模型、測試及實驗文件。
-
-第一版程式、設定與既有結果已封存至 [`exp1/`](exp1/ARCHIVE.md)。
-本資料夾根目錄只放目前使用的新版實驗。
 
 ## 目前目標
 
@@ -30,8 +29,6 @@
 - 將每張影像內的 morphology 彙整為 median 與 IQR。
 - 比較 Dummy、dose-only、morphology-only、ElasticNet 及 dose＋morphology models。
 - 執行 condition-stratified repeated CV 與 leave-one-condition-out validation。
-- 計算七組預先定義的 condition-level ΔMorphology；不將不同條件的相同影像編號視為配對。
-- 輸出 ΔMorphology heatmap、top-feature boxplots 與 morphology PCA。
 - 計算三條描述性 IDO dose-response 曲線與 AUC，輸出圖表及中文報告。
 
 ## 執行
@@ -56,7 +53,7 @@ conda run --no-capture-output -n ki67dtc python main.py --data_folder "data/inpu
 ### 2. Immunity 模型與 AUC
 
 ```powershell
-conda run --no-capture-output -n ki67dtc python -m immunity.run_experiment --config immunity/configs/b4_p6.yaml
+conda run --no-capture-output -n ki67dtc python -m immunity.exp1.run_experiment --config immunity/exp1/configs/b4_p6.yaml
 ```
 
 這一步只讀取 cleaned CSV、挑選 morphology predictors、執行 repeated CV／LOCO，並由 out-of-fold IDO predictions 重建 dose-response curve 與 predicted AUC，不會再次執行 Cellpose。
@@ -73,7 +70,6 @@ conda run --no-capture-output -n ki67dtc python -m pytest -q
 
 ```text
 immunity/
-├── exp1/                     # 第一版程式、設定與既有輸出的完整封存
 ├── README.md
 ├── EXPERIMENT_PLAN.md
 ├── configs/
@@ -81,7 +77,6 @@ immunity/
 ├── outputs/                 # 執行後的模型、表格、圖及報告
 ├── __init__.py
 ├── build_dataset.py         # 影像配對、morphology、IDO target 與 AUC
-├── condition_morphology.py  # 七組條件差異、heatmap、boxplot 與 PCA
 ├── train_ido_proxy.py       # 模型、cross-validation 與圖表
 └── run_experiment.py        # 完整實驗入口與報告輸出
 ```
@@ -90,30 +85,21 @@ immunity/
 
 ## 主要輸出
 
-執行結果預設存於 `immunity/outputs/b4_p6/`：
+執行結果預設存於 `immunity/exp1/outputs/b4_p6/`：
 
 - `data_manifest.csv`：80 組 triplets 與刺激條件。
 - `cell_level_features.csv`：每顆通過 QC 細胞的 morphology 與 IDO_score。
 - `image_level_dataset.csv`：模型實際使用的一圖一列資料。
-- `morphology_condition_summary.csv`：八個刺激條件的 morphology 描述統計。
-- `morphology_delta_summary.csv`：七組 condition-level、非配對 ΔMorphology。
-- `morphology_pca_scores.csv`：只作探索性視覺化的影像 PCA 座標。
 - `dose_response_auc.csv`：三個描述性 IDO dose-response AUC。
 - `predicted_dose_response_auc_summary.csv`：由 OOF predictions 推導的 predicted AUC 與 observed AUC 誤差。
 - `cv_metrics_summary.csv`：模型 repeated CV 與 LOCO 指標。
 - `oof_predictions.csv`：每張影像的 out-of-fold prediction。
 - `feature_coefficients.csv`：Ridge／ElasticNet coefficients。
 - `models/`：以全部 B4 p6 影像 fit 的探索性模型。
-- `figures/`：預測、dose-response、ΔMorphology、boxplot 與 PCA 圖。
+- `figures/`：observed-vs-predicted 與 dose-response 圖。
 - `REPORT.md`：白話結果、證據邊界與限制。
 - `run.log`：完整執行紀錄。
 
 ## 實驗計畫
 
 完整方法、資料切分、評估指標與結果解讀限制，請見 [EXPERIMENT_PLAN.md](EXPERIMENT_PLAN.md)。
-
-## 重要限制
-
-目前沒有 Plate／Well／FOV 對應資料，因此 ΔMorphology 只比較各條件的
-影像分布，不是 paired difference，也不提供生物重複的推論統計。
-主要 machine-learning target 仍是連續的背景校正 `image_IDO_score`。

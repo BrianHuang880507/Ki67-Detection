@@ -15,6 +15,13 @@ from immunity.build_dataset import (
     morphology_feature_columns,
     parse_image_filename,
 )
+from immunity.condition_morphology import (
+    calculate_morphology_contrasts,
+    plot_morphology_delta_heatmap,
+    plot_morphology_pca,
+    plot_top_morphology_boxplots,
+    summarize_condition_morphology,
+)
 from immunity.train_ido_proxy import run_repeated_cross_validation
 
 
@@ -154,6 +161,130 @@ class ImmunityExperimentTest(unittest.TestCase):
         self.assertEqual(len(auc), 3)
         ifn_auc = auc.loc[auc["curve"].eq("IFN_response_AUC"), "auc_raw"].iloc[0]
         self.assertAlmostEqual(ifn_auc, 300.0)
+
+    def test_condition_morphology_summary_uses_condition_level_images(self) -> None:
+        images = pd.DataFrame(
+            [
+                {
+                    "condition": "IFN0_TNF0",
+                    "IFN_dose": 0.0,
+                    "TNF_dose": 0.0,
+                    "Area_cyto__median": 10.0,
+                },
+                {
+                    "condition": "IFN0_TNF0",
+                    "IFN_dose": 0.0,
+                    "TNF_dose": 0.0,
+                    "Area_cyto__median": 14.0,
+                },
+                {
+                    "condition": "IFN25_TNF0",
+                    "IFN_dose": 25.0,
+                    "TNF_dose": 0.0,
+                    "Area_cyto__median": 20.0,
+                },
+            ]
+        )
+
+        summary = summarize_condition_morphology(
+            images, ["Area_cyto__median"]
+        )
+
+        control = summary[
+            summary["condition"].eq("IFN0_TNF0")
+            & summary["feature"].eq("Area_cyto__median")
+        ].iloc[0]
+        self.assertEqual(control["n_images"], 2)
+        self.assertAlmostEqual(control["feature_median"], 12.0)
+        self.assertAlmostEqual(control["feature_iqr"], 2.0)
+
+    def test_morphology_contrasts_create_seven_unpaired_condition_differences(
+        self,
+    ) -> None:
+        conditions = [
+            (0, 0),
+            (25, 0),
+            (50, 0),
+            (100, 0),
+            (0, 25),
+            (0, 50),
+            (25, 25),
+            (25, 50),
+        ]
+        rows = []
+        for ifn, tnf in conditions:
+            for replicate in range(2):
+                rows.append(
+                    {
+                        "image_key": f"IFN{ifn}_TNF{tnf}_R{replicate}",
+                        "condition": f"IFN{ifn}_TNF{tnf}",
+                        "IFN_dose": float(ifn),
+                        "TNF_dose": float(tnf),
+                        "Area_cyto__median": float(ifn + tnf + replicate),
+                    }
+                )
+        images = pd.DataFrame(rows)
+
+        contrasts = calculate_morphology_contrasts(
+            images, ["Area_cyto__median"]
+        )
+
+        self.assertEqual(contrasts["contrast_id"].nunique(), 7)
+        delta = contrasts[
+            contrasts["contrast_id"].eq("IFN25_vs_0_at_TNF0")
+        ].iloc[0]
+        self.assertEqual(delta["comparison_type"], "condition_level_unpaired")
+        self.assertEqual(delta["control_condition"], "IFN0_TNF0")
+        self.assertEqual(delta["treated_condition"], "IFN25_TNF0")
+        self.assertEqual(delta["n_control_images"], 2)
+        self.assertEqual(delta["n_treated_images"], 2)
+        self.assertAlmostEqual(delta["delta_raw"], 25.0)
+
+    def test_morphology_exploration_plots_are_created(self) -> None:
+        conditions = [
+            (0, 0),
+            (25, 0),
+            (50, 0),
+            (100, 0),
+            (0, 25),
+            (0, 50),
+            (25, 25),
+            (25, 50),
+        ]
+        rows = []
+        for condition_index, (ifn, tnf) in enumerate(conditions):
+            for replicate in range(2):
+                rows.append(
+                    {
+                        "image_key": f"C{condition_index}_R{replicate}",
+                        "condition": f"IFN{ifn}_TNF{tnf}",
+                        "IFN_dose": float(ifn),
+                        "TNF_dose": float(tnf),
+                        "Area_cyto__median": float(
+                            condition_index + replicate
+                        ),
+                        "Solidity_nuc__iqr": float(
+                            condition_index * 0.2 - replicate * 0.1
+                        ),
+                    }
+                )
+        images = pd.DataFrame(rows)
+        features = ["Area_cyto__median", "Solidity_nuc__iqr"]
+        contrasts = calculate_morphology_contrasts(images, features)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            heatmap = root / "delta.png"
+            boxplots = root / "boxplots.png"
+            pca_plot = root / "pca.png"
+            plot_morphology_delta_heatmap(contrasts, heatmap)
+            plot_top_morphology_boxplots(images, contrasts, boxplots)
+            scores = plot_morphology_pca(images, features, pca_plot)
+
+            self.assertTrue(heatmap.is_file())
+            self.assertTrue(boxplots.is_file())
+            self.assertTrue(pca_plot.is_file())
+            self.assertEqual(len(scores), len(images))
 
     def test_oof_predicted_auc_matches_observed_when_predictions_are_exact(self) -> None:
         conditions = [

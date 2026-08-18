@@ -28,13 +28,6 @@ from .build_dataset import (
     load_cell_level_from_cleaned,
     resolve_project_path,
 )
-from .condition_morphology import (
-    calculate_morphology_contrasts,
-    plot_morphology_delta_heatmap,
-    plot_morphology_pca,
-    plot_top_morphology_boxplots,
-    summarize_condition_morphology,
-)
 from .train_ido_proxy import (
     fit_final_models,
     plot_dose_response,
@@ -118,7 +111,6 @@ def write_report(
     coefficient_summary: pd.DataFrame,
     dose_auc: pd.DataFrame,
     predicted_auc_summary: pd.DataFrame,
-    morphology_contrasts: pd.DataFrame,
 ) -> Path:
     """產生白話且不超出證據邊界的實驗結果報告。"""
     repeated = metrics_summary[
@@ -144,15 +136,6 @@ def write_report(
         predicted_auc_summary["validation"].eq("repeated_cv")
         & predicted_auc_summary["model"].eq("morphology_ridge")
     ]
-    top_differences = (
-        morphology_contrasts.assign(
-            absolute_scaled_delta=morphology_contrasts[
-                "delta_scaled_by_global_iqr"
-            ].abs()
-        )
-        .sort_values("absolute_scaled_delta", ascending=False)
-        .head(15)
-    )
     report = [
         "# B4 p6 Morphology → IDO Response 實驗結果",
         "",
@@ -235,20 +218,6 @@ def write_report(
         "",
         "模型仍以每張影像的 IDO_score 為訓練目標；此表是在完成 out-of-fold 預測後，才依劑量重建曲線並積分。因此 predicted AUC 是模型結果的下游摘要，不是用單一 B4 p6 AUC 反覆訓練。",
         "",
-        "## 探索性 Morphology 條件差異",
-        "",
-        _markdown_table(
-            top_differences,
-            [
-                "contrast_label",
-                "feature",
-                "delta_raw",
-                "delta_scaled_by_global_iqr",
-            ],
-        ),
-        "",
-        "差值是處理條件的影像中位數減去對照條件的影像中位數。由於目前沒有 Well／FOV 對應資訊，這是條件層級的非配對描述性比較；不能當成同一顆細胞、同一個 Well 的 paired difference，也不放入本次 regression predictors。",
-        "",
         "## 限制",
         "",
         "- 只有 B4 p6 一個 lot／passage，80 張視野是技術影像，不是 80 個獨立生物樣本。",
@@ -260,9 +229,6 @@ def write_report(
         "",
         "- `figures/observed_vs_predicted.png`：repeated-CV 的 out-of-fold 預測。",
         "- `figures/dose_response.png`：三條描述性 IDO dose-response 曲線。",
-        "- `figures/morphology_delta_heatmap.png`：七組預定 contrasts 的標準化形態差異。",
-        "- `figures/top_morphology_boxplots.png`：條件差異最大的 morphology predictors。",
-        "- `figures/morphology_pca_by_condition.png`：八個刺激條件的 morphology PCA 分布。",
     ]
     report_path = output_dir / "REPORT.md"
     report_path.write_text("\n".join(report) + "\n", encoding="utf-8")
@@ -335,37 +301,6 @@ def run_experiment(config: Mapping[str, Any]) -> Path:
         f"{len(morphology_columns)} morphology predictors"
     )
 
-    condition_morphology = summarize_condition_morphology(
-        images, morphology_columns
-    )
-    morphology_contrasts = calculate_morphology_contrasts(
-        images, morphology_columns
-    )
-    condition_morphology.to_csv(
-        output_dir / "morphology_condition_summary.csv", index=False
-    )
-    morphology_contrasts.to_csv(
-        output_dir / "morphology_delta_summary.csv", index=False
-    )
-    plot_morphology_delta_heatmap(
-        morphology_contrasts,
-        figures_dir / "morphology_delta_heatmap.png",
-    )
-    plot_top_morphology_boxplots(
-        images,
-        morphology_contrasts,
-        figures_dir / "top_morphology_boxplots.png",
-    )
-    morphology_pca_scores = plot_morphology_pca(
-        images,
-        morphology_columns,
-        figures_dir / "morphology_pca_by_condition.png",
-    )
-    morphology_pca_scores.to_csv(
-        output_dir / "morphology_pca_scores.csv", index=False
-    )
-    print("[OK] 七組 condition-level ΔMorphology 與探索性圖表完成")
-
     dose_summary, dose_auc = calculate_dose_response(images)
     dose_summary.to_csv(output_dir / "dose_response_summary.csv", index=False)
     dose_auc.to_csv(output_dir / "dose_response_auc.csv", index=False)
@@ -421,7 +356,6 @@ def run_experiment(config: Mapping[str, Any]) -> Path:
         coefficient_summary,
         dose_auc,
         predicted_auc_summary,
-        morphology_contrasts,
     )
     metadata = {
         "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -436,7 +370,6 @@ def run_experiment(config: Mapping[str, Any]) -> Path:
         "images": int(len(images)),
         "target": "image-level background-corrected IDO_score",
         "scope": "B4 p6 within-lot exploratory model",
-        "morphology_comparison": "7 condition-level unpaired descriptive contrasts",
     }
     (output_dir / "run_metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"

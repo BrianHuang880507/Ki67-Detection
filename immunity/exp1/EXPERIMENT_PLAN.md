@@ -1,4 +1,6 @@
-# Morphology 預測 IDO 反應實驗計畫
+# Exp1：Morphology 預測 IDO 反應實驗計畫（封存）
+
+> 這是 2026-07-28 封存的第一版計畫。歷史輸出已移至 `immunity/exp1/outputs/`。
 
 ## Material Passport
 
@@ -36,7 +38,7 @@
 - **語言**：Python 3.10–3.12
 - **主要套件**：Cellpose、NumPy、pandas、SciPy、scikit-image、scikit-learn、matplotlib
 - **工作目錄**：`D:/Project/Ki67-Detection`
-- **執行入口**：`conda run --no-capture-output -n ki67dtc python -m immunity.run_experiment --config immunity/configs/b4_p6.yaml`
+- **執行入口**：`conda run --no-capture-output -n ki67dtc python -m immunity.exp1.run_experiment --config immunity/exp1/configs/b4_p6.yaml`
 - **狀態**：入口、資料整理、模型、圖表、報告與測試已實作；B4 p6 完整實驗尚待執行
 
 ## 輸入資料
