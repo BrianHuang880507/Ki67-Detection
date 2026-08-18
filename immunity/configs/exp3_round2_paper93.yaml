@@ -1,0 +1,59 @@
+experiment_name: exp3_round2_phase_only_paper93
+
+round1:
+  dir: immunity/outputs/exp3
+  expected:
+    raw_pc: 720
+    raw_ido: 719
+    paired: 719
+    exclusions: 26
+    analyzed_images: 693
+    valid_cells: 23976
+    outer_folds: 23
+    seed: 20260804
+    manifest_hash: b4508aaf830f4c456759d1f02458606aa28ed385856575c6fb99a5ac2e163771
+    config_hash: b7590ed3438cdb5062b2588e525e603dd0b7610d397322c761facdaea5b54bc0
+  roster_sha256: a8333f12e1591d9e4c4174f5c6fe13dd31550124b19aea3522f4d0f812e0e426
+  artifact_sha256:
+    pairing_qc.csv: 0fa953eceb35678aab0209214eb1ee267e844a0b81e649b0c0acca487246e0eb
+    data_manifest.csv: b4508aaf830f4c456759d1f02458606aa28ed385856575c6fb99a5ac2e163771
+    segmentation_qc.csv: 2a1e8969fc8d0a81d3dd737ef99df57f58ce3e1faf0206e833463f2dc9d28c1e
+    outer_splits.csv: c7e9e26a9ad0c6f73d8f14c5fa4c73747f6e58865aac963bf8e16e527fa05a3e
+    feature_cache/image_level_basic.csv: dad479258d08846d05a43f551b0001a52d96fa5e2e8ea6a98645723931aa0d14
+    feature_cache/cell_level_basic.csv: 7d999a728d848ccb61a3910cb5230c9efde6d7e1fa14f22de792990ee4ad7850
+    fold_metrics.csv: 8ce0df3866822a54c98cb1cd95dbec3c3a8ffa130af54890692b240250091884
+    oof_predictions.csv: 637242dc0f45c4dc436643214c21ac451fc560d7ae36b25a6db04aafe5d6a2c8
+    model_ranking.csv: d279ae973d5ab7508e97460bb1b6f94dd95345ce27d4cca0ad2f587516cb72e4
+    hyperparameters.csv: 5da9c936b573126d21417752d0fd140306562ed387b299364a5cd356268bfe00
+    feature_importance.csv: 17cf4bafdb1d7b87654d7efd58ef79584f1324c40abac3cb7bdfc617a510b9f6
+    model_failures.csv: b1ce311d21be365f1e5a010d9eb16aaea997e5d843e5b630aef77c91b52d98ea
+    feature_sets.json: 49e65affebbab6285170e45048eee3991bfc70e1a53454d7e6bbc94a092e28cd
+    run_metadata.json: d0cdfabea5f9243eeadf7eb2278019f9497a75c3e82ba129b4077e1f62566b9f
+
+models: [extra_trees, random_forest]
+
+features:
+  feature_set: paper_style_median
+  predictor_count: 93
+  extra_count: 60
+  min_finite_cells_per_feature: 3
+  numeric_atol: 1.0e-12
+
+benchmark:
+  seed: 20260804
+  inner_splits: 5
+  max_hyperparameter_candidates: 24
+  n_jobs: 1
+  permutation_repeats: 20
+  tree_estimators: 400
+  simplicity_order:
+    [paper_linear_3f, ridge, elasticnet, rbf_svr, hist_gradient_boosting, random_forest, extra_trees]
+
+smoke:
+  fovs_per_condition: 1
+  max_hyperparameter_candidates: 1
+  permutation_repeats: 2
+  tree_estimators: 10
+
+output:
+  dir: immunity/outputs/exp3/round2_paper93

@@ -1,0 +1,184 @@
+# Exp4 唯讀重用 Exp3 inputs，並以 expected 區塊鎖定 snapshot invariants。
+source_root: 'D:\Project\Ki67-Detection\.worktrees\exp3-multimodel-benchmark'
+manifest_path: immunity/outputs/exp3/data_manifest.csv
+cell_level_path: immunity/outputs/exp3/feature_cache/cell_level_basic.csv
+masks_dir: immunity/outputs/exp3/feature_cache/masks
+metadata_path: immunity/outputs/exp4/run_metadata.json
+cell_dedup_report_path: immunity/outputs/exp4/cell_dedup_report.csv
+border_exclusion_report_path: immunity/outputs/exp4/border_exclusion_report.csv
+fov_ido_scores_path: immunity/outputs/exp4/fov_ido_scores.csv
+group_targets_path: immunity/outputs/exp4/group_targets.csv
+group_target_sensitivity_path: immunity/outputs/exp4/group_target_sensitivity.csv
+report_path: immunity/outputs/exp4/REPORT.md
+cell_level_rui49_path: immunity/outputs/exp4/cell_level_rui49.csv
+feature_health_report_path: immunity/outputs/exp4/feature_health_report.csv
+run_log_path: immunity/outputs/exp4/run.log
+rui49_checkpoint_dir: immunity/outputs/exp4/.rui49_checkpoints
+# E2 僅接受既有 precomputed DAPI nucleus label cache；目前沒有可用的 693-FOV cache。
+dapi_label_masks_dir: null
+nucleus_dapi_validation_path: immunity/outputs/exp4/nucleus_dapi_validation.csv
+nucleus_dapi_validation_summary_path: immunity/outputs/exp4/nucleus_dapi_validation_summary.csv
+nucleus_sanity_report_path: immunity/outputs/exp4/nucleus_sanity_report.csv
+# CV/去冗餘由後續 analysis stage 寫入；各檔案均位於同一個 Exp4 output root。
+feature_redundancy_report_path: immunity/outputs/exp4/feature_redundancy_report.csv
+leakage_preflight_report_path: immunity/outputs/exp4/leakage_preflight_report.csv
+cv_metrics_path: immunity/outputs/exp4/cv_metrics.csv
+oof_predictions_path: immunity/outputs/exp4/oof_predictions.csv
+hyperparameters_path: immunity/outputs/exp4/hyperparameters.csv
+hyperparameter_grids_path: immunity/outputs/exp4/hyperparameter_grids.json
+feature_importance_path: immunity/outputs/exp4/feature_importance.csv
+per_group_residuals_path: immunity/outputs/exp4/per_group_residuals.csv
+cv_checkpoint_dir: immunity/outputs/exp4/.cv_checkpoints
+# Post-CV diagnostics are published as a separate, restricted transaction.
+shrinkage_analysis_path: immunity/outputs/exp4/shrinkage_analysis.csv
+orientation_target_marginal_path: immunity/outputs/exp4/orientation_target_marginal.csv
+umap_embeddings_path: immunity/outputs/exp4/umap_embeddings.csv
+kmeans_cluster_features_path: immunity/outputs/exp4/kmeans_cluster_features.csv
+umap_by_donor_path: immunity/outputs/exp4/figures/umap_by_donor.png
+umap_by_passage_path: immunity/outputs/exp4/figures/umap_by_passage.png
+umap_by_condition_path: immunity/outputs/exp4/figures/umap_by_condition.png
+expected_cv_artifact_sha256:
+  cv_metrics.csv: 8F62750F921148CDA7DC033DBF1AAFCB2C7F9B001B49422A3C45607321BE1A80
+  oof_predictions.csv: 69947B3BA3D5DA5B5E7E58648DB58BC21849B5CF9AB602269519DAAE9FDDEB2A
+  per_group_residuals.csv: 218F34BF2C12D0B9DC42036EBC990DC0358D2967E9FEB320996BD9F907ED97BF
+  feature_importance.csv: 9CE2B32432364BB081B5579CD678F7BD2A3033724177BCAD87E4F262D3487CAC
+  hyperparameters.csv: 48A1CBCBAAC0268960409D254A637683D704382B69BDAF90C5B896EAEE8FDBB2
+  hyperparameter_grids.json: 6AAE6283C5976D05AD89B4D12DCDE0E7080E53F3C0C83F0086BCE1A57C37E0AC
+  feature_health_report.csv: 969BCD073846C635D665D6BF38A78BC2EA5D63531085BC46887C1B27B572FC5B
+  nucleus_sanity_report.csv: 08EEBF7F65A9D3C67FEEAC821AF74396AA2DEF465651C310A92070617658B765
+  feature_redundancy_report.csv: 2534DECDA02FC123BA75BD109F683AA44D1A31A4426D7A53BC25A6C5BC94D1C4
+  leakage_preflight_report.csv: 241D39A8135D4EA08DE076A327AD46033A2A14A495230D4BC2E8CA6DCB905951
+cv_n_jobs: 6
+importance_repeats: 3
+ido_background_qc:
+  summary:
+    pilot_80_fov: '3 distinct normalized values: 8/255, 9/255, 10/255; counts 2/33/45; 78/80=97.5% in 9-10'
+    full_693: '11 distinct raw-gray values: 7-17; counts 7:2, 8:152, 9:155, 10:110, 11:35, 12:8, 13:54, 14:133, 15:33, 16:9, 17:2'
+  source:
+    pilot_80_fov: 'D:\Project\Ki67-Detection\immunity\outputs\b4_p6\cell_level_features.csv'
+    full_693: 'immunity/outputs/exp3/segmentation_qc.csv'
+  metric:
+    pilot_80_fov: 'IDO_background_median (normalized [0,1])'
+    full_693: 'extraction_background_median (raw gray)'
+
+expected:
+  manifest_image_key_count: 693
+  cell_row_count: 23976
+  cell_image_key_count: 693
+  dedup_cell_count: 23012
+  post_border_cell_count: 19648
+  duplicate_key_count: 938
+  retained_raw_pair_rows: 20440
+  sparse_fov_count: 10
+  sparse_fov_keys:
+    - B4_P7_C08_F06
+    - B7_P7_C07_F03
+    - B7_P7_C07_F06
+    - B8_P5_C07_F03
+    - B8_P5_C08_F02
+    - B8_P7_C01_F02
+    - B8_P7_C01_F03
+    - B8_P7_C03_F01
+    - B8_P7_C07_F04
+    - B8_P7_C07_F08
+  group_count: 9
+  group_keys:
+    - B4_P5
+    - B4_P6
+    - B4_P7
+    - B7_P5
+    - B7_P6
+    - B7_P7
+    - B8_P5
+    - B8_P6
+    - B8_P7
+
+# Phase 2 mapping is post-CV only.  It is deliberately separate from the
+# existing condition_mapping used by Phase 1 and is never read by the
+# mapping-free population/CV seams.
+condition_mapping_reversed_hypothesis:
+  1:
+    condition: IFN100_TNF0
+    ifn_dose: 100
+    tnf_dose: 0
+  2:
+    condition: IFN50_TNF0
+    ifn_dose: 50
+    tnf_dose: 0
+  3:
+    condition: IFN25_TNF0
+    ifn_dose: 25
+    tnf_dose: 0
+  4:
+    condition: IFN0_TNF0
+    ifn_dose: 0
+    tnf_dose: 0
+  5:
+    condition: IFN0_TNF25
+    ifn_dose: 0
+    tnf_dose: 25
+  6:
+    condition: IFN0_TNF50
+    ifn_dose: 0
+    tnf_dose: 50
+  7:
+    condition: IFN25_TNF25
+    ifn_dose: 25
+    tnf_dose: 25
+  8:
+    condition: IFN25_TNF50
+    ifn_dose: 25
+    tnf_dose: 50
+
+phase1_output_root: immunity/outputs/exp4
+phase1_checkpoint_sha256: 0F8658ABDFB7A6438BD017B6C9F0375D8A42EEFA0EB2247305D716BF840D9A7C
+phase1_checkpoint_manifest_sha256: FE1CC7203417D7747E3D911CB29B127C155D9A617D771D1792DCA3D5DDF3EF06
+phase1_checkpoint_npz_count: 120
+phase1_mask_cache_fingerprint: 1def2f97dcad23315c40d083a2acb2a09a3fe12f1d813c79de260314995d848e
+
+phase2_group_targets_path: immunity/outputs/exp4/phase2_group_targets.csv
+phase2_leakage_preflight_report_path: immunity/outputs/exp4/phase2_leakage_preflight_report.csv
+phase2_cv_metrics_path: immunity/outputs/exp4/phase2_cv_metrics.csv
+phase2_oof_predictions_path: immunity/outputs/exp4/phase2_oof_predictions.csv
+phase2_hyperparameters_path: immunity/outputs/exp4/phase2_hyperparameters.csv
+phase2_hyperparameter_grids_path: immunity/outputs/exp4/phase2_hyperparameter_grids.json
+phase2_feature_importance_path: immunity/outputs/exp4/phase2_feature_importance.csv
+phase2_per_group_residuals_path: immunity/outputs/exp4/phase2_per_group_residuals.csv
+phase2_shrinkage_analysis_path: immunity/outputs/exp4/phase2_shrinkage_analysis.csv
+dose_response_check_path: immunity/outputs/exp4/dose_response_check.csv
+residual_vs_dose_path: immunity/outputs/exp4/residual_vs_dose.csv
+metrics_within_condition_path: immunity/outputs/exp4/metrics_within_condition.csv
+phase1_vs_phase2_comparison_path: immunity/outputs/exp4/phase1_vs_phase2_comparison.csv
+phase2_figure_phase1_vs_phase2_r2_path: immunity/outputs/exp4/figures/phase1_vs_phase2_r2.png
+phase2_figure_within_condition_r2_path: immunity/outputs/exp4/figures/phase2_within_condition_r2.png
+phase2_figure_dose_response_path: immunity/outputs/exp4/figures/phase2_dose_response.png
+phase2_run_metadata_path: immunity/outputs/exp4/phase2_run_metadata.json
+phase2_run_log_path: immunity/outputs/exp4/phase2_run.log
+phase2_cv_checkpoint_dir: immunity/outputs/exp4/.phase2_cv_checkpoints
+
+phase1_protected_artifact_sha256:
+  border_exclusion_report.csv: 9EBE3315C4FFC1508A66060AFAEE3AC861AEAF30CE4103F4EB3B941532DEF4BF
+  cell_dedup_report.csv: 3FF03E66FACA2DF2CD3BA7CAA33B60F7924F9AD328E87219EC47459F0F87F209
+  cell_level_rui49.csv: 5C6197CC002D406DAAA0B4DDF60824D1F37FC0411F8E11F765DF8DB186E25966
+  cv_metrics.csv: 8F62750F921148CDA7DC033DBF1AAFCB2C7F9B001B49422A3C45607321BE1A80
+  environment_packages.json: 15961851247508492CA0F538A61975565F37B29836294F0984ACBF5C4AB39B93
+  feature_health_report.csv: 969BCD073846C635D665D6BF38A78BC2EA5D63531085BC46887C1B27B572FC5B
+  feature_importance.csv: 9CE2B32432364BB081B5579CD678F7BD2A3033724177BCAD87E4F262D3487CAC
+  feature_redundancy_report.csv: 2534DECDA02FC123BA75BD109F683AA44D1A31A4426D7A53BC25A6C5BC94D1C4
+  feature_smoke_report.json: ED11A579F4EEC2BE9DC9FDD444293F236A7924D21A84828878975341616FE6B9
+  figures/umap_by_condition.png: 6518FD7F4BDF65B106478D6F956B70EE45AD5948967FB32F808E3616FF6622C9
+  figures/umap_by_donor.png: 8D06BFACF4E3A206D2554B0D528B1FAE51B672347BCCBEB812C7E7D54745CD2E
+  figures/umap_by_passage.png: F06F677FD217C99CB8D5A6F8B3286BF03681B0A939DD57C26542B2F3A2BEA03A
+  fov_ido_scores.csv: 7E71BDBBE7C1F2492852A39F57C104DEAF26A2302B7024ECD3090D32FBB1168C
+  group_target_sensitivity.csv: E943D7DC3D2D3D6F8FE3E2A91BDD0B8E5B02A3B92073D70FC59503E10C1C166F
+  group_targets.csv: E0C3223E5E79D00945C86670A623B1F5E2824E84C7AB4577147C496F0E36810D
+  hyperparameter_grids.json: 6AAE6283C5976D05AD89B4D12DCDE0E7080E53F3C0C83F0086BCE1A57C37E0AC
+  hyperparameters.csv: 48A1CBCBAAC0268960409D254A637683D704382B69BDAF90C5B896EAEE8FDBB2
+  kmeans_cluster_features.csv: 86079167A4EEFF74BB2D9516C266643A162F6F74DC3F76884F4C15674F75F84A
+  leakage_preflight_report.csv: 241D39A8135D4EA08DE076A327AD46033A2A14A495230D4BC2E8CA6DCB905951
+  nucleus_sanity_report.csv: 08EEBF7F65A9D3C67FEEAC821AF74396AA2DEF465651C310A92070617658B765
+  oof_predictions.csv: 69947B3BA3D5DA5B5E7E58648DB58BC21849B5CF9AB602269519DAAE9FDDEB2A
+  orientation_target_marginal.csv: ECAB0AE3C67B38D30F6DD54124153C8322F6E58DB30EAA2192BB043B0939C3DC
+  per_group_residuals.csv: 218F34BF2C12D0B9DC42036EBC990DC0358D2967E9FEB320996BD9F907ED97BF
+  shrinkage_analysis.csv: A1A5D1BCEFF9419DB3FD31EF980768958FEE36E8FFF79C084B2AEFE5BC9A3FFC
+  umap_embeddings.csv: 5FD3D8FF9C4E471F3AA072CBE8D2F5CDD203B872FA842F8C65BAD4119F7E73BA

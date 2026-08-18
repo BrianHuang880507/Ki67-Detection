@@ -1,0 +1,1204 @@
+"""以凍結 roster 擷取隔離的 Exp3 Round 2 Paper-style 93 特徵。"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+from immunity.exp3.feature_sets import (
+    BASIC_GEOMETRY,
+    PAPER_STYLE_EXTRA_FEATURES,
+    PAPER_STYLE_FOV_FEATURES,
+    PRIMARY_CELL_FEATURES,
+    PRIMARY_FOV_FEATURES,
+    validate_phase_predictors,
+)
+from immunity.exp3.phase_features import (
+    _geometry_values,
+    _read_grayscale_image,
+    load_cached_masks,
+    paper_style_extras,
+)
+from immunity.exp3.round2_evidence import Round1Evidence, validate_frozen_masks
+
+
+ROSTER_COLUMNS = ("image_key", "cell_label", "nucleus_label")
+VALID_COUNT_COLUMNS = [
+    "image_key",
+    "feature",
+    "roster_cell_count",
+    "finite_cell_count",
+    "required_minimum",
+    "status",
+]
+EXTRACTION_QC_COLUMNS = [
+    "image_key",
+    "pc_path",
+    "mask_path",
+    "aggregation_unit",
+    "roster_pair_count",
+    "extracted_pair_count",
+    "unique_cell_count",
+    "unique_nucleus_count",
+    "multi_nucleus_cell_count",
+    "multi_nucleus_pair_count",
+    "max_nuclei_per_cell",
+    "retained_outside_pair_count",
+    "max_retained_outside_fraction",
+    "max_nucleus_outside_fraction",
+    "status",
+    "reason",
+]
+FEATURE_QC_COLUMNS = [
+    "feature",
+    "feature_group",
+    "finite_fov_count",
+    "unique_finite_count",
+    "constant",
+    "forbidden_token",
+    "registered",
+    "status",
+]
+MASK_QC_COLUMNS = [
+    "image_key",
+    "pc_path",
+    "mask_path",
+    "expected_pc_sha256",
+    "actual_pc_sha256",
+    "expected_provenance_hash",
+    "actual_provenance_hash",
+    "cell_mask_sha256",
+    "nucleus_mask_sha256",
+    "status",
+    "reason",
+]
+_FORBIDDEN_PREDICTOR_TOKENS = (
+    "ido",
+    "ifn",
+    "tnf",
+    "dose",
+    "condition",
+    "path",
+    "filename",
+    "donor",
+    "b_id",
+    "delta",
+)
+_EXPECTED_BASIC_ATTR = "_paper93_expected_basic_images"
+_EXPECTED_CELLS_ATTR = "_paper93_expected_basic_cells"
+_ATOL_ATTR = "_paper93_atol"
+_FROZEN_ATOL = 1e-12
+_FORMAL_IMAGE_KEYS_SHA256 = (
+    "efc55b45033a3923f1467dce86802f6514a0e9c182de77e94a2c155d47503232"
+)
+_PAIR_AGGREGATION_UNIT = "frozen_nucleus_cell_pair"
+
+
+@dataclass(frozen=True)
+class Paper93Bundle:
+    """保存隔離的 93-feature 資料與 fail-closed 品質證據。
+
+    Attributes:
+        images: 凍結 metadata、33 個 Round 1 predictors、target 與 60 個新 median。
+        paper_cells: 僅含凍結 roster 的重算 cell-level phase features。
+        valid_counts: 每張 FOV、每個額外特徵的有限 cell 數量。
+        extraction_qc: 每張 FOV 的擷取結果與具路徑的失敗原因。
+        feature_qc: 93 個 predictors 的有限性、常數與 leakage 檢查。
+        predictor_columns: canonical Paper-style 93 predictor 順序。
+        max_nucleus_outside_fraction: SHA-pinned Round 1 nucleus outside 閾值。
+    """
+
+    images: pd.DataFrame
+    paper_cells: pd.DataFrame
+    valid_counts: pd.DataFrame
+    extraction_qc: pd.DataFrame
+    feature_qc: pd.DataFrame
+    predictor_columns: tuple[str, ...]
+    max_nucleus_outside_fraction: float
+    _images_semantic_sha256: str = field(repr=False)
+    _cells_semantic_sha256: str = field(repr=False)
+    _images_snapshot_sha256: str = field(repr=False)
+    _cells_snapshot_sha256: str = field(repr=False)
+
+
+def extract_locked_paper93(
+    evidence: Round1Evidence,
+    mask_qc: pd.DataFrame,
+    image_keys: Sequence[str] | None = None,
+    *,
+    min_finite_cells: int = 3,
+    atol: float = 1e-12,
+) -> Paper93Bundle:
+    """只讀 phase 與已驗證 masks，依凍結 roster 擷取 93 個 predictors。
+
+    Args:
+        evidence: 已通過 Task 2 驗證的 Round 1 frozen evidence。
+        mask_qc: ``validate_frozen_masks`` 產生的逐圖驗證結果。
+        image_keys: 選用的 image keys；省略時處理完整凍結 image roster。
+        min_finite_cells: 每張 FOV、每個額外特徵要求的有限 cell 數。
+        atol: 重算 basic cell features 與 frozen values 的絕對容忍值。
+
+    Returns:
+        含資料、valid counts 與 QC 的 immutable bundle contract。
+
+    Raises:
+        ValueError: 輸入 schema、image identity、路徑或數值參數不合法時拋出。
+
+    Notes:
+        單張影像的讀檔、roster 或 feature failure 會寫入 ``extraction_qc``，
+        不會以常數填補；由 ``require_paper93_preflight`` 統一阻擋。
+    """
+    minimum = _positive_integer(min_finite_cells, "min_finite_cells")
+    if minimum != 3:
+        raise ValueError("min_finite_cells 必須精確為 3，不可變更 frozen Paper93 gate")
+    tolerance = float(atol)
+    if tolerance != _FROZEN_ATOL:
+        raise ValueError("atol 必須精確為 1e-12，不可放寬 frozen basic drift gate")
+    max_outside = _round1_max_nucleus_outside_fraction(evidence.metadata)
+
+    _require_columns(evidence.manifest, ("image_key", "group_id", "pc_path"), "manifest")
+    _require_columns(
+        evidence.basic_cells,
+        (*ROSTER_COLUMNS, *PRIMARY_CELL_FEATURES, "IDO_score"),
+        "basic_cells",
+    )
+    _require_columns(
+        evidence.basic_images,
+        ("image_key", *PRIMARY_FOV_FEATURES, "IDO_score"),
+        "basic_images",
+    )
+    _require_columns(mask_qc, MASK_QC_COLUMNS, "mask_qc", exact=True)
+
+    manifest = _unique_by_image(evidence.manifest, "manifest")
+    basic_images = _unique_by_image(evidence.basic_images, "basic_images")
+    verified = _unique_by_image(mask_qc, "mask_qc")
+    if set(manifest.index) != set(basic_images.index):
+        raise ValueError("manifest 與 basic_images image_key identity 不一致")
+    keys = _selected_image_keys(list(basic_images.index), image_keys)
+    missing_qc = [key for key in keys if key not in verified.index]
+    if missing_qc:
+        raise ValueError(f"mask_qc 缺少 image_key：{missing_qc}")
+    fresh_qc = _unique_by_image(validate_frozen_masks(evidence, keys), "fresh mask_qc")
+
+    selected_images = basic_images.loc[keys].reset_index(drop=True).copy()
+    selected_images.attrs = {}
+    selected_cells = evidence.basic_cells[
+        evidence.basic_cells["image_key"].astype(str).isin(keys)
+    ].copy()
+    selected_cells["image_key"] = selected_cells["image_key"].astype(str)
+    cell_rows: list[dict[str, Any]] = []
+    extraction_rows: list[dict[str, Any]] = []
+
+    for image_key in keys:
+        manifest_row = manifest.loc[image_key]
+        qc_row = verified.loc[image_key]
+        fresh_qc_row = fresh_qc.loc[image_key]
+        pc_path = Path(str(qc_row["pc_path"])).resolve(strict=False)
+        mask_path = Path(str(qc_row["mask_path"])).resolve(strict=False)
+        roster = selected_cells[selected_cells["image_key"].eq(image_key)].copy()
+        roster_mapping = _pair_mapping_counts(roster)
+        qc_result: dict[str, Any] = {
+            "image_key": image_key,
+            "pc_path": str(pc_path),
+            "mask_path": str(mask_path),
+            "aggregation_unit": _PAIR_AGGREGATION_UNIT,
+            "roster_pair_count": len(roster),
+            "extracted_pair_count": 0,
+            **roster_mapping,
+            "retained_outside_pair_count": 0,
+            "max_retained_outside_fraction": 0.0,
+            "max_nucleus_outside_fraction": max_outside,
+            "status": "failed",
+            "reason": "",
+        }
+        try:
+            _require_verified_paths(evidence, manifest_row, qc_row, image_key)
+            _require_fresh_mask_qc(qc_row, fresh_qc_row)
+            image_rows = _extract_roster_image(
+                image_key,
+                pc_path,
+                mask_path,
+                roster,
+                tolerance,
+                max_outside,
+            )
+            cell_rows.extend(image_rows)
+            extracted = pd.DataFrame(image_rows)
+            outside = pd.to_numeric(
+                extracted["nucleus_outside_fraction"],
+                errors="raise",
+            ).to_numpy(dtype=float)
+            qc_result.update(_pair_mapping_counts(extracted))
+            qc_result["extracted_pair_count"] = len(image_rows)
+            qc_result["retained_outside_pair_count"] = int(
+                np.count_nonzero(outside > 0.0)
+            )
+            qc_result["max_retained_outside_fraction"] = float(
+                np.max(outside, initial=0.0)
+            )
+            qc_result["status"] = "passed"
+            qc_result["reason"] = "verified frozen roster extraction"
+        except Exception as error:  # noqa: BLE001 - 每張 FOV 必須保留完整 failure evidence
+            qc_result["reason"] = (
+                f"image_key={image_key}; pc_path={pc_path}; mask_path={mask_path}; "
+                f"{type(error).__name__}: {error}"
+            )
+        extraction_rows.append(qc_result)
+
+    paper_cells = pd.DataFrame(
+        cell_rows,
+        columns=[
+            *ROSTER_COLUMNS,
+            *PRIMARY_CELL_FEATURES,
+            *PAPER_STYLE_EXTRA_FEATURES,
+            "nucleus_outside_fraction",
+            "IDO_score",
+        ],
+    )
+    valid_counts, extra_medians = _aggregate_extras(
+        paper_cells,
+        keys,
+        selected_cells,
+        minimum,
+    )
+    images = selected_images.copy()
+    for feature in PAPER_STYLE_EXTRA_FEATURES:
+        images[f"{feature}__median"] = [
+            extra_medians[(image_key, feature)] for image_key in keys
+        ]
+    images = images.reset_index(drop=True)
+
+    expected_images = selected_images.loc[
+        :, ["image_key", *PRIMARY_FOV_FEATURES, "IDO_score"]
+    ].copy()
+    expected_images.attrs = {}
+    expected_cells = selected_cells.loc[
+        :, [*ROSTER_COLUMNS, *PRIMARY_CELL_FEATURES, "IDO_score"]
+    ].copy()
+    expected_cells.attrs = {}
+    images.attrs[_EXPECTED_BASIC_ATTR] = expected_images
+    images.attrs[_ATOL_ATTR] = tolerance
+    paper_cells.attrs[_EXPECTED_CELLS_ATTR] = expected_cells
+    paper_cells.attrs[_ATOL_ATTR] = tolerance
+
+    feature_qc = _build_feature_qc(images, valid_counts)
+    images_semantic_sha256 = _frame_semantic_sha256(images)
+    cells_semantic_sha256 = _frame_semantic_sha256(paper_cells)
+    images_snapshot_sha256 = _frame_semantic_sha256(expected_images)
+    cells_snapshot_sha256 = _frame_semantic_sha256(expected_cells)
+    return Paper93Bundle(
+        images=images,
+        paper_cells=paper_cells,
+        valid_counts=valid_counts,
+        extraction_qc=pd.DataFrame(extraction_rows, columns=EXTRACTION_QC_COLUMNS),
+        feature_qc=feature_qc,
+        predictor_columns=tuple(PAPER_STYLE_FOV_FEATURES),
+        max_nucleus_outside_fraction=max_outside,
+        _images_semantic_sha256=images_semantic_sha256,
+        _cells_semantic_sha256=cells_semantic_sha256,
+        _images_snapshot_sha256=images_snapshot_sha256,
+        _cells_snapshot_sha256=cells_snapshot_sha256,
+    )
+
+
+def require_paper93_preflight(bundle: Paper93Bundle, *, formal: bool) -> None:
+    """驗證 Paper93 bundle 可安全進入 smoke 或 formal benchmark。
+
+    Args:
+        bundle: ``extract_locked_paper93`` 產生的隔離資料與 QC。
+        formal: ``True`` 時額外要求完整 693 FOV；``False`` 允許非空 subset。
+
+    Raises:
+        ValueError: predictor、leakage、roster、凍結值、finite count 或 QC 失敗時拋出。
+    """
+    predictors = tuple(str(column) for column in bundle.predictor_columns)
+    if len(predictors) != 93:
+        raise ValueError(f"Paper93 predictor 必須精確為 93 欄，目前為 {len(predictors)}")
+    duplicates = sorted({name for name in predictors if predictors.count(name) > 1})
+    if duplicates:
+        raise ValueError(f"Paper93 predictor 順序不可重複：{duplicates}")
+    forbidden = [(name, _forbidden_token(name)) for name in predictors]
+    forbidden = [(name, token) for name, token in forbidden if token]
+    if forbidden:
+        details = ", ".join(f"{name}({token})" for name, token in forbidden)
+        raise ValueError(f"Paper93 predictor 含 forbidden token：{details}")
+    unregistered = [name for name in predictors if name not in PAPER_STYLE_FOV_FEATURES]
+    if unregistered:
+        raise ValueError(f"Paper93 predictor 未註冊：{unregistered}")
+    if predictors != tuple(PAPER_STYLE_FOV_FEATURES):
+        mismatch = next(
+            index
+            for index, (actual, expected) in enumerate(
+                zip(predictors, PAPER_STYLE_FOV_FEATURES, strict=True)
+            )
+            if actual != expected
+        )
+        raise ValueError(
+            "Paper93 predictor 必須符合固定 33+60 identity 與 canonical order；"
+            f"index={mismatch}, actual={predictors[mismatch]}, "
+            f"expected={PAPER_STYLE_FOV_FEATURES[mismatch]}"
+        )
+    validate_phase_predictors(predictors)
+    if formal and len(bundle.images) == 693:
+        _validate_formal_image_roster(bundle.images)
+
+    _require_columns(
+        bundle.extraction_qc,
+        EXTRACTION_QC_COLUMNS,
+        "extraction_qc",
+        exact=True,
+    )
+    failed_extraction = bundle.extraction_qc[
+        ~bundle.extraction_qc["status"].astype(str).eq("passed")
+    ]
+    if not failed_extraction.empty:
+        raise ValueError(
+            "Paper93 extraction QC status failure："
+            + " | ".join(failed_extraction["reason"].astype(str).tolist())
+        )
+
+    _validate_extraction_qc(bundle)
+    _validate_frozen_images(bundle.images)
+    _validate_frozen_cells(bundle.paper_cells)
+    _validate_extra_medians(bundle)
+    _validate_creation_semantics(bundle)
+    _validate_valid_counts(bundle)
+    _validate_feature_qc(bundle)
+
+    image_count = len(bundle.images)
+    if formal and image_count != 693:
+        raise ValueError(f"formal Paper93 必須精確包含 693 FOV，目前為 {image_count}")
+    if not formal and image_count == 0:
+        raise ValueError("smoke Paper93 subset 不可為空")
+
+
+def _extract_roster_image(
+    image_key: str,
+    pc_path: Path,
+    mask_path: Path,
+    roster: pd.DataFrame,
+    atol: float,
+    max_nucleus_outside_fraction: float,
+) -> list[dict[str, Any]]:
+    """擷取一張影像的 frozen roster，不進行配對、排除或重建 roster。"""
+    if roster.empty:
+        raise ValueError("frozen roster 不可為空")
+    if roster.loc[:, list(ROSTER_COLUMNS)].duplicated().any():
+        raise ValueError("frozen roster identity 重複")
+    duplicated_nuclei = roster[roster["nucleus_label"].duplicated(keep=False)]
+    if not duplicated_nuclei.empty:
+        nucleus_label = _label(
+            duplicated_nuclei.iloc[0]["nucleus_label"],
+            "nucleus_label",
+        )
+        cell_labels = sorted(
+            {
+                _label(value, "cell_label")
+                for value in duplicated_nuclei.loc[
+                    duplicated_nuclei["nucleus_label"].eq(nucleus_label),
+                    "cell_label",
+                ]
+            }
+        )
+        raise ValueError(
+            "frozen roster nucleus mapping 重複："
+            f"nucleus_label={nucleus_label}, cell_labels={cell_labels}"
+        )
+
+    embedded_threshold = _embedded_max_nucleus_outside_fraction(mask_path)
+    if embedded_threshold != max_nucleus_outside_fraction:
+        raise ValueError(
+            "mask provenance max_nucleus_outside_fraction 與 pinned run_metadata 不一致："
+            f"embedded={embedded_threshold:g}, "
+            f"run_metadata={max_nucleus_outside_fraction:g}"
+        )
+
+    phase = _read_grayscale_image(pc_path)
+    cell_mask, nucleus_mask = load_cached_masks(mask_path)
+    if phase.ndim != 2 or phase.shape != cell_mask.shape or cell_mask.shape != nucleus_mask.shape:
+        raise ValueError("phase 與 verified mask arrays 必須是相同 shape 的二維陣列")
+
+    rows: list[dict[str, Any]] = []
+    for frozen in roster.to_dict(orient="records"):
+        cell_label = _label(frozen["cell_label"], "cell_label")
+        nucleus_label = _label(frozen["nucleus_label"], "nucleus_label")
+        cell_region = cell_mask == cell_label
+        nucleus_region = nucleus_mask == nucleus_label
+        if not np.any(cell_region):
+            raise ValueError(f"frozen roster missing cell_label={cell_label}")
+        if not np.any(nucleus_region):
+            raise ValueError(f"frozen roster missing nucleus_label={nucleus_label}")
+        nucleus_coords = np.argwhere(nucleus_region)
+        center_y, center_x = nucleus_coords.mean(axis=0).astype(int)
+        centroid_cell_label = int(cell_mask[center_y, center_x])
+        if centroid_cell_label != cell_label:
+            raise ValueError(
+                "frozen roster centroid mapping 不一致："
+                f"nucleus_label={nucleus_label}, expected_cell_label={cell_label}, "
+                f"actual_cell_label={centroid_cell_label}"
+            )
+        nucleus_area = int(np.count_nonzero(nucleus_region))
+        outside_area = int(np.count_nonzero(nucleus_region & ~cell_region))
+        outside_fraction = float(outside_area / nucleus_area)
+        if outside_fraction > max_nucleus_outside_fraction:
+            raise ValueError(
+                "frozen roster nucleus outside threshold："
+                f"cell_label={cell_label}, nucleus_label={nucleus_label}, "
+                f"outside_fraction={outside_fraction:.12f}, "
+                "max_nucleus_outside_fraction="
+                f"{max_nucleus_outside_fraction:g}"
+            )
+        cytoplasm = cell_region & ~nucleus_region
+        if not np.any(cytoplasm):
+            raise ValueError(
+                f"frozen roster empty cytoplasm cell_label={cell_label}, nucleus_label={nucleus_label}"
+            )
+        basic = {
+            **_geometry_values(phase, cell_region, "cell"),
+            **_geometry_values(phase, nucleus_region, "nucleus"),
+            "nucleus_cytoplasm_area_ratio": float(
+                np.count_nonzero(nucleus_region) / np.count_nonzero(cytoplasm)
+            ),
+        }
+        expected_basic = (
+            *(f"cell__{name}" for name in BASIC_GEOMETRY),
+            *(f"nucleus__{name}" for name in BASIC_GEOMETRY),
+            "nucleus_cytoplasm_area_ratio",
+        )
+        if tuple(basic) != expected_basic or expected_basic != tuple(PRIMARY_CELL_FEATURES):
+            raise ValueError("basic feature schema 偏離固定 33 欄")
+        for feature in PRIMARY_CELL_FEATURES:
+            actual = float(basic[feature])
+            expected = float(frozen[feature])
+            if not np.isclose(actual, expected, rtol=0, atol=atol, equal_nan=False):
+                raise ValueError(
+                    f"basic feature drift cell_label={cell_label}, feature={feature}, "
+                    f"expected={expected}, actual={actual}"
+                )
+        extras = paper_style_extras(phase, cell_region, nucleus_region)
+        if tuple(extras) != tuple(PAPER_STYLE_EXTRA_FEATURES):
+            missing = sorted(set(PAPER_STYLE_EXTRA_FEATURES) - set(extras))
+            unexpected = sorted(set(extras) - set(PAPER_STYLE_EXTRA_FEATURES))
+            raise ValueError(
+                f"extra feature schema 偏離固定 60 欄；missing={missing}; unexpected={unexpected}"
+            )
+        rows.append(
+            {
+                "image_key": image_key,
+                "cell_label": cell_label,
+                "nucleus_label": nucleus_label,
+                **basic,
+                **{feature: float(extras[feature]) for feature in PAPER_STYLE_EXTRA_FEATURES},
+                "nucleus_outside_fraction": outside_fraction,
+                "IDO_score": float(frozen["IDO_score"]),
+            }
+        )
+    return rows
+
+
+def _round1_max_nucleus_outside_fraction(metadata: Mapping[str, Any]) -> float:
+    """從 SHA-pinned Round 1 run metadata 取得原始 nucleus outside 閾值。"""
+    if not isinstance(metadata, Mapping):
+        raise ValueError("run_metadata 必須是 mapping")
+    snapshot = metadata.get("effective_config_snapshot")
+    if not isinstance(snapshot, Mapping):
+        raise ValueError(
+            "run_metadata 缺少 effective_config_snapshot.max_nucleus_outside_fraction"
+        )
+    segmentation = snapshot.get("segmentation")
+    if not isinstance(segmentation, Mapping) or (
+        "max_nucleus_outside_fraction" not in segmentation
+    ):
+        raise ValueError(
+            "run_metadata 缺少 segmentation.max_nucleus_outside_fraction"
+        )
+    return _outside_fraction_threshold(
+        segmentation["max_nucleus_outside_fraction"],
+        "run_metadata max_nucleus_outside_fraction",
+    )
+
+
+def _embedded_max_nucleus_outside_fraction(mask_path: Path) -> float:
+    """讀取 verified NPZ embedded provenance 的 nucleus outside 閾值。"""
+    with np.load(mask_path, allow_pickle=False) as cached:
+        if "provenance_json" not in cached:
+            raise ValueError("mask provenance 缺少 provenance_json")
+        raw = np.asarray(cached["provenance_json"])
+        if raw.ndim != 0 or raw.dtype.kind not in {"U", "S"}:
+            raise ValueError("mask provenance_json 必須是文字 scalar")
+        item = raw.item()
+        text = item.decode("utf-8") if isinstance(item, bytes) else str(item)
+    try:
+        provenance = json.loads(
+            text,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"不允許 JSON constant：{value}")
+            ),
+        )
+    except (json.JSONDecodeError, ValueError) as error:
+        raise ValueError(f"mask provenance_json 不合法：{error}") from error
+    if not isinstance(provenance, Mapping):
+        raise ValueError("mask provenance_json 必須是 object")
+    segmentation = provenance.get("segmentation_config")
+    if not isinstance(segmentation, Mapping) or (
+        "max_nucleus_outside_fraction" not in segmentation
+    ):
+        raise ValueError(
+            "mask provenance 缺少 segmentation_config.max_nucleus_outside_fraction"
+        )
+    return _outside_fraction_threshold(
+        segmentation["max_nucleus_outside_fraction"],
+        "mask provenance max_nucleus_outside_fraction",
+    )
+
+
+def _outside_fraction_threshold(value: object, name: str) -> float:
+    """解析 0 到 1 的有限 fraction，拒絕布林與隱式預設值。"""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} 必須是 0 到 1 的有限數值")
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} 必須是 0 到 1 的有限數值") from error
+    if not np.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError(f"{name} 必須是 0 到 1 的有限數值")
+    return threshold
+
+
+def _aggregate_extras(
+    paper_cells: pd.DataFrame,
+    image_keys: Sequence[str],
+    frozen_cells: pd.DataFrame,
+    minimum: int,
+) -> tuple[pd.DataFrame, dict[tuple[str, str], float]]:
+    """以有限值計算 60 個額外特徵 medians 與逐圖 valid counts。"""
+    rows: list[dict[str, Any]] = []
+    medians: dict[tuple[str, str], float] = {}
+    for image_key in image_keys:
+        extracted = paper_cells[paper_cells["image_key"].astype(str).eq(image_key)]
+        roster_count = int(
+            frozen_cells["image_key"].astype(str).eq(image_key).sum()
+        )
+        for feature in PAPER_STYLE_EXTRA_FEATURES:
+            values = pd.to_numeric(extracted[feature], errors="coerce").to_numpy(dtype=float)
+            finite = values[np.isfinite(values)]
+            finite_count = int(finite.size)
+            status = "passed" if finite_count >= minimum else "failed"
+            rows.append(
+                {
+                    "image_key": image_key,
+                    "feature": feature,
+                    "roster_cell_count": roster_count,
+                    "finite_cell_count": finite_count,
+                    "required_minimum": minimum,
+                    "status": status,
+                }
+            )
+            medians[(image_key, feature)] = (
+                float(np.median(finite)) if finite_count else np.nan
+            )
+    return pd.DataFrame(rows, columns=VALID_COUNT_COLUMNS), medians
+
+
+def _build_feature_qc(images: pd.DataFrame, valid_counts: pd.DataFrame) -> pd.DataFrame:
+    """建立固定 93-row feature QC；常數只回報，不視為失敗。"""
+    rows: list[dict[str, Any]] = []
+    failed_extras = set(
+        valid_counts.loc[~valid_counts["status"].eq("passed"), "feature"].astype(str)
+    )
+    for feature in PAPER_STYLE_FOV_FEATURES:
+        values = pd.to_numeric(images[feature], errors="coerce").to_numpy(dtype=float)
+        finite = values[np.isfinite(values)]
+        finite_count = int(finite.size)
+        unique_count = int(np.unique(finite).size)
+        token = _forbidden_token(feature)
+        registered = feature in PAPER_STYLE_FOV_FEATURES
+        cell_feature = feature.removesuffix("__median")
+        finite_ok = finite_count == len(images)
+        counts_ok = cell_feature not in failed_extras
+        rows.append(
+            {
+                "feature": feature,
+                "feature_group": (
+                    "basic" if feature in PRIMARY_FOV_FEATURES else "paper_style_extra"
+                ),
+                "finite_fov_count": finite_count,
+                "unique_finite_count": unique_count,
+                "constant": bool(unique_count <= 1),
+                "forbidden_token": token,
+                "registered": bool(registered),
+                "status": (
+                    "passed" if finite_ok and counts_ok and not token and registered else "failed"
+                ),
+            }
+        )
+    return pd.DataFrame(rows, columns=FEATURE_QC_COLUMNS)
+
+
+def _validate_frozen_images(images: pd.DataFrame) -> None:
+    """檢查 FOV schema、有限性與 frozen 33 predictors／target tolerance。"""
+    _require_columns(
+        images,
+        ("image_key", "IDO_score", *PAPER_STYLE_FOV_FEATURES),
+        "images",
+    )
+    if images.empty:
+        raise ValueError("Paper93 images 不可為空")
+    if images["image_key"].astype(str).duplicated().any():
+        raise ValueError("Paper93 images image_key 不可重複")
+    matrix = images.loc[:, list(PAPER_STYLE_FOV_FEATURES)].apply(
+        pd.to_numeric, errors="coerce"
+    ).to_numpy(dtype=float)
+    if not np.isfinite(matrix).all():
+        locations = np.argwhere(~np.isfinite(matrix))
+        row_index, column_index = locations[0]
+        raise ValueError(
+            f"Paper93 predictor 非有限：image_key={images.iloc[row_index]['image_key']}; "
+            f"feature={PAPER_STYLE_FOV_FEATURES[column_index]}"
+        )
+    expected = images.attrs.get(_EXPECTED_BASIC_ATTR)
+    tolerance = images.attrs.get(_ATOL_ATTR)
+    if not isinstance(expected, pd.DataFrame) or tolerance is None:
+        raise ValueError("Paper93 images 缺少 frozen basic/target comparison evidence")
+    actual = images.loc[:, ["image_key", *PRIMARY_FOV_FEATURES, "IDO_score"]]
+    _assert_aligned_frozen_values(actual, expected, float(tolerance), "FOV basic/target")
+
+
+def _validate_frozen_cells(cells: pd.DataFrame) -> None:
+    """檢查 paper cell roster 與 frozen cell basic／target identity。"""
+    _require_columns(
+        cells,
+        (
+            *ROSTER_COLUMNS,
+            *PRIMARY_CELL_FEATURES,
+            *PAPER_STYLE_EXTRA_FEATURES,
+            "nucleus_outside_fraction",
+            "IDO_score",
+        ),
+        "paper_cells",
+    )
+    expected = cells.attrs.get(_EXPECTED_CELLS_ATTR)
+    tolerance = cells.attrs.get(_ATOL_ATTR)
+    if not isinstance(expected, pd.DataFrame) or tolerance is None:
+        raise ValueError("Paper93 cells 缺少 frozen roster/basic/target comparison evidence")
+    actual = cells.loc[:, [*ROSTER_COLUMNS, *PRIMARY_CELL_FEATURES, "IDO_score"]]
+    _assert_aligned_frozen_values(actual, expected, float(tolerance), "cell roster/basic/target")
+
+
+def _validate_extra_medians(bundle: Paper93Bundle) -> None:
+    """從 frozen-roster cells 重算 60 個 finite-only medians 並比對 FOV values。"""
+    image_keys = bundle.images["image_key"].astype(str).tolist()
+    for image_key in image_keys:
+        cells = bundle.paper_cells[
+            bundle.paper_cells["image_key"].astype(str).eq(image_key)
+        ]
+        image_rows = bundle.images[
+            bundle.images["image_key"].astype(str).eq(image_key)
+        ]
+        if len(image_rows) != 1:
+            raise ValueError(f"Paper93 median identity 不一致：image_key={image_key}")
+        image_row = image_rows.iloc[0]
+        for feature in PAPER_STYLE_EXTRA_FEATURES:
+            values = pd.to_numeric(cells[feature], errors="coerce").to_numpy(dtype=float)
+            finite = values[np.isfinite(values)]
+            expected = float(np.median(finite)) if finite.size else np.nan
+            actual = float(image_row[f"{feature}__median"])
+            if not np.isclose(
+                actual,
+                expected,
+                rtol=0,
+                atol=_FROZEN_ATOL,
+                equal_nan=False,
+            ):
+                raise ValueError(
+                    f"Paper93 median drift：feature={feature}, image_key={image_key}, "
+                    f"expected={expected}, actual={actual}"
+                )
+
+
+def _validate_creation_semantics(bundle: Paper93Bundle) -> None:
+    """以 immutable digests 鎖定 extraction-time tables 與 frozen snapshots。"""
+    expected_image_attrs = {_EXPECTED_BASIC_ATTR, _ATOL_ATTR}
+    expected_cell_attrs = {_EXPECTED_CELLS_ATTR, _ATOL_ATTR}
+    if set(bundle.images.attrs) != expected_image_attrs:
+        raise ValueError("Paper93 images attrs 偏離 creation-time contract")
+    if set(bundle.paper_cells.attrs) != expected_cell_attrs:
+        raise ValueError("Paper93 cells attrs 偏離 creation-time contract")
+    if float(bundle.images.attrs[_ATOL_ATTR]) != _FROZEN_ATOL:
+        raise ValueError("Paper93 images attrs atol 偏離 1e-12")
+    if float(bundle.paper_cells.attrs[_ATOL_ATTR]) != _FROZEN_ATOL:
+        raise ValueError("Paper93 cells attrs atol 偏離 1e-12")
+    expected_images = bundle.images.attrs[_EXPECTED_BASIC_ATTR]
+    expected_cells = bundle.paper_cells.attrs[_EXPECTED_CELLS_ATTR]
+    if not isinstance(expected_images, pd.DataFrame) or not isinstance(
+        expected_cells, pd.DataFrame
+    ):
+        raise ValueError("Paper93 frozen snapshot attrs 必須是 DataFrame")
+    checks = (
+        (
+            "images semantic",
+            _frame_semantic_sha256(bundle.images),
+            bundle._images_semantic_sha256,
+        ),
+        (
+            "cells semantic",
+            _frame_semantic_sha256(bundle.paper_cells),
+            bundle._cells_semantic_sha256,
+        ),
+        (
+            "images snapshot",
+            _frame_semantic_sha256(expected_images),
+            bundle._images_snapshot_sha256,
+        ),
+        (
+            "cells snapshot",
+            _frame_semantic_sha256(expected_cells),
+            bundle._cells_snapshot_sha256,
+        ),
+    )
+    for name, actual, expected in checks:
+        if actual != expected:
+            raise ValueError(
+                f"Paper93 {name} SHA-256 不一致：expected={expected}, actual={actual}"
+            )
+
+
+def _frame_semantic_sha256(frame: pd.DataFrame) -> str:
+    """計算含欄序、dtype、index 與 scalar values 的穩定 DataFrame digest。"""
+    digest = hashlib.sha256()
+    for column, dtype in zip(frame.columns, frame.dtypes, strict=True):
+        encoded = f"{column}\0{dtype}\n".encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    hashes = pd.util.hash_pandas_object(frame, index=True, categorize=False)
+    digest.update(hashes.to_numpy(dtype=np.uint64).tobytes())
+    return digest.hexdigest()
+
+
+def _validate_formal_image_roster(images: pd.DataFrame) -> None:
+    """鎖定 formal 693 FOV 的 production image-key roster digest。"""
+    keys = images["image_key"].astype(str).tolist()
+    payload = ("\n".join(sorted(keys)) + "\n").encode("utf-8")
+    actual = hashlib.sha256(payload).hexdigest()
+    if actual != _FORMAL_IMAGE_KEYS_SHA256:
+        raise ValueError(
+            "formal Paper93 image-key roster SHA-256 不一致："
+            f"expected={_FORMAL_IMAGE_KEYS_SHA256}, actual={actual}"
+        )
+
+
+def _assert_aligned_frozen_values(
+    actual: pd.DataFrame,
+    expected: pd.DataFrame,
+    atol: float,
+    label: str,
+) -> None:
+    """依 identity 排序後比較 frozen 數值，不接受 NaN 相等。"""
+    identity = [column for column in ROSTER_COLUMNS if column in actual.columns]
+    if identity == ["image_key"] or "cell_label" not in actual.columns:
+        identity = ["image_key"]
+    actual_sorted = actual.sort_values(identity, kind="stable").reset_index(drop=True)
+    expected_sorted = expected.sort_values(identity, kind="stable").reset_index(drop=True)
+    if len(actual_sorted) != len(expected_sorted):
+        raise ValueError(
+            f"{label} row count 不一致：actual={len(actual_sorted)}, expected={len(expected_sorted)}"
+        )
+    if not actual_sorted.loc[:, identity].astype(str).equals(
+        expected_sorted.loc[:, identity].astype(str)
+    ):
+        raise ValueError(f"{label} identity 不一致")
+    value_columns = [column for column in expected_sorted.columns if column not in identity]
+    actual_values = actual_sorted.loc[:, value_columns].apply(
+        pd.to_numeric, errors="coerce"
+    ).to_numpy(dtype=float)
+    expected_values = expected_sorted.loc[:, value_columns].apply(
+        pd.to_numeric, errors="coerce"
+    ).to_numpy(dtype=float)
+    if not np.allclose(
+        actual_values,
+        expected_values,
+        rtol=0,
+        atol=atol,
+        equal_nan=False,
+    ):
+        mismatch = np.argwhere(
+            ~np.isclose(
+                actual_values,
+                expected_values,
+                rtol=0,
+                atol=atol,
+                equal_nan=False,
+            )
+        )[0]
+        row_index, column_index = (int(mismatch[0]), int(mismatch[1]))
+        raise ValueError(
+            f"{label} drift：identity={actual_sorted.loc[row_index, identity].to_dict()}; "
+            f"feature={value_columns[column_index]}"
+        )
+
+
+def _validate_valid_counts(bundle: Paper93Bundle) -> None:
+    """驗證每張 FOV × 60 extras 的 exact finite-count schema。"""
+    _require_columns(bundle.valid_counts, VALID_COUNT_COLUMNS, "valid_counts", exact=True)
+    keys = bundle.images["image_key"].astype(str).tolist()
+    expected_pairs = {
+        (image_key, feature) for image_key in keys for feature in PAPER_STYLE_EXTRA_FEATURES
+    }
+    actual_pairs = list(
+        bundle.valid_counts.loc[:, ["image_key", "feature"]].astype(str).itertuples(
+            index=False, name=None
+        )
+    )
+    if len(actual_pairs) != len(set(actual_pairs)):
+        raise ValueError("Paper93 valid_counts image/feature pair 不可重複")
+    if set(actual_pairs) != expected_pairs:
+        raise ValueError("Paper93 valid_counts 必須精確涵蓋每張 FOV × 60 extras")
+    required_numeric = pd.to_numeric(
+        bundle.valid_counts["required_minimum"], errors="coerce"
+    ).to_numpy(dtype=float)
+    if not np.equal(required_numeric, 3.0).all():
+        raise ValueError("Paper93 valid_counts required_minimum 必須精確為 3")
+    counts = bundle.valid_counts.set_index(["image_key", "feature"], drop=False)
+    required_values: set[int] = set()
+    for image_key, feature in expected_pairs:
+        row = counts.loc[(image_key, feature)]
+        required = _positive_integer(row["required_minimum"], "required_minimum")
+        required_values.add(required)
+        cells = bundle.paper_cells[
+            bundle.paper_cells["image_key"].astype(str).eq(image_key)
+        ]
+        values = pd.to_numeric(cells[feature], errors="coerce").to_numpy(dtype=float)
+        expected_roster_count = len(cells)
+        expected_finite_count = int(np.isfinite(values).sum())
+        try:
+            roster_count = _nonnegative_integer(
+                row["roster_cell_count"], "roster_cell_count"
+            )
+            finite_count = _nonnegative_integer(
+                row["finite_cell_count"], "finite_cell_count"
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                f"Paper93 valid-count QC 非整數：image_key={image_key}, "
+                f"feature={feature}, error={error}"
+            ) from error
+        expected_status = "passed" if expected_finite_count >= required else "failed"
+        if (
+            roster_count != expected_roster_count
+            or finite_count != expected_finite_count
+            or str(row["status"]) != expected_status
+        ):
+            raise ValueError(
+                f"Paper93 valid-count QC 不一致：image_key={image_key}, feature={feature}, "
+                f"roster_cell_count={roster_count}/{expected_roster_count}, "
+                f"finite_cell_count={finite_count}/{expected_finite_count}, "
+                f"status={row['status']}/{expected_status}"
+            )
+    if len(required_values) != 1:
+        raise ValueError("Paper93 valid-count QC required_minimum 必須全表一致")
+    failed = bundle.valid_counts[~bundle.valid_counts["status"].astype(str).eq("passed")]
+    if not failed.empty:
+        details = "; ".join(
+            f"image_key={row.image_key}, feature={row.feature}, "
+            f"finite_cell_count={row.finite_cell_count}, required_minimum={row.required_minimum}"
+            for row in failed.itertuples(index=False)
+        )
+        raise ValueError(f"Paper93 finite cell count 不足：{details}")
+
+
+def _validate_feature_qc(bundle: Paper93Bundle) -> None:
+    """驗證 feature QC 與 canonical 93 predictors 一致且全部通過。"""
+    _require_columns(bundle.feature_qc, FEATURE_QC_COLUMNS, "feature_qc", exact=True)
+    features = bundle.feature_qc["feature"].astype(str).tolist()
+    if features != list(PAPER_STYLE_FOV_FEATURES):
+        raise ValueError("Paper93 feature_qc 必須是 canonical 93-row order")
+    failed = bundle.feature_qc[~bundle.feature_qc["status"].astype(str).eq("passed")]
+    if not failed.empty:
+        raise ValueError(f"Paper93 feature_qc failed：{failed['feature'].astype(str).tolist()}")
+    if not bundle.feature_qc["registered"].astype(bool).all():
+        raise ValueError("Paper93 feature_qc 含未註冊 predictor")
+    if bundle.feature_qc["forbidden_token"].astype(str).ne("").any():
+        raise ValueError("Paper93 feature_qc 含 forbidden predictor")
+    expected = _build_feature_qc(bundle.images, bundle.valid_counts)
+    try:
+        pd.testing.assert_frame_equal(
+            bundle.feature_qc.reset_index(drop=True),
+            expected.reset_index(drop=True),
+            check_dtype=False,
+        )
+    except AssertionError as error:
+        raise ValueError(f"Paper93 feature QC 與資料重算結果不一致：{error}") from error
+
+
+def _validate_extraction_qc(bundle: Paper93Bundle) -> None:
+    """重算 extraction QC 的 frozen pair identity、topology 與 outside counts。"""
+    qc = bundle.extraction_qc.copy()
+    qc["image_key"] = qc["image_key"].astype(str)
+    if qc["image_key"].duplicated().any():
+        raise ValueError("Paper93 extraction QC image_key 不可重複")
+    image_keys = bundle.images["image_key"].astype(str).tolist()
+    if set(qc["image_key"]) != set(image_keys):
+        raise ValueError("Paper93 extraction QC image_key identity 不一致")
+    expected_cells = bundle.paper_cells.attrs.get(_EXPECTED_CELLS_ATTR)
+    if not isinstance(expected_cells, pd.DataFrame):
+        raise ValueError("Paper93 extraction QC 缺少 frozen roster evidence")
+    qc_by_key = qc.set_index("image_key", drop=False)
+    for image_key in image_keys:
+        row = qc_by_key.loc[image_key]
+        expected_roster_count = int(
+            expected_cells["image_key"].astype(str).eq(image_key).sum()
+        )
+        expected_extracted_count = int(
+            bundle.paper_cells["image_key"].astype(str).eq(image_key).sum()
+        )
+        expected_rows = expected_cells[
+            expected_cells["image_key"].astype(str).eq(image_key)
+        ]
+        extracted_rows = bundle.paper_cells[
+            bundle.paper_cells["image_key"].astype(str).eq(image_key)
+        ]
+        mapping_counts = _pair_mapping_counts(extracted_rows)
+        outside = pd.to_numeric(
+            extracted_rows["nucleus_outside_fraction"],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        if not np.isfinite(outside).all() or (
+            (outside < 0.0)
+            | (outside > float(bundle.max_nucleus_outside_fraction))
+        ).any():
+            raise ValueError(
+                f"Paper93 extraction QC outside fraction 不合法：image_key={image_key}"
+            )
+        expected_qc: dict[str, Any] = {
+            "aggregation_unit": _PAIR_AGGREGATION_UNIT,
+            "roster_pair_count": len(expected_rows),
+            "extracted_pair_count": len(extracted_rows),
+            **mapping_counts,
+            "retained_outside_pair_count": int(np.count_nonzero(outside > 0.0)),
+            "max_retained_outside_fraction": float(
+                np.max(outside, initial=0.0)
+            ),
+            "max_nucleus_outside_fraction": float(
+                bundle.max_nucleus_outside_fraction
+            ),
+            "status": "passed",
+        }
+        try:
+            actual_qc = {
+                "aggregation_unit": str(row["aggregation_unit"]),
+                "roster_pair_count": _nonnegative_integer(
+                    row["roster_pair_count"], "roster_pair_count"
+                ),
+                "extracted_pair_count": _nonnegative_integer(
+                    row["extracted_pair_count"], "extracted_pair_count"
+                ),
+                "unique_cell_count": _nonnegative_integer(
+                    row["unique_cell_count"], "unique_cell_count"
+                ),
+                "unique_nucleus_count": _nonnegative_integer(
+                    row["unique_nucleus_count"], "unique_nucleus_count"
+                ),
+                "multi_nucleus_cell_count": _nonnegative_integer(
+                    row["multi_nucleus_cell_count"],
+                    "multi_nucleus_cell_count",
+                ),
+                "multi_nucleus_pair_count": _nonnegative_integer(
+                    row["multi_nucleus_pair_count"],
+                    "multi_nucleus_pair_count",
+                ),
+                "max_nuclei_per_cell": _nonnegative_integer(
+                    row["max_nuclei_per_cell"], "max_nuclei_per_cell"
+                ),
+                "retained_outside_pair_count": _nonnegative_integer(
+                    row["retained_outside_pair_count"],
+                    "retained_outside_pair_count",
+                ),
+                "max_retained_outside_fraction": float(
+                    row["max_retained_outside_fraction"]
+                ),
+                "max_nucleus_outside_fraction": float(
+                    row["max_nucleus_outside_fraction"]
+                ),
+                "status": str(row["status"]),
+            }
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                f"Paper93 extraction QC 欄位不合法：image_key={image_key}"
+            ) from error
+        if actual_qc != expected_qc:
+            raise ValueError(
+                f"Paper93 extraction pair mapping QC 不一致：image_key={image_key}, "
+                f"actual={actual_qc}, expected={expected_qc}"
+            )
+        if expected_roster_count != expected_extracted_count:
+            raise ValueError(
+                f"Paper93 extraction pair row count 不一致：image_key={image_key}, "
+                f"roster={expected_roster_count}, extracted={expected_extracted_count}"
+            )
+
+
+def _pair_mapping_counts(rows: pd.DataFrame) -> dict[str, int]:
+    """依 FOV 內 cell identity 重算 pair topology counts。"""
+    if rows.empty:
+        return {
+            "unique_cell_count": 0,
+            "unique_nucleus_count": 0,
+            "multi_nucleus_cell_count": 0,
+            "multi_nucleus_pair_count": 0,
+            "max_nuclei_per_cell": 0,
+        }
+    _require_columns(rows, ROSTER_COLUMNS, "pair mapping rows")
+    working = rows.loc[:, list(ROSTER_COLUMNS)].copy()
+    working["image_key"] = working["image_key"].astype(str)
+    for column in ("cell_label", "nucleus_label"):
+        working[column] = [
+            _label(value, column) for value in working[column].tolist()
+        ]
+    cell_counts = working.groupby(
+        ["image_key", "cell_label"],
+        sort=False,
+    ).size()
+    multi = cell_counts[cell_counts > 1]
+    return {
+        "unique_cell_count": int(len(cell_counts)),
+        "unique_nucleus_count": int(
+            len(working.drop_duplicates(["image_key", "nucleus_label"]))
+        ),
+        "multi_nucleus_cell_count": int(len(multi)),
+        "multi_nucleus_pair_count": int(multi.sum()),
+        "max_nuclei_per_cell": int(cell_counts.max()),
+    }
+
+
+def _require_verified_paths(
+    evidence: Round1Evidence,
+    manifest_row: pd.Series,
+    qc_row: pd.Series,
+    image_key: str,
+) -> None:
+    """確認 extractor 使用 Task 2 已驗證的 phase 與固定 mask 路徑。"""
+    pc_path = Path(str(qc_row["pc_path"])).resolve(strict=False)
+    manifest_pc = Path(str(manifest_row["pc_path"])).resolve(strict=False)
+    group_id = str(manifest_row["group_id"])
+    expected_mask = (
+        evidence.root / "feature_cache" / "masks" / group_id / f"{image_key}.npz"
+    ).resolve(strict=False)
+    mask_path = Path(str(qc_row["mask_path"])).resolve(strict=False)
+    if pc_path != manifest_pc:
+        raise ValueError("mask_qc.pc_path 與 frozen manifest 不一致")
+    if mask_path != expected_mask:
+        raise ValueError("mask_qc.mask_path 與 frozen cache path 不一致")
+
+
+def _require_fresh_mask_qc(provided: pd.Series, fresh: pd.Series) -> None:
+    """要求 supplied Task 2 QC 與 extraction-time fresh provenance 完全一致。"""
+    if str(fresh["status"]) != "passed":
+        raise ValueError(f"fresh mask provenance failed：{fresh['reason']}")
+    if str(provided["status"]) != "passed":
+        raise ValueError(
+            f"provided mask_qc status={provided['status']}; reason={provided['reason']}"
+        )
+    mismatches = [
+        column
+        for column in MASK_QC_COLUMNS
+        if str(provided[column]) != str(fresh[column])
+    ]
+    if mismatches:
+        details = ", ".join(
+            f"{column}={provided[column]}/{fresh[column]}" for column in mismatches
+        )
+        raise ValueError(f"Task 2 mask_qc 與 fresh provenance 不一致：{details}")
+
+
+def _selected_image_keys(
+    available: Sequence[str], image_keys: Sequence[str] | None
+) -> list[str]:
+    """驗證並回傳不重複、已知的指定 image roster。"""
+    keys = list(available) if image_keys is None else [str(key) for key in image_keys]
+    if len(keys) != len(set(keys)):
+        raise ValueError("image_keys 不可重複")
+    unknown = sorted(set(keys) - set(available))
+    if unknown:
+        raise ValueError(f"image_keys 含未知 image_key：{unknown}")
+    return keys
+
+
+def _unique_by_image(frame: pd.DataFrame, name: str) -> pd.DataFrame:
+    """建立字串 image_key index 並拒絕 ambiguous rows。"""
+    indexed = frame.copy()
+    indexed["image_key"] = indexed["image_key"].astype(str)
+    if indexed["image_key"].duplicated().any():
+        raise ValueError(f"{name} image_key 不可重複")
+    return indexed.set_index("image_key", drop=False)
+
+
+def _require_columns(
+    frame: pd.DataFrame,
+    columns: Sequence[str],
+    name: str,
+    *,
+    exact: bool = False,
+) -> None:
+    """驗證 DataFrame 必要欄位，必要時要求 exact order。"""
+    expected = list(columns)
+    missing = [column for column in expected if column not in frame.columns]
+    if missing:
+        raise ValueError(f"{name} 缺少欄位：{missing}")
+    if exact and list(frame.columns) != expected:
+        raise ValueError(f"{name} schema 必須精確為：{expected}")
+
+
+def _positive_integer(value: object, name: str) -> int:
+    """解析至少為一的整數參數，拒絕布林與截斷。"""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} 必須是至少為 1 的整數")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} 必須是至少為 1 的整數") from error
+    if not np.isfinite(numeric) or numeric < 1 or numeric != np.floor(numeric):
+        raise ValueError(f"{name} 必須是至少為 1 的整數")
+    return int(numeric)
+
+
+def _nonnegative_integer(value: object, name: str) -> int:
+    """解析至少為零的整數 QC 值，拒絕布林與 float truncation。"""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} 必須是至少為 0 的整數")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} 必須是至少為 0 的整數") from error
+    if not np.isfinite(numeric) or numeric < 0 or numeric != np.floor(numeric):
+        raise ValueError(f"{name} 必須是至少為 0 的整數")
+    return int(numeric)
+
+
+def _label(value: object, name: str) -> int:
+    """解析正整數 mask label，不允許 float truncation。"""
+    label = _positive_integer(value, name)
+    return label
+
+
+def _forbidden_token(feature: str) -> str:
+    """回傳 feature 名稱中第一個 leakage token，沒有則回傳空字串。"""
+    lowered = str(feature).lower()
+    return next((token for token in _FORBIDDEN_PREDICTOR_TOKENS if token in lowered), "")
+
+
+__all__ = [
+    "EXTRACTION_QC_COLUMNS",
+    "FEATURE_QC_COLUMNS",
+    "Paper93Bundle",
+    "ROSTER_COLUMNS",
+    "VALID_COUNT_COLUMNS",
+    "extract_locked_paper93",
+    "require_paper93_preflight",
+]
