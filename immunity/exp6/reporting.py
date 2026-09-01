@@ -245,9 +245,13 @@ def render_report(
 
 ![global 分割後 IDO](figures/fig_gallery_global_ido_segmented.png)
 
-每顆細胞另外輸出一張五格 PNG（phase 原圖／phase 分割／IDO 原圖／IDO 分割（黑底）／
-IDO 去背（白底）），放在 `cell_crops_global/`，共 {splits.get('global', {}).get('n_crop_files', 0)} 張。
-對應的細胞清單與原始影像路徑見 `bright_dim_selected_cells_global.csv`。
+每顆細胞另外輸出兩種 PNG，對應的細胞清單與原始影像路徑見
+`bright_dim_selected_cells_global.csv`：
+
+- `cell_nobg_global/`：**一張圖一顆細胞的純去背 PNG**，原始像素解析度、無邊框與標題，
+  共 {splits.get('global', {}).get('n_nobg_files', 0)} 張，可直接貼進簡報。
+- `cell_crops_global/`：五格對照圖（phase 原圖／phase 分割／IDO 原圖／IDO 分割（黑底）／
+  IDO 去背（白底）），共 {splits.get('global', {}).get('n_crop_files', 0)} 張，供 QC 用。
 
 ### matched：同一刺激條件內
 
@@ -278,6 +282,7 @@ rank-biserial 效果量：+1 代表亮組該特徵幾乎總是比暗組大，0 �
 | `bright_dim_features_*.csv` | 亮／暗細胞的外觀特徵比較 |
 | `bright_dim_selected_cells_*.csv` | 影像庫實際用到的細胞清單與原始影像路徑 |
 | `fov_background_removed_selected.csv` | 整張視野去背圖用到的視野清單 |
+| `cell_nobg_global/` | 一張圖一顆細胞的純去背 PNG |
 | `cell_crops_global/` | 逐顆細胞的五格 PNG（含白底去背） |
 | `fov_background_removed/` | 全尺寸整張視野去背 PNG |
 | `figures/` | 全部圖表 |

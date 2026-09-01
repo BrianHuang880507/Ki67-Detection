@@ -324,6 +324,49 @@ def test_incell_ido_vmax_ignores_background_pixels() -> None:
     assert vmax == pytest.approx(200.0, abs=1.0)
 
 
+def test_crop_cell_keeps_native_resolution_when_tile_pixels_is_none() -> None:
+    bundle = _toy_bundle()
+    resized = gl.crop_cell(bundle, 3, padding=1.4, tile_pixels=48)
+    native = gl.crop_cell(bundle, 3, padding=1.4, tile_pixels=None)
+    assert resized["ido"].shape == (48, 48)
+    assert native["ido"].shape != (48, 48)
+    assert native["ido"].shape == native["mask"].shape == native["nucleus"].shape
+    assert native["mask"].any()
+
+
+def test_write_nobg_cells_writes_one_file_per_cell(tmp_path: Path) -> None:
+    from matplotlib import image as mpimage
+
+    bundle = _toy_bundle()
+    crop = gl.crop_cell(bundle, 3, padding=1.4, tile_pixels=48)
+    crop["native"] = gl.crop_cell(bundle, 3, padding=1.4, tile_pixels=None)
+    crops = {("IMG00", 3): crop}
+    selection = pd.DataFrame(
+        [{"image_key": "IMG00", "cell_label": 3, "brightness_group": "bright"}]
+    )
+
+    records = gl.write_nobg_cells(selection, crops, tmp_path / "cell_nobg")
+    assert len(records) == 1
+    written = sorted((tmp_path / "cell_nobg").glob("*.png"))
+    assert len(written) == 1
+    assert written[0].name == "bright_IMG00_cell0003.png"
+
+    saved = mpimage.imread(written[0])
+    assert saved.shape[:2] == crop["native"]["ido"].shape
+    # 角落必須是白色背景，代表背景真的被移除。
+    assert saved[0, 0, 0] == pytest.approx(1.0, abs=0.01)
+    assert saved[0, 0, 1] == pytest.approx(1.0, abs=0.01)
+
+
+def test_write_nobg_cells_requires_native_crops(tmp_path: Path) -> None:
+    crops = {("IMG00", 3): gl.crop_cell(_toy_bundle(), 3, padding=1.4, tile_pixels=48)}
+    selection = pd.DataFrame(
+        [{"image_key": "IMG00", "cell_label": 3, "brightness_group": "bright"}]
+    )
+    with pytest.raises(gl.GalleryError, match="native"):
+        gl.write_nobg_cells(selection, crops, tmp_path / "cell_nobg")
+
+
 def test_load_image_bundle_reports_a_missing_mask(tmp_path: Path) -> None:
     row = pd.Series({"group_id": "B4_P5", "image_key": "IMG99", "pc_path": "x", "ido_path": "y"})
     with pytest.raises(gl.GalleryError, match="mask cache"):

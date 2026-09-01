@@ -101,6 +101,7 @@ TNF 軸的相關係數在 IFN 區塊內計算（partial Spearman：先在區塊�
 | `figures/fig06_top10_bright_vs_dim_matched.png` | 同一條件下亮／暗細胞的外觀差異 |
 | `figures/fig07_fov_background_removed.png` | 整張視野去背：未刺激 vs. 強刺激，各 3 張 |
 | `figures/fig_gallery_{global,matched}_{ido,phase,ido_segmented,ido_nobg}.png` | 亮／暗細胞影像庫，共 8 張 |
+| `cell_nobg_global/*.png` | **一張圖一顆細胞的純去背 PNG**，原始像素解析度，無邊框與標題 |
 | `cell_crops_global/*.png` | 逐顆細胞五格圖：phase 原圖／phase 分割／IDO 原圖／IDO 分割（黑底）／IDO 去背（白底） |
 | `fov_background_removed/*.png` | 全尺寸整張視野去背 PNG |
 

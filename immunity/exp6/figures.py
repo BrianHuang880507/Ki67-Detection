@@ -94,7 +94,7 @@ def _draw_rho_bars(
     marks: list[str],
     *,
     title: str,
-    subtitle: str,
+    subtitle: str | None = None,
 ) -> None:
     """畫一張帶正負號的水平 rho 長條圖，最強的排在最上面。"""
     y = np.arange(len(labels))[::-1]
@@ -119,16 +119,24 @@ def _draw_rho_bars(
             fontsize=9,
             color=TEXT_SECONDARY,
         )
-    ax.set_title(title, fontsize=13, color=TEXT_PRIMARY, loc="left", pad=27, fontweight="bold")
-    ax.text(
-        0.0,
-        1.012,
-        subtitle,
-        transform=ax.transAxes,
-        fontsize=9.5,
-        color=TEXT_SECONDARY,
-        va="bottom",
+    ax.set_title(
+        title,
+        fontsize=13,
+        color=TEXT_PRIMARY,
+        loc="left",
+        pad=27 if subtitle else 12,
+        fontweight="bold",
     )
+    if subtitle:
+        ax.text(
+            0.0,
+            1.012,
+            subtitle,
+            transform=ax.transAxes,
+            fontsize=9.5,
+            color=TEXT_SECONDARY,
+            va="bottom",
+        )
     _style_axes(ax)
 
 
@@ -145,7 +153,6 @@ def plot_top_features(
     labels = subset["feature_label"].tolist()
     rhos = subset["spearman_rho"].tolist()
     marks = [_significance_mark(value) for value in subset["q_value_bh"]]
-    n_images = int(subset["n_images"].iloc[0])
 
     fig = _new_figure(9.0, 5.6)
     ax = fig.add_subplot(111)
@@ -155,10 +162,6 @@ def plot_top_features(
         rhos,
         marks,
         title=f"外觀特徵與 {axis_title} 的關聯性　前 {top_n} 名",
-        subtitle=(
-            f"n = {n_images} 張影像　|　藍＝正相關、紅＝負相關　|　"
-            "* q<0.05、** q<0.01、*** q<0.001（BH FDR）"
-        ),
     )
     return _save(fig, out_path)
 
@@ -179,7 +182,6 @@ def plot_top_features_combined(
             subset["spearman_rho"].tolist(),
             [_significance_mark(value) for value in subset["q_value_bh"]],
             title=f"vs. {axis_title}",
-            subtitle=f"n = {int(subset['n_images'].iloc[0])} 張影像",
         )
     fig.suptitle(
         "細胞外觀特徵與細胞激素劑量的關聯性　前 10 名",
@@ -240,18 +242,8 @@ def plot_features_vs_ido(table: pd.DataFrame, out_path: Path, *, top_n: int = 10
         fontsize=13,
         color=TEXT_PRIMARY,
         loc="left",
-        pad=27,
+        pad=12,
         fontweight="bold",
-    )
-    ax.text(
-        0.0,
-        1.012,
-        f"n = {int(subset['n_images'].iloc[0])} 張影像　|　"
-        "右側掉到接近 0 表示該特徵跟的是劑量，不是 IDO 本身",
-        transform=ax.transAxes,
-        fontsize=9.5,
-        color=TEXT_SECONDARY,
-        va="bottom",
     )
     _style_axes(ax)
     legend = ax.legend(frameon=False, fontsize=9.5, loc="lower left")
@@ -353,15 +345,7 @@ def plot_ido_dose_response(
         fontweight="bold",
         x=0.045,
         ha="left",
-        y=1.11,
-    )
-    fig.text(
-        0.045,
-        1.048,
-        "每點 = 一張影像的細胞中位數　|　ρ 為該軸的 Spearman 相關係數，Δ中位數為最高與最低劑量的灰階差",
-        fontsize=9.5,
-        color=TEXT_SECONDARY,
-        ha="left",
+        y=1.05,
     )
     fig.tight_layout(w_pad=2.0)
     return _save(fig, out_path)
@@ -396,25 +380,13 @@ def plot_bright_dim_contrast(table: pd.DataFrame, out_path: Path, *, top_n: int 
             fontsize=9,
             color=TEXT_SECONDARY,
         )
-    n_bright = int(subset["n_bright"].iloc[0])
-    n_dim = int(subset["n_dim"].iloc[0])
     ax.set_title(
         "IDO 亮細胞 vs. 暗細胞的外觀差異　前 10 名",
         fontsize=13,
         color=TEXT_PRIMARY,
         loc="left",
-        pad=27,
+        pad=12,
         fontweight="bold",
-    )
-    ax.text(
-        0.0,
-        1.012,
-        f"同一刺激條件內取上／下 {int(subset['decile_pct'].iloc[0])}%　|　"
-        f"亮 n = {n_bright}、暗 n = {n_dim} 顆細胞",
-        transform=ax.transAxes,
-        fontsize=9.5,
-        color=TEXT_SECONDARY,
-        va="bottom",
     )
     _style_axes(ax)
     return _save(fig, out_path)

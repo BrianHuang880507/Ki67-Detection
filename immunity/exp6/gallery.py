@@ -240,11 +240,12 @@ def render_background_removed(
 
 
 def crop_cell(
-    bundle: ImageBundle, cell_label: int, *, padding: float, tile_pixels: int
+    bundle: ImageBundle, cell_label: int, *, padding: float, tile_pixels: int | None
 ) -> dict[str, np.ndarray]:
     """裁出單顆細胞的 phase／IDO 影像與遮罩。
 
-    回傳的四個陣列都已重採樣成 `tile_pixels` 見方：
+    `tile_pixels` 為 `None` 時保留原始像素尺寸（供單顆細胞出圖用），否則統一
+    重採樣成 `tile_pixels` 見方（供影像庫排版用）：
 
     - `phase`、`ido`：帶周圍環境的原始裁切。
     - `phase_segmented`、`ido_segmented`：只留下該細胞 mask 內的像素（背景為 0）。
@@ -271,6 +272,8 @@ def crop_cell(
     ido = bundle.ido[window]
 
     def _resize(array: np.ndarray, nearest: bool = False) -> np.ndarray:
+        if tile_pixels is None:
+            return array.copy()
         mode = cv2.INTER_NEAREST if nearest else cv2.INTER_LINEAR
         return cv2.resize(array, (tile_pixels, tile_pixels), interpolation=mode)
 
@@ -286,20 +289,68 @@ def crop_cell(
 
 
 def collect_crops(
-    data_root: Path, selection: pd.DataFrame, config: GalleryConfig
+    data_root: Path,
+    selection: pd.DataFrame,
+    config: GalleryConfig,
+    *,
+    include_native: bool = False,
 ) -> dict[tuple[str, int], dict[str, np.ndarray]]:
-    """把選中的細胞逐張影像讀進來，避免同一張影像重複解碼。"""
+    """把選中的細胞逐張影像讀進來，避免同一張影像重複解碼。
+
+    `include_native` 為真時，每個 crop 額外掛一份未經重採樣的 `native` 子字典，
+    供單顆細胞出圖使用；影像庫排版仍用統一尺寸的版本。
+    """
     crops: dict[tuple[str, int], dict[str, np.ndarray]] = {}
     for image_key, block in selection.groupby("image_key", sort=False):
         bundle = load_image_bundle(data_root, block.iloc[0])
         for row in block.itertuples():
-            crops[(str(image_key), int(row.cell_label))] = crop_cell(
+            crop = crop_cell(
                 bundle,
                 int(row.cell_label),
                 padding=config.padding,
                 tile_pixels=config.tile_pixels,
             )
+            if include_native:
+                crop["native"] = crop_cell(
+                    bundle, int(row.cell_label), padding=config.padding, tile_pixels=None
+                )
+            crops[(str(image_key), int(row.cell_label))] = crop
     return crops
+
+
+def write_nobg_cells(
+    selection: pd.DataFrame,
+    crops: dict[tuple[str, int], dict[str, np.ndarray]],
+    out_dir: Path,
+) -> list[dict[str, object]]:
+    """每顆細胞輸出一張純去背 PNG：一張圖一顆細胞，沒有邊框、標題或座標軸。
+
+    使用未經重採樣的原始像素，所以解析度由細胞本身大小決定，貼進簡報不會糊。
+    顯示範圍由所有細胞的細胞內像素共同決定，亮暗才可以互相比較。
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    natives = {key: crop["native"] for key, crop in crops.items() if "native" in crop}
+    if not natives:
+        raise GalleryError("collect_crops 未產生 native 版本，無法輸出單顆細胞圖")
+    vmax = incell_ido_vmax(natives)
+
+    records: list[dict[str, object]] = []
+    for row in selection.itertuples():
+        native = natives[(str(row.image_key), int(row.cell_label))]
+        rgb = render_background_removed(
+            native["ido"], native["mask"], native["nucleus"], vmax=vmax
+        )
+        filename = f"{row.brightness_group}_{row.image_key}_cell{int(row.cell_label):04d}.png"
+        plt.imsave(out_dir / filename, np.clip(rgb, 0.0, 1.0))
+        records.append(
+            {
+                "image_key": row.image_key,
+                "cell_label": int(row.cell_label),
+                "nobg_file": filename,
+                "nobg_pixels": int(rgb.shape[0]),
+            }
+        )
+    return records
 
 
 def _ido_display_range(crops: dict[tuple[str, int], dict[str, np.ndarray]]) -> tuple[float, float]:
@@ -514,7 +565,7 @@ def build_split(
     if missing_paths or selected["pc_path"].isna().any():
         raise GalleryError("選中的細胞缺少影像路徑，請確認 manifest 已併入 cell 表")
 
-    crops = collect_crops(data_root, selected, config)
+    crops = collect_crops(data_root, selected, config, include_native=write_crops)
     figures_dir = out_root / "figures"
     paths = {
         "ido": plot_gallery(
@@ -555,8 +606,10 @@ def build_split(
     }
 
     crop_records: list[dict[str, object]] = []
+    nobg_records: list[dict[str, object]] = []
     if write_crops:
         crop_records = write_cell_crops(selected, crops, out_root / f"cell_crops_{split_name}")
+        nobg_records = write_nobg_cells(selected, crops, out_root / f"cell_nobg_{split_name}")
 
     export_columns = [
         "image_key",
@@ -575,8 +628,11 @@ def build_split(
         "ido_path",
     ]
     export = selected[export_columns].copy()
-    if crop_records:
-        export = export.merge(pd.DataFrame(crop_records), on=["image_key", "cell_label"], how="left")
+    for records in (crop_records, nobg_records):
+        if records:
+            export = export.merge(
+                pd.DataFrame(records), on=["image_key", "cell_label"], how="left"
+            )
 
     counts = labelled["brightness_group"].value_counts()
     return {
@@ -589,4 +645,5 @@ def build_split(
         "selection": export,
         "figures": paths,
         "n_crop_files": len(crop_records),
+        "n_nobg_files": len(nobg_records),
     }

@@ -217,7 +217,8 @@ def main(argv: list[str] | None = None) -> int:
             log(
                 f"影像庫 {split_name}：亮 {result['labelled_counts']['bright']} 顆、"
                 f"暗 {result['labelled_counts']['dim']} 顆；"
-                f"逐顆 PNG {result['n_crop_files']} 張"
+                f"逐顆五格 PNG {result['n_crop_files']} 張、"
+                f"單顆去背 PNG {result['n_nobg_files']} 張"
             )
             splits[split_name] = result
 
