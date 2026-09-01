@@ -219,6 +219,24 @@ def render_report(
 | `global` | 全部細胞取 IDO_score_ff 上／下 {decile_pct:.0f}% | {global_counts.get('bright', 0):,} | {global_counts.get('dim', 0):,} | 最直觀的「亮 vs 不亮」，但亮的那群幾乎必然來自 IFN-γ 刺激組 |
 | `matched` | 在每個 donor×passage×條件內取上／下 {decile_pct:.0f}% | {matched_counts.get('bright', 0):,} | {matched_counts.get('dim', 0):,} | 劑量被固定住，剩下的差異才是「同樣刺激下，為什麼有些細胞亮」 |
 
+### 去背版本（背景已移除）
+
+白底＝背景已移除，綠色＝IDO 強度，藍色＝細胞核，紅線＝分割輪廓。
+綠色飽和值只由細胞內像素決定，所以不會被大片白色背景拉暗。
+
+![global 去背](figures/fig_gallery_global_ido_nobg.png)
+
+![matched 去背](figures/fig_gallery_matched_ido_nobg.png)
+
+### 整張視野去背：未刺激 vs. 強刺激
+
+保留細胞在視野中的原始位置，看得到密度與排列。只畫通過 QC、有配到細胞核的細胞，
+所以畫面上看到的細胞就是統計用到的細胞。
+
+![整張視野去背](figures/fig07_fov_background_removed.png)
+
+全尺寸單張 PNG 放在 `fov_background_removed/`，清單見 `fov_background_removed_selected.csv`。
+
 ### global：不分刺激條件
 
 ![global IDO 影像庫](figures/fig_gallery_global_ido.png)
@@ -227,8 +245,8 @@ def render_report(
 
 ![global 分割後 IDO](figures/fig_gallery_global_ido_segmented.png)
 
-每顆細胞另外輸出一張四格 PNG（phase 原圖／phase 分割／IDO 原圖／IDO 分割），
-放在 `cell_crops_global/`，共 {splits.get('global', {}).get('n_crop_files', 0)} 張。
+每顆細胞另外輸出一張五格 PNG（phase 原圖／phase 分割／IDO 原圖／IDO 分割（黑底）／
+IDO 去背（白底）），放在 `cell_crops_global/`，共 {splits.get('global', {}).get('n_crop_files', 0)} 張。
 對應的細胞清單與原始影像路徑見 `bright_dim_selected_cells_global.csv`。
 
 ### matched：同一刺激條件內
@@ -259,7 +277,9 @@ rank-biserial 效果量：+1 代表亮組該特徵幾乎總是比暗組大，0 �
 | `image_level_dataset.csv` | 影像層級資料（一張影像一列） |
 | `bright_dim_features_*.csv` | 亮／暗細胞的外觀特徵比較 |
 | `bright_dim_selected_cells_*.csv` | 影像庫實際用到的細胞清單與原始影像路徑 |
-| `cell_crops_global/` | 逐顆細胞的四格 PNG |
+| `fov_background_removed_selected.csv` | 整張視野去背圖用到的視野清單 |
+| `cell_crops_global/` | 逐顆細胞的五格 PNG（含白底去背） |
+| `fov_background_removed/` | 全尺寸整張視野去背 PNG |
 | `figures/` | 全部圖表 |
 | `run_metadata.json`、`run.log` | 執行環境與紀錄 |
 

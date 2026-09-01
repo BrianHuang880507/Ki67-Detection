@@ -38,6 +38,7 @@ from .figures import (
     plot_top_features,
     plot_top_features_combined,
 )
+from .fov_views import build_fov_views
 from .gallery import GalleryConfig, MATCH_STRATA, build_split
 from .reporting import render_report
 
@@ -86,6 +87,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--tiles-per-group", type=int, default=30, help="影像庫每組放幾顆細胞（預設 30）"
+    )
+    parser.add_argument(
+        "--fov-views-per-condition",
+        type=int,
+        default=3,
+        help="整張視野去背圖每個條件放幾張（預設 3）",
     )
     parser.add_argument(
         "--skip-gallery", action="store_true", help="只跑第一部分的關聯分析，不讀原始影像"
@@ -220,6 +227,22 @@ def main(argv: list[str] | None = None) -> int:
             splits["matched"]["contrast"],
             figures_dir / f"fig06_top{args.top_n}_bright_vs_dim_matched.png",
             top_n=args.top_n,
+        )
+
+        fov_views = build_fov_views(
+            cells,
+            fov,
+            data_root,
+            out_root,
+            per_condition=args.fov_views_per_condition,
+            write_full_size=not args.skip_cell_crops,
+        )
+        figure_paths["fov_background_removed"] = fov_views["comparison_figure"]
+        _write_csv(fov_views["selected"], out_root / "fov_background_removed_selected.csv", log)
+        log(
+            f"整張視野去背：{len(fov_views['selected'])} 張，"
+            f"全尺寸 PNG {len(fov_views['full_size_files'])} 張，"
+            f"綠色飽和值 {fov_views['vmax']:.0f} 灰階"
         )
         log("第二部分圖表完成")
     else:

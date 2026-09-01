@@ -244,19 +244,30 @@ def test_sample_cells_is_deterministic_and_capped(cell_table: pd.DataFrame) -> N
     assert list(first["cell_label"]) == list(second["cell_label"])
 
 
-def test_crop_cell_masks_everything_outside_the_label() -> None:
+def _toy_bundle() -> gl.ImageBundle:
+    """一顆位於畫面中央的方形細胞，內含一個更小的方形細胞核。"""
     cell_mask = np.zeros((60, 60), dtype=np.int32)
     cell_mask[20:40, 25:35] = 3
+    nucleus_mask = np.zeros((60, 60), dtype=np.int32)
+    nucleus_mask[27:33, 28:32] = 1
     phase = np.full((60, 60), 50.0, dtype=np.float32)
     ido = np.full((60, 60), 7.0, dtype=np.float32)
     ido[20:40, 25:35] = 200.0
-    bundle = gl.ImageBundle(phase=phase, ido=ido, cell_mask=cell_mask)
+    return gl.ImageBundle(
+        phase=phase, ido=ido, cell_mask=cell_mask, nucleus_mask=nucleus_mask
+    )
 
-    crop = gl.crop_cell(bundle, 3, padding=1.4, tile_pixels=48)
+
+def test_crop_cell_masks_everything_outside_the_label() -> None:
+    crop = gl.crop_cell(_toy_bundle(), 3, padding=1.4, tile_pixels=48)
     assert crop["ido"].shape == (48, 48)
     outside = crop["mask"] < 0.5
     assert np.allclose(crop["ido_segmented"][outside], 0.0)
     assert crop["ido_segmented"][crop["mask"] > 0.5].max() == pytest.approx(200.0)
+    assert crop["nucleus"].shape == (48, 48)
+    assert crop["nucleus"].max() == pytest.approx(1.0)
+    # 細胞核必須完全落在細胞之內。
+    assert not np.any((crop["nucleus"] > 0.5) & (crop["mask"] < 0.5))
 
 
 def test_crop_cell_rejects_a_missing_label() -> None:
@@ -264,15 +275,92 @@ def test_crop_cell_rejects_a_missing_label() -> None:
         phase=np.zeros((10, 10), dtype=np.float32),
         ido=np.zeros((10, 10), dtype=np.float32),
         cell_mask=np.zeros((10, 10), dtype=np.int32),
+        nucleus_mask=np.zeros((10, 10), dtype=np.int32),
     )
     with pytest.raises(gl.GalleryError, match="cell_label"):
         gl.crop_cell(bundle, 9, padding=1.2, tile_pixels=16)
+
+
+def test_render_background_removed_whitens_outside_and_paints_the_nucleus() -> None:
+    bundle = _toy_bundle()
+    cell = bundle.cell_mask == 3
+    nucleus = bundle.nucleus_mask > 0
+    rgb = gl.render_background_removed(bundle.ido, cell, nucleus, vmax=200.0)
+
+    assert rgb.shape == (60, 60, 3)
+    assert np.allclose(rgb[0, 0], gl.WHITE_BG)
+    assert np.allclose(rgb[~cell], np.array(gl.WHITE_BG, dtype=np.float32))
+    # 細胞核中心是純藍，不是綠色訊號。
+    assert np.allclose(rgb[30, 30], np.array(gl.NUCLEUS_BLUE, dtype=np.float32), atol=1e-6)
+    # 細胞核外圍有紅環，細胞內部沒有任何白色像素。
+    assert np.any(np.all(np.isclose(rgb[cell], np.array(gl.OUTLINE_RED)), axis=-1))
+    assert not np.any(np.all(rgb[cell] == 1.0, axis=-1))
+
+
+def test_render_background_removed_scales_green_with_vmax() -> None:
+    bundle = _toy_bundle()
+    cell = bundle.cell_mask == 3
+    empty = np.zeros_like(bundle.nucleus_mask)
+    bright = gl.render_background_removed(bundle.ido, cell, empty, vmax=200.0)
+    dim = gl.render_background_removed(bundle.ido, cell, empty, vmax=800.0)
+    assert bright[30, 27, 1] > dim[30, 27, 1]
+    assert dim[30, 27, 1] == pytest.approx(0.25, abs=0.02)
+
+
+def test_render_background_removed_rejects_mismatched_shapes() -> None:
+    with pytest.raises(gl.GalleryError, match="尺寸不符"):
+        gl.render_background_removed(
+            np.zeros((10, 10), dtype=np.float32),
+            np.zeros((10, 10), dtype=bool),
+            np.zeros((8, 8), dtype=bool),
+            vmax=1.0,
+        )
+
+
+def test_incell_ido_vmax_ignores_background_pixels() -> None:
+    crop = gl.crop_cell(_toy_bundle(), 3, padding=1.4, tile_pixels=48)
+    vmax = gl.incell_ido_vmax({("IMG", 3): crop}, percentile=99.0)
+    # 細胞內是 200、背景是 7；若把背景算進去，百分位會被拉低。
+    assert vmax == pytest.approx(200.0, abs=1.0)
 
 
 def test_load_image_bundle_reports_a_missing_mask(tmp_path: Path) -> None:
     row = pd.Series({"group_id": "B4_P5", "image_key": "IMG99", "pc_path": "x", "ido_path": "y"})
     with pytest.raises(gl.GalleryError, match="mask cache"):
         gl.load_image_bundle(tmp_path, row)
+
+
+def test_pick_reference_fovs_filters_by_cell_count_and_takes_the_extreme(
+    cell_table: pd.DataFrame,
+) -> None:
+    from immunity.exp6 import fov_views as fv
+
+    fov = ds.build_fov_table(cell_table)
+    chosen = fv.pick_reference_fovs(
+        fov,
+        cell_table,
+        condition="IFN0_TNF0",
+        count=2,
+        ascending=False,
+        min_cells=1,
+        max_cells=40,
+    )
+    assert len(chosen) == 2
+    assert (chosen["condition"] == "IFN0_TNF0").all()
+    assert {"pc_path", "ido_path"} <= set(chosen.columns)
+    others = fov[(fov["condition"] == "IFN0_TNF0") & ~fov["image_key"].isin(chosen["image_key"])]
+    if not others.empty:
+        assert chosen["IDO_score_ff"].min() >= others["IDO_score_ff"].max()
+
+
+def test_pick_reference_fovs_rejects_an_impossible_cell_count(cell_table: pd.DataFrame) -> None:
+    from immunity.exp6 import fov_views as fv
+
+    fov = ds.build_fov_table(cell_table)
+    with pytest.raises(gl.GalleryError, match="沒有細胞數"):
+        fv.pick_reference_fovs(
+            fov, cell_table, condition="IFN0_TNF0", count=1, ascending=True, min_cells=99
+        )
 
 
 def test_render_report_contains_both_questions(cell_table: pd.DataFrame) -> None:

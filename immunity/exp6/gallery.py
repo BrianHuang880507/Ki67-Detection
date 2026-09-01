@@ -36,6 +36,11 @@ IDO_CMAP = LinearSegmentedColormap.from_list("ido_green", ["#000000", "#0f3d1e",
 BRIGHT_COLOR = "#1baf7a"
 DIM_COLOR = "#4a3aa7"
 
+#: 去背算繪的三個顏色，沿用螢光影像的慣例：白底、綠色訊號、藍色細胞核、紅色輪廓。
+WHITE_BG = (1.0, 1.0, 1.0)
+NUCLEUS_BLUE = (0.09, 0.09, 0.78)
+OUTLINE_RED = (0.85, 0.06, 0.06)
+
 MATCH_STRATA = ["group_id", "condition_index"]
 
 
@@ -50,7 +55,7 @@ class GalleryConfig:
     decile_pct: float = 10.0
     tiles_per_group: int = 30
     crops_per_group: int = 40
-    tile_pixels: int = 132
+    tile_pixels: int = 180
     padding: float = 1.35
     seed: int = 0
 
@@ -161,25 +166,77 @@ def _mask_path(data_root: Path, group_id: str, image_key: str) -> Path:
 
 @dataclass
 class ImageBundle:
-    """一張影像所需的三個陣列。"""
+    """一張影像所需的四個陣列。"""
 
     phase: np.ndarray
     ido: np.ndarray
     cell_mask: np.ndarray
+    nucleus_mask: np.ndarray
 
 
 def load_image_bundle(data_root: Path, row: pd.Series) -> ImageBundle:
-    """載入單張影像的 phase、IDO 與 whole-cell mask。"""
+    """載入單張影像的 phase、IDO 與 whole-cell／nucleus mask。"""
     mask_file = _mask_path(data_root, str(row["group_id"]), str(row["image_key"]))
     if not mask_file.exists():
         raise GalleryError(f"找不到 mask cache：{mask_file}")
     with np.load(mask_file) as archive:
         cell_mask = np.asarray(archive["cell_mask"])
+        nucleus_mask = np.asarray(archive["nucleus_mask"])
     phase = _read_grayscale(Path(str(row["pc_path"])))
     ido = _read_grayscale(Path(str(row["ido_path"])))
-    if phase.shape != cell_mask.shape or ido.shape != cell_mask.shape:
+    shapes = {phase.shape, ido.shape, cell_mask.shape, nucleus_mask.shape}
+    if len(shapes) != 1:
         raise GalleryError(f"{row['image_key']} 的影像與 mask 尺寸不符")
-    return ImageBundle(phase=phase, ido=ido, cell_mask=cell_mask)
+    return ImageBundle(
+        phase=phase, ido=ido, cell_mask=cell_mask, nucleus_mask=nucleus_mask
+    )
+
+
+def render_background_removed(
+    ido: np.ndarray,
+    cell: np.ndarray,
+    nucleus: np.ndarray,
+    *,
+    vmax: float,
+    ring_width: int = 2,
+    draw_outline: bool = True,
+) -> np.ndarray:
+    """把 IDO 訊號畫成白底去背影像。
+
+    細胞外的所有像素換成白色，細胞內以「黑→綠」呈現 IDO 強度，細胞核填藍色
+    並加紅色環。輸出是 float RGB，可直接餵給 `imshow`。
+
+    Args:
+        ido: 二維 IDO 灰階影像。
+        cell: 與 `ido` 同尺寸的細胞布林遮罩。
+        nucleus: 細胞核布林遮罩，已限制在 `cell` 之內。
+        vmax: 綠色飽和對應的灰階值；所有面板共用同一個值才能互相比較。
+        ring_width: 細胞核紅環的粗細（像素）。
+        draw_outline: 是否額外畫出細胞外輪廓。
+    """
+    if ido.shape != cell.shape or ido.shape != nucleus.shape:
+        raise GalleryError("去背算繪的影像與遮罩尺寸不符")
+    cell_bool = cell.astype(bool)
+    nucleus_bool = nucleus.astype(bool) & cell_bool
+
+    rgb = np.empty((*ido.shape, 3), dtype=np.float32)
+    rgb[...] = WHITE_BG
+    green = np.clip(ido / max(vmax, 1e-6), 0.0, 1.0)
+    rgb[cell_bool] = 0.0
+    rgb[..., 1] = np.where(cell_bool, green, np.float32(WHITE_BG[1]))
+
+    if draw_outline:
+        eroded = cv2.erode(cell_bool.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1)
+        rgb[cell_bool & (eroded == 0)] = OUTLINE_RED
+
+    if nucleus_bool.any():
+        rgb[nucleus_bool] = NUCLEUS_BLUE
+        if ring_width > 0:
+            kernel = np.ones((3, 3), np.uint8)
+            grown = cv2.dilate(nucleus_bool.astype(np.uint8), kernel, iterations=ring_width)
+            ring = (grown > 0) & ~nucleus_bool & cell_bool
+            rgb[ring] = OUTLINE_RED
+    return rgb
 
 
 def crop_cell(
@@ -190,8 +247,9 @@ def crop_cell(
     回傳的四個陣列都已重採樣成 `tile_pixels` 見方：
 
     - `phase`、`ido`：帶周圍環境的原始裁切。
-    - `phase_segmented`、`ido_segmented`：只留下該細胞 mask 內的像素。
-    - `mask`：布林遮罩，供畫輪廓用。
+    - `phase_segmented`、`ido_segmented`：只留下該細胞 mask 內的像素（背景為 0）。
+    - `mask`：該細胞的布林遮罩，供畫輪廓用。
+    - `nucleus`：該細胞內的細胞核遮罩，供去背算繪填藍色用。
     """
     ys, xs = np.nonzero(bundle.cell_mask == cell_label)
     if xs.size == 0:
@@ -208,6 +266,7 @@ def crop_cell(
 
     window = (slice(y0, y1), slice(x0, x1))
     mask = (bundle.cell_mask[window] == cell_label).astype(np.float32)
+    nucleus = ((bundle.nucleus_mask[window] > 0) & (mask > 0)).astype(np.float32)
     phase = bundle.phase[window]
     ido = bundle.ido[window]
 
@@ -222,6 +281,7 @@ def crop_cell(
         "phase_segmented": _resize(phase) * mask_resized,
         "ido_segmented": _resize(ido) * mask_resized,
         "mask": mask_resized,
+        "nucleus": _resize(nucleus, nearest=True),
     }
 
 
@@ -248,6 +308,21 @@ def _ido_display_range(crops: dict[tuple[str, int], dict[str, np.ndarray]]) -> t
     return 0.0, float(np.percentile(values, 99.5))
 
 
+def incell_ido_vmax(
+    crops: dict[tuple[str, int], dict[str, np.ndarray]], *, percentile: float = 99.0
+) -> float:
+    """去背算繪的綠色飽和值，只由細胞內像素決定。
+
+    去背之後畫面上超過九成是白色背景，若沿用整張影像的百分位，亮度會被背景
+    拉低，所有細胞都會偏暗。
+    """
+    values = [crop["ido"][crop["mask"] > 0.5] for crop in crops.values()]
+    pooled = np.concatenate([block for block in values if block.size])
+    if pooled.size == 0:
+        raise GalleryError("沒有任何細胞內像素可決定顯示範圍")
+    return float(max(np.percentile(pooled, percentile), 1.0))
+
+
 def _draw_tile(
     ax: plt.Axes,
     image: np.ndarray,
@@ -258,8 +333,11 @@ def _draw_tile(
     outline: np.ndarray | None,
     outline_color: str,
 ) -> None:
-    """畫一格 tile，必要時疊上細胞輪廓。"""
-    ax.imshow(image, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
+    """畫一格 tile，必要時疊上細胞輪廓。RGB 影像直接顯示，不套 colormap。"""
+    if image.ndim == 3:
+        ax.imshow(image, interpolation="nearest")
+    else:
+        ax.imshow(image, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
     if outline is not None:
         ax.contour(outline, levels=[0.5], colors=[outline_color], linewidths=0.9)
     ax.set_xticks([])
@@ -278,11 +356,18 @@ def plot_gallery(
     subtitle: str,
     columns: int = 10,
 ) -> Path:
-    """畫「亮組在上、暗組在下」的影像庫。"""
+    """畫「亮組在上、暗組在下」的影像庫。
+
+    `channel` 為 `"ido_nobg"` 時改走去背算繪：白底、綠色 IDO、藍色細胞核、
+    紅色輪廓，綠色飽和值只由細胞內像素決定。
+    """
+    no_background = channel == "ido_nobg"
     vmin, vmax = _ido_display_range(crops)
     is_ido = channel.startswith("ido")
     cmap = IDO_CMAP if is_ido else "gray"
-    if not is_ido:
+    if no_background:
+        vmax = incell_ido_vmax(crops)
+    elif not is_ido:
         phase_values = np.concatenate([crop["phase"].ravel() for crop in crops.values()])
         vmin = float(np.percentile(phase_values, 1))
         vmax = float(np.percentile(phase_values, 99))
@@ -317,13 +402,21 @@ def plot_gallery(
             grid_col = position % columns
             ax = fig.add_subplot(grid[grid_row, grid_col])
             crop = crops[(str(row.image_key), int(row.cell_label))]
+            if no_background:
+                tile = render_background_removed(
+                    crop["ido"], crop["mask"], crop["nucleus"], vmax=vmax
+                )
+                tile_outline = None
+            else:
+                tile = crop[channel]
+                tile_outline = crop["mask"] if not channel.endswith("segmented") else None
             _draw_tile(
                 ax,
-                crop[channel],
+                tile,
                 cmap=cmap,
                 vmin=vmin,
                 vmax=vmax,
-                outline=crop["mask"] if not channel.endswith("segmented") else None,
+                outline=tile_outline,
                 outline_color=color,
             )
             ax.set_title(
@@ -353,9 +446,10 @@ def write_cell_crops(
     crops: dict[tuple[str, int], dict[str, np.ndarray]],
     out_dir: Path,
 ) -> list[dict[str, object]]:
-    """每顆細胞輸出一張四格 PNG：phase 原圖／分割、IDO 原圖／分割。"""
+    """每顆細胞輸出一張五格 PNG，最後一格是白底去背版本。"""
     out_dir.mkdir(parents=True, exist_ok=True)
     vmin_ido, vmax_ido = _ido_display_range(crops)
+    vmax_nobg = incell_ido_vmax(crops)
     phase_values = np.concatenate([crop["phase"].ravel() for crop in crops.values()])
     vmin_pc = float(np.percentile(phase_values, 1))
     vmax_pc = float(np.percentile(phase_values, 99))
@@ -364,16 +458,20 @@ def write_cell_crops(
     for row in selection.itertuples():
         crop = crops[(str(row.image_key), int(row.cell_label))]
         color = BRIGHT_COLOR if row.brightness_group == "bright" else DIM_COLOR
-        fig = _new_figure(6.6, 2.15)
-        axes = fig.subplots(1, 4)
-        panels = (
-            ("phase", "phase 原圖", "gray", vmin_pc, vmax_pc, crop["mask"]),
-            ("phase_segmented", "phase 分割", "gray", vmin_pc, vmax_pc, None),
-            ("ido", "IDO 原圖", IDO_CMAP, vmin_ido, vmax_ido, crop["mask"]),
-            ("ido_segmented", "IDO 分割", IDO_CMAP, vmin_ido, vmax_ido, None),
+        nobg = render_background_removed(
+            crop["ido"], crop["mask"], crop["nucleus"], vmax=vmax_nobg
         )
-        for ax, (key, label, cmap, low, high, outline) in zip(axes, panels):
-            _draw_tile(ax, crop[key], cmap=cmap, vmin=low, vmax=high, outline=outline, outline_color=color)
+        fig = _new_figure(8.2, 2.15)
+        axes = fig.subplots(1, 5)
+        panels = (
+            (crop["phase"], "phase 原圖", "gray", vmin_pc, vmax_pc, crop["mask"]),
+            (crop["phase_segmented"], "phase 分割", "gray", vmin_pc, vmax_pc, None),
+            (crop["ido"], "IDO 原圖", IDO_CMAP, vmin_ido, vmax_ido, crop["mask"]),
+            (crop["ido_segmented"], "IDO 分割（黑底）", IDO_CMAP, vmin_ido, vmax_ido, None),
+            (nobg, "IDO 去背（白底）", IDO_CMAP, 0.0, 1.0, None),
+        )
+        for ax, (image, label, cmap, low, high, outline) in zip(axes, panels):
+            _draw_tile(ax, image, cmap=cmap, vmin=low, vmax=high, outline=outline, outline_color=color)
             ax.set_title(label, fontsize=8, color=TEXT_SECONDARY, pad=3)
         group_zh = "亮" if row.brightness_group == "bright" else "暗"
         fig.suptitle(
@@ -442,6 +540,17 @@ def build_split(
             channel="ido_segmented",
             title=title,
             subtitle=f"{subtitle}　|　只保留分割輪廓內的 IDO 像素",
+        ),
+        "ido_nobg": plot_gallery(
+            selected,
+            crops,
+            figures_dir / f"fig_gallery_{split_name}_ido_nobg.png",
+            channel="ido_nobg",
+            title=f"{title}　— 去背",
+            subtitle=(
+                f"{subtitle}　|　背景移除：白底、綠色為 IDO 強度、"
+                "藍色為細胞核、紅線為分割輪廓"
+            ),
         ),
     }
 

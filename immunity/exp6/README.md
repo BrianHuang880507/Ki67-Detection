@@ -22,6 +22,7 @@ conda run --no-capture-output -n ki67dtc python -m immunity.exp6.run_experiment
 | `--top-n` | 10 | 長條圖取前幾名 |
 | `--decile-pct` | 10 | 亮／暗各取上下多少百分比 |
 | `--tiles-per-group` | 30 | 影像庫每組放幾顆細胞 |
+| `--fov-views-per-condition` | 3 | 整張視野去背圖每個條件放幾張 |
 | `--skip-gallery` | 關 | 只跑關聯分析，不讀原始影像（約 3 秒） |
 | `--skip-cell-crops` | 關 | 不輸出逐顆細胞的四格 PNG |
 
@@ -98,8 +99,28 @@ TNF 軸的相關係數在 IFN 區塊內計算（partial Spearman：先在區塊�
 | `figures/fig04_top10_features_combined.png` | 上面兩張並排，簡報用 |
 | `figures/fig05_top10_features_vs_ido.png` | 外觀特徵 vs. IDO（全部影像 vs. 同一條件內） |
 | `figures/fig06_top10_bright_vs_dim_matched.png` | 同一條件下亮／暗細胞的外觀差異 |
-| `figures/fig_gallery_{global,matched}_{ido,phase,ido_segmented}.png` | 亮／暗細胞影像庫，共 6 張 |
-| `cell_crops_global/*.png` | 逐顆細胞四格圖：phase 原圖／phase 分割／IDO 原圖／IDO 分割 |
+| `figures/fig07_fov_background_removed.png` | 整張視野去背：未刺激 vs. 強刺激，各 3 張 |
+| `figures/fig_gallery_{global,matched}_{ido,phase,ido_segmented,ido_nobg}.png` | 亮／暗細胞影像庫，共 8 張 |
+| `cell_crops_global/*.png` | 逐顆細胞五格圖：phase 原圖／phase 分割／IDO 原圖／IDO 分割（黑底）／IDO 去背（白底） |
+| `fov_background_removed/*.png` | 全尺寸整張視野去背 PNG |
+
+### 去背算繪
+
+`*_ido_nobg` 與 `fig07` 使用同一套算繪規則，符合螢光影像的慣例：
+
+| 元素 | 顏色 |
+|---|---|
+| 背景（細胞外） | 白色，像素完全移除 |
+| 細胞內 IDO 強度 | 黑 → 綠 |
+| 細胞核 | 藍色實心 ＋ 紅色環 |
+| 細胞分割輪廓 | 紅色細線 |
+
+綠色飽和值 (`vmax`) **只由細胞內像素決定**。去背後畫面上超過九成是白色背景，
+若沿用整張影像的百分位，所有細胞都會偏暗。同一張圖的所有格子共用一個 `vmax`，
+亮暗差異才可以互相比較。
+
+`fig07` 只算繪出現在 cell-level 表裡的細胞，也就是有配到細胞核、沒有貼邊、
+通過面積 QC 的細胞——**畫面上看到的細胞，就是統計用到的細胞**。
 
 ### 兩種亮暗切法
 
