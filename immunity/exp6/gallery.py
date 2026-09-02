@@ -58,6 +58,12 @@ class GalleryConfig:
     tile_pixels: int = 180
     padding: float = 1.35
     seed: int = 0
+    #: 固定裁切視窗邊長（原始像素）。設定後每顆細胞都用同樣大小的視窗，
+    #: 縮放到 tile 之後相對大小才會保留；`None` 則依各自外框加邊界。
+    fixed_span: int | None = None
+    #: 算繪前先扣掉該張影像的細胞外背景中位數。刺激孔的背景本身就偏亮，
+    #: 不扣背景時「暗細胞」在畫面上看起來和亮細胞一樣綠，與 IDO 分數不符。
+    subtract_background: bool = False
 
 
 def assign_brightness_groups(
@@ -240,7 +246,12 @@ def render_background_removed(
 
 
 def crop_cell(
-    bundle: ImageBundle, cell_label: int, *, padding: float, tile_pixels: int | None
+    bundle: ImageBundle,
+    cell_label: int,
+    *,
+    padding: float,
+    tile_pixels: int | None,
+    fixed_span: int | None = None,
 ) -> dict[str, np.ndarray]:
     """裁出單顆細胞的 phase／IDO 影像與遮罩。
 
@@ -257,19 +268,37 @@ def crop_cell(
         raise GalleryError(f"mask 內找不到 cell_label={cell_label}")
     center_x = float(xs.mean())
     center_y = float(ys.mean())
-    span = max(xs.max() - xs.min() + 1, ys.max() - ys.min() + 1)
-    half = max(32.0, span * padding / 2.0)
+    if fixed_span is not None:
+        # 所有細胞共用同一個視窗大小，縮放後相對大小才不會被抹掉。
+        half = float(fixed_span) / 2.0
+    else:
+        span = max(xs.max() - xs.min() + 1, ys.max() - ys.min() + 1)
+        half = max(32.0, span * padding / 2.0)
     height, width = bundle.cell_mask.shape
-    x0 = int(round(max(0.0, center_x - half)))
-    x1 = int(round(min(float(width), center_x + half)))
-    y0 = int(round(max(0.0, center_y - half)))
-    y1 = int(round(min(float(height), center_y + half)))
+    x0 = int(round(center_x - half))
+    x1 = int(round(center_x + half))
+    y0 = int(round(center_y - half))
+    y1 = int(round(center_y + half))
 
-    window = (slice(y0, y1), slice(x0, x1))
-    mask = (bundle.cell_mask[window] == cell_label).astype(np.float32)
-    nucleus = ((bundle.nucleus_mask[window] > 0) & (mask > 0)).astype(np.float32)
-    phase = bundle.phase[window]
-    ido = bundle.ido[window]
+    def _window(array: np.ndarray, fill: float) -> np.ndarray:
+        """取出視窗；超出影像邊界的部分補 `fill`，維持視窗尺寸不變。"""
+        out = np.full((y1 - y0, x1 - x0), fill, dtype=np.float32)
+        src_y0, src_y1 = max(0, y0), min(height, y1)
+        src_x0, src_x1 = max(0, x0), min(width, x1)
+        if src_y1 > src_y0 and src_x1 > src_x0:
+            out[src_y0 - y0 : src_y1 - y0, src_x0 - x0 : src_x1 - x0] = array[
+                src_y0:src_y1, src_x0:src_x1
+            ]
+        return out
+
+    mask = (_window(bundle.cell_mask.astype(np.float32), 0.0) == float(cell_label)).astype(
+        np.float32
+    )
+    nucleus = ((_window(bundle.nucleus_mask.astype(np.float32), 0.0) > 0) & (mask > 0)).astype(
+        np.float32
+    )
+    phase = _window(bundle.phase, float(np.median(bundle.phase)))
+    ido = _window(bundle.ido, float(np.median(bundle.ido)))
 
     def _resize(array: np.ndarray, nearest: bool = False) -> np.ndarray:
         if tile_pixels is None:
@@ -303,12 +332,22 @@ def collect_crops(
     crops: dict[tuple[str, int], dict[str, np.ndarray]] = {}
     for image_key, block in selection.groupby("image_key", sort=False):
         bundle = load_image_bundle(data_root, block.iloc[0])
+        if config.subtract_background:
+            background = bundle.ido[bundle.cell_mask == 0]
+            if background.size:
+                bundle = ImageBundle(
+                    phase=bundle.phase,
+                    ido=np.clip(bundle.ido - float(np.median(background)), 0.0, None),
+                    cell_mask=bundle.cell_mask,
+                    nucleus_mask=bundle.nucleus_mask,
+                )
         for row in block.itertuples():
             crop = crop_cell(
                 bundle,
                 int(row.cell_label),
                 padding=config.padding,
                 tile_pixels=config.tile_pixels,
+                fixed_span=config.fixed_span,
             )
             if include_native:
                 crop["native"] = crop_cell(
