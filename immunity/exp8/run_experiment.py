@@ -41,6 +41,7 @@ from .notable import (
     cell_caption,
     combined_ranking,
     notable_fraction,
+    row_label,
     select_notable_cells,
     select_typical_cells,
 )
@@ -89,12 +90,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=PRIMARY_CONDITION,
         help=f"亮暗比較的主力條件（預設 {PRIMARY_CONDITION}，亮暗人數最平衡）",
     )
-    parser.add_argument("--cells-per-dose", type=int, default=8, help="每一列放幾顆細胞")
+    parser.add_argument("--cells-per-dose", type=int, default=6, help="每一列放幾顆細胞")
     parser.add_argument(
         "--notable-features",
         type=int,
-        default=3,
-        help="用兩條劑量軸合併排名的前幾個形狀特徵當篩選條件（預設 3）",
+        default=5,
+        help="用兩條劑量軸合併排名的前幾個形狀特徵當篩選條件（預設 5）",
     )
     parser.add_argument(
         "--notable-percentile",
@@ -247,29 +248,34 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if not args.skip_images:
-        blocks = [select_typical_cells(cells, shape_thresholds, count=args.cells_per_dose)]
+        blocks: list[tuple[object, pd.DataFrame]] = [
+            (None, select_typical_cells(cells, shape_thresholds, count=args.cells_per_dose))
+        ]
         blocks += [
-            select_notable_cells(cells, threshold, count=args.cells_per_dose)
+            (threshold, select_notable_cells(cells, threshold, count=args.cells_per_dose))
             for threshold in shape_thresholds
         ]
-        notable_selection = pd.concat(blocks, ignore_index=True)
+        notable_selection = pd.concat([block for _, block in blocks], ignore_index=True)
         # 這張圖同時放典型細胞與長軸特別長的細胞，若用 P95 當視窗，典型細胞
-        # 會縮成小點看不清楚。取 P75 讓多數細胞填滿版面，少數最長的略微出界。
-        notable_span = fixed_window_span(notable_selection, quantile=0.75, margin=1.25)
+        # 會縮成小點看不清楚。取 P65 讓多數細胞填滿版面，少數最長的略微出界。
+        notable_span = fixed_window_span(notable_selection, quantile=0.65, margin=1.2)
         rendered, _ = render_selection(
             data_root,
             notable_selection,
-            GalleryConfig(tile_pixels=180, fixed_span=notable_span, subtract_background=True),
+            # tile 邊長對齊裁切視窗，避免降採樣把細長的細胞糊掉。
+            GalleryConfig(
+                tile_pixels=notable_span, fixed_span=notable_span, subtract_background=True
+            ),
         )
         log(f"形狀影像庫固定裁切視窗 {notable_span} 像素，圖上相對大小為真實比例")
 
         rows = []
-        for label, block in notable_selection.groupby("notable_label", sort=False):
+        for threshold, block in blocks:
             images = [
                 rendered[(str(row.image_key), int(row.cell_label))] for row in block.itertuples()
             ]
             captions = [cell_caption(row) for _, row in block.iterrows()]
-            rows.append((label, images, captions))
+            rows.append((row_label(threshold), images, captions))
         figure_paths["fig06"] = fig.plot_notable_cells(
             rows, figures_dir / "fig06_notable_cells.png", "形狀特別的細胞"
         )

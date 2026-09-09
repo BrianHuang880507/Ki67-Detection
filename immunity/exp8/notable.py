@@ -232,9 +232,21 @@ def select_typical_cells(
     )
 
 
-def cell_caption(row: pd.Series) -> tuple[str, str]:
-    """回傳兩行標題：完整細胞編號，以及刺激條件＋該特徵的值。"""
+def cell_caption(row: pd.Series) -> tuple[str, str, str]:
+    """回傳三段標題：完整細胞編號、刺激條件、該特徵的值。
+
+    特徵值單獨成一段，圖上會加粗放大——那是生醫同仁要引用的數字。
+    """
     value = float(row["notable_value"])
-    text = f"{value:.3g}" if abs(value) < 1000 else f"{value:.0f}"
+    text = f"{value:.3f}" if abs(value) < 10 else f"{value:.0f}"
     identifier = f"{row['image_key']} #{int(row['cell_label'])}"
-    return identifier, f"{row['condition']}　{text}"
+    return identifier, str(row["condition"]), text
+
+
+def row_label(threshold: FeatureThreshold | None) -> str:
+    """列標題：特徵名稱加上達標門檻，讓每一列自己說明篩選條件。"""
+    if threshold is None:
+        return "典型細胞\n（未達任何門檻）"
+    cut = f"{threshold.threshold:.3f}" if threshold.threshold < 10 else f"{threshold.threshold:.0f}"
+    sign = ">" if threshold.direction > 0 else "<"
+    return f"{threshold.feature_label}\n{sign} {cut}"

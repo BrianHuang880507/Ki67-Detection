@@ -21,8 +21,8 @@ conda run --no-capture-output -n ki67dtc python -m immunity.exp8.run_experiment
 | `--data-root` | 目前工作目錄 | Exp3／Exp4 產物所在的專案根目錄 |
 | `--output-root` | `<data-root>/immunity/outputs/exp8` | 輸出目錄 |
 | `--primary-condition` | `IFN25_TNF0` | 亮暗比較的條件，此條件亮暗人數最平衡 |
-| `--cells-per-dose` | 8 | fig06 每一列放幾顆細胞 |
-| `--notable-features` | 3 | fig06 用合併排名前幾個形狀特徵當篩選條件 |
+| `--cells-per-dose` | 6 | fig06 每一列放幾顆細胞（越少每顆越大） |
+| `--notable-features` | 5 | fig06 用合併排名前幾個形狀特徵當篩選條件 |
 | `--notable-percentile` | 90 | 形狀「特別」的門檻取對照組第幾百分位 |
 | `--paired-images` | 10 | 亮暗配對影像庫用幾張影像 |
 | `--detail-features` | 3 | 劑量曲線畫幾個形狀特徵 |
@@ -78,11 +78,15 @@ conda run --no-capture-output -n ki67dtc python -m pytest tests/test_immunity_ex
 fig06 原本每個濃度都取最接近中位數的細胞，但濃度之間的中位數位移很小
 （離心率 0.932 → 0.962），生醫同仁肉眼看不出差別。改法：
 
-1. 取**兩條劑量軸合併排名的前 3 個形狀特徵**（fig03 與 fig04 的名次相加），
-   且要求兩軸同號 —— 目前是離心率、長軸長、緊緻度。
+1. 取**兩條劑量軸合併排名的前 5 個形狀特徵**（fig03 與 fig04 的名次相加），
+   且要求兩軸同號 —— 目前是離心率、長軸長、緊緻度、最大 Feret 徑、周長。
 2. 門檻取**未刺激對照組的第 90 百分位**，和 IDO 亮暗用對照組定義的邏輯一致。
+   列標題會同時寫出特徵名稱與門檻（例如「離心率 Eccentricity ＞ 0.984」）。
 3. 每一列在達標區間上**等分位取樣**，所以是從「剛過門檻」漸變到「明顯特別」。
-4. 每格標上**細胞編號**（`image_key #cell_label`），可以回原圖找到同一顆細胞。
+4. 每格三行：**細胞編號**（`image_key #cell_label`）、刺激條件、**該特徵的值**
+   （加粗放大，那是要引用的數字）。
+5. 裁切視窗取選集的 P65，`tile_pixels` 對齊視窗做 1:1 取樣，避免降採樣把
+   細長的細胞糊掉。少數最長的細胞會略微出界，換取典型細胞看得清楚。
 
 **不挑「全資料最極端的 K 顆」。** 實測前 40 名的離心率落在 0.9975–0.9989、
 長軸長落在 416–541 像素，多數是分割把相鄰細胞併成一個物件的結果，而且沒有

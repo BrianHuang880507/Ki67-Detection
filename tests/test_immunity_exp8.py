@@ -433,10 +433,25 @@ def test_select_typical_cells_are_all_below_every_threshold(
         assert not item.qualifies(chosen[item.feature]).any()
 
 
-def test_cell_caption_carries_the_cell_id(cells: pd.DataFrame, ranking: pd.DataFrame) -> None:
+def test_cell_caption_carries_the_cell_id_and_value(
+    cells: pd.DataFrame, ranking: pd.DataFrame
+) -> None:
     item = nb.build_thresholds(cells, ranking, percentile=90.0)[0]
     chosen = nb.select_notable_cells(cells, item, count=3)
-    identifier, detail = nb.cell_caption(chosen.iloc[0])
-    assert "#" in identifier
-    assert identifier.startswith(str(chosen.iloc[0]["image_key"]))
-    assert str(chosen.iloc[0]["condition"]) in detail
+    row = chosen.iloc[0]
+    identifier, condition, value = nb.cell_caption(row)
+    assert identifier == f"{row['image_key']} #{int(row['cell_label'])}"
+    assert condition == str(row["condition"])
+    # 特徵值必須是可讀的數字，且對得回原始值。
+    assert float(value) == pytest.approx(float(row["notable_value"]), rel=1e-3)
+
+
+def test_row_label_shows_the_feature_and_threshold(
+    cells: pd.DataFrame, ranking: pd.DataFrame
+) -> None:
+    item = nb.build_thresholds(cells, ranking, percentile=90.0)[0]
+    label = nb.row_label(item)
+    assert item.feature_label in label
+    assert "\n" in label
+    assert (">" if item.direction > 0 else "<") in label
+    assert "典型細胞" in nb.row_label(None)

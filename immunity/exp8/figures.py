@@ -314,19 +314,19 @@ def _tile_axes(ax: plt.Axes, image: np.ndarray) -> None:
 
 
 def plot_notable_cells(
-    rows: list[tuple[str, list[np.ndarray], list[tuple[str, str]]]],
+    rows: list[tuple[str, list[np.ndarray], list[tuple[str, str, str]]]],
     out_path: Path,
     title: str,
 ) -> Path:
-    """fig06：一列一個形狀條件，列出達標的細胞並標上細胞編號。
+    """fig06：一列一個形狀條件，列出達標的細胞並標上細胞編號與特徵值。
 
-    每格上方兩行分別是影像編號與「細胞編號＋該特徵的值」，方便生醫同仁
-    回原圖找到同一顆細胞。
+    每格上方三行：細胞編號、刺激條件、該特徵的值。特徵值加粗放大，因為那是
+    生醫同仁要引用的數字；列標題則帶出是哪個特徵與達標門檻。
     """
     columns = max(len(images) for _, images, _ in rows)
-    fig = _new_figure(columns * 1.62, len(rows) * 1.95 + 0.8)
+    fig = _new_figure(columns * 2.25 + 1.6, len(rows) * 2.52 + 1.0)
     grid = fig.add_gridspec(
-        len(rows), columns, hspace=0.52, wspace=0.08, top=0.9, bottom=0.02, left=0.12, right=0.99
+        len(rows), columns, hspace=0.42, wspace=0.06, top=0.9, bottom=0.02, left=0.145, right=0.995
     )
     for row_index, (row_label, images, captions) in enumerate(rows):
         color = TEXT_SECONDARY if row_index == 0 else TEXT_PRIMARY
@@ -334,26 +334,38 @@ def plot_notable_cells(
             ax = fig.add_subplot(grid[row_index, column_index])
             if column_index < len(images):
                 _tile_axes(ax, images[column_index])
-                image_key, detail = captions[column_index]
+                identifier, condition, value = captions[column_index]
                 ax.set_title(
-                    f"{image_key}\n{detail}",
-                    fontsize=6.4,
+                    f"{identifier}\n{condition}",
+                    fontsize=9.0,
                     color=TEXT_SECONDARY,
-                    pad=2.5,
-                    linespacing=1.25,
+                    pad=20.0,
+                    linespacing=1.3,
+                )
+                ax.text(
+                    0.5,
+                    1.015,
+                    value,
+                    transform=ax.transAxes,
+                    fontsize=12.0,
+                    fontweight="bold",
+                    color=TEXT_PRIMARY,
+                    ha="center",
+                    va="bottom",
                 )
             else:
                 ax.set_axis_off()
             if column_index == 0:
                 ax.set_ylabel(
                     row_label,
-                    fontsize=10.5,
+                    fontsize=13.0,
                     color=color,
                     fontweight="bold",
                     rotation=0,
                     ha="right",
                     va="center",
-                    labelpad=16,
+                    labelpad=22,
+                    linespacing=1.5,
                 )
     _title(fig, title)
     return _save(fig, out_path)
