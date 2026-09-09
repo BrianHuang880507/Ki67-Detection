@@ -21,7 +21,9 @@ conda run --no-capture-output -n ki67dtc python -m immunity.exp8.run_experiment
 | `--data-root` | 目前工作目錄 | Exp3／Exp4 產物所在的專案根目錄 |
 | `--output-root` | `<data-root>/immunity/outputs/exp8` | 輸出目錄 |
 | `--primary-condition` | `IFN25_TNF0` | 亮暗比較的條件，此條件亮暗人數最平衡 |
-| `--cells-per-dose` | 8 | 每個濃度放幾顆代表性細胞 |
+| `--cells-per-dose` | 8 | fig06 每一列放幾顆細胞 |
+| `--notable-features` | 3 | fig06 用合併排名前幾個形狀特徵當篩選條件 |
+| `--notable-percentile` | 90 | 形狀「特別」的門檻取對照組第幾百分位 |
 | `--paired-images` | 10 | 亮暗配對影像庫用幾張影像 |
 | `--detail-features` | 3 | 劑量曲線畫幾個形狀特徵 |
 | `--skip-images` | 關 | 不讀原始影像，跳過 fig06 與 fig09 |
@@ -71,6 +73,25 @@ conda run --no-capture-output -n ki67dtc python -m pytest tests/test_immunity_ex
 配對掉之後剩下的才是細胞本身的差異。每張影像各算一次 rank-biserial 效果量，
 再對這些影像層級的效果量做 Wilcoxon signed-rank 檢定。
 
+### 四、fig06 用形狀門檻挑細胞，不用中位數
+
+fig06 原本每個濃度都取最接近中位數的細胞，但濃度之間的中位數位移很小
+（離心率 0.932 → 0.962），生醫同仁肉眼看不出差別。改法：
+
+1. 取**兩條劑量軸合併排名的前 3 個形狀特徵**（fig03 與 fig04 的名次相加），
+   且要求兩軸同號 —— 目前是離心率、長軸長、緊緻度。
+2. 門檻取**未刺激對照組的第 90 百分位**，和 IDO 亮暗用對照組定義的邏輯一致。
+3. 每一列在達標區間上**等分位取樣**，所以是從「剛過門檻」漸變到「明顯特別」。
+4. 每格標上**細胞編號**（`image_key #cell_label`），可以回原圖找到同一顆細胞。
+
+**不挑「全資料最極端的 K 顆」。** 實測前 40 名的離心率落在 0.9975–0.9989、
+長軸長落在 416–541 像素，多數是分割把相鄰細胞併成一個物件的結果，而且沒有
+劑量梯度（IFN0 佔 12–25%，和無關聯時的期望值差不多）。挑那一群等於在展示
+分割失敗，不是展示生物差異。`FeatureThreshold.qualifies` 會排除最極端的 1%。
+
+fig13 是 fig06 的量化對照：影像庫只放得下幾顆細胞，容易被質疑是挑出來的，
+比例才說得出「哪個條件真的比較多這種細胞」。
+
 ## 兩個算繪上的決定
 
 **固定裁切視窗。** 影像庫若讓每顆細胞各自貼合外框再縮放到同尺寸，大細胞和
@@ -93,13 +114,14 @@ conda run --no-capture-output -n ki67dtc python -m pytest tests/test_immunity_ex
 | fig03 | 細胞形狀與 IFN-γ 濃度的關聯性 | 1 |
 | fig04 | 細胞形狀與 TNF-α 濃度的關聯性 | 1 |
 | fig05 | 細胞形狀隨刺激濃度的變化 | 1 |
-| fig06 | 不同 IFN-γ 濃度下的細胞外觀 | 1 |
+| fig06 | 形狀特別的細胞 | 1 |
 | fig07 | IDO 亮細胞與暗細胞的形狀差異 | 2 |
 | fig08 | IDO 亮細胞與暗細胞的形狀分布 | 2 |
 | fig09 | 同一張影像中的 IDO 亮細胞與暗細胞 | 2 |
 | fig10 | 各 donor 的形狀變化量 | 3 |
 | fig11 | 各 donor 的形狀變化量與濃度的關係 | 3 |
 | fig12 | 各 donor 的整體形狀變化幅度 | 3 |
+| fig13 | 形狀特別的細胞比例 | 1 |
 
 fig03／fig04 每個特徵畫兩根長條：原始相關係數，以及扣除細胞密度後的偏相關
 係數。濃度會改變細胞數，細胞數又會改變形狀，不控制就分不出是刺激讓細胞變形，
@@ -117,7 +139,10 @@ fig03／fig04 每個特徵畫兩根長條：原始相關係數，以及扣除細
 | `shape_delta.csv` | 每個 donor×passage×條件的形狀變化量 |
 | `donor_magnitude.csv` | 各 donor 的整體形狀變化幅度 |
 | `donor_spread.csv` | 各特徵×濃度下 donor 之間的差距 |
-| `cells_by_dose.csv`、`paired_cells.csv` | 影像庫用到的細胞清單 |
+| `notable_feature_ranking.csv` | 兩條劑量軸合併排名，fig06 篩選條件的來源 |
+| `notable_fraction.csv` | 各條件下形狀達標的細胞比例 |
+| `notable_cells.csv` | fig06 用到的細胞編號、條件與特徵值 |
+| `paired_cells.csv` | fig09 用到的細胞清單 |
 
 ## 結果與限制
 

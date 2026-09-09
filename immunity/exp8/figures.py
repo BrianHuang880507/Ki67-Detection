@@ -313,34 +313,103 @@ def _tile_axes(ax: plt.Axes, image: np.ndarray) -> None:
         spine.set_visible(False)
 
 
-def plot_cells_by_dose(
-    rows: list[tuple[str, list[np.ndarray]]], out_path: Path, title: str, row_color: str | None = None
+def plot_notable_cells(
+    rows: list[tuple[str, list[np.ndarray], list[tuple[str, str]]]],
+    out_path: Path,
+    title: str,
 ) -> Path:
-    """fig06：每一列一個濃度，列出該濃度的代表性去背細胞。"""
-    columns = max(len(images) for _, images in rows)
-    fig = _new_figure(columns * 1.5, len(rows) * 1.62 + 0.7)
+    """fig06：一列一個形狀條件，列出達標的細胞並標上細胞編號。
+
+    每格上方兩行分別是影像編號與「細胞編號＋該特徵的值」，方便生醫同仁
+    回原圖找到同一顆細胞。
+    """
+    columns = max(len(images) for _, images, _ in rows)
+    fig = _new_figure(columns * 1.62, len(rows) * 1.95 + 0.8)
     grid = fig.add_gridspec(
-        len(rows), columns, hspace=0.12, wspace=0.06, top=0.9, bottom=0.02, left=0.06, right=0.99
+        len(rows), columns, hspace=0.52, wspace=0.08, top=0.9, bottom=0.02, left=0.12, right=0.99
     )
-    for row_index, (row_label, images) in enumerate(rows):
+    for row_index, (row_label, images, captions) in enumerate(rows):
+        color = TEXT_SECONDARY if row_index == 0 else TEXT_PRIMARY
         for column_index in range(columns):
             ax = fig.add_subplot(grid[row_index, column_index])
             if column_index < len(images):
                 _tile_axes(ax, images[column_index])
+                image_key, detail = captions[column_index]
+                ax.set_title(
+                    f"{image_key}\n{detail}",
+                    fontsize=6.4,
+                    color=TEXT_SECONDARY,
+                    pad=2.5,
+                    linespacing=1.25,
+                )
             else:
                 ax.set_axis_off()
             if column_index == 0:
                 ax.set_ylabel(
                     row_label,
-                    fontsize=11,
-                    color=row_color or TEXT_PRIMARY,
+                    fontsize=10.5,
+                    color=color,
                     fontweight="bold",
                     rotation=0,
                     ha="right",
                     va="center",
-                    labelpad=14,
+                    labelpad=16,
                 )
     _title(fig, title)
+    return _save(fig, out_path)
+
+
+def plot_notable_fraction(table: pd.DataFrame, out_path: Path, title: str) -> Path:
+    """fig13：各條件下形狀達標的細胞比例。"""
+    # 圖例依兩軸合併排名排序，和 fig03／fig04 的名次一致。
+    labels = list(dict.fromkeys(table.sort_values("feature_order")["feature_label"]))
+    conditions = (
+        table.drop_duplicates("condition")
+        .sort_values(["ifn_dose", "tnf_dose"])["condition"]
+        .tolist()
+    )
+    y = np.arange(len(conditions))[::-1]
+    height = 0.78 / len(labels)
+
+    fig = _new_figure(9.6, 5.8)
+    ax = fig.add_subplot(111)
+    for index, label in enumerate(labels):
+        block = table[table["feature_label"] == label].set_index("condition")
+        values = np.array(
+            [float(block.loc[name, "notable_fraction"]) * 100 for name in conditions]
+        )
+        offset = (len(labels) - 1) / 2.0 - index
+        ax.barh(
+            y + offset * height,
+            values,
+            height=height * 0.9,
+            color=CURVE_COLORS[index % len(CURVE_COLORS)],
+            zorder=3,
+            label=label,
+        )
+    # 對照組的達標比例等於門檻百分位，畫一條參考線讓「高多少」看得出來。
+    baseline = float(
+        table.loc[table["condition"] == "IFN0_TNF0", "notable_fraction"].mean() * 100
+    )
+    ax.axvline(baseline, color=NEUTRAL, linewidth=1.4, linestyle="--", zorder=2)
+    ax.text(
+        baseline + 0.6,
+        y.max() + 0.55,
+        f"未刺激對照 {baseline:.0f}%",
+        fontsize=9,
+        color=TEXT_SECONDARY,
+        va="center",
+    )
+    ax.set_yticks(y)
+    ax.set_yticklabels(conditions, fontsize=10, color=TEXT_PRIMARY)
+    ax.set_xlabel("形狀達標的細胞比例 (%)", fontsize=9.5)
+    ax.set_xlim(0, max(40.0, float(table["notable_fraction"].max()) * 100 * 1.2))
+    _title(ax, title, axes=True)
+    _style_axes(ax)
+    legend = ax.legend(frameon=False, fontsize=9.5, loc="lower right")
+    for text in legend.get_texts():
+        text.set_color(TEXT_SECONDARY)
+    fig.tight_layout()
     return _save(fig, out_path)
 
 

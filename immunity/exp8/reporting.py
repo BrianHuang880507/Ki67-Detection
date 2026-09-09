@@ -84,6 +84,32 @@ def _passage_table(frame: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
+def _threshold_list(metadata: Mapping[str, Any]) -> str:
+    """形狀「特別」的門檻清單。"""
+    lines = []
+    for item in metadata.get("notable_thresholds", []):
+        arrow = "高於" if item["direction"] > 0 else "低於"
+        lines.append(
+            f"- **{item['feature_label']}**：{arrow} {item['threshold']:.4g}"
+            f"（對照組中位數 {item['control_median']:.4g}）"
+        )
+    return "\n".join(lines)
+
+
+def _notable_fraction_table(frame: pd.DataFrame) -> str:
+    """各條件下形狀達標的細胞比例。"""
+    labels = list(dict.fromkeys(frame.sort_values("feature_order")["feature_label"]))
+    conditions = (
+        frame.drop_duplicates("condition").sort_values(["ifn_dose", "tnf_dose"])["condition"].tolist()
+    )
+    lines = ["| 條件 | " + " | ".join(labels) + " |", "|---|" + "---:|" * len(labels)]
+    for condition in conditions:
+        block = frame[frame["condition"] == condition].set_index("feature_label")
+        cells = " | ".join(f"{block.loc[label, 'notable_fraction']:.1%}" for label in labels)
+        lines.append(f"| {condition} | {cells} |")
+    return "\n".join(lines)
+
+
 def _magnitude_table(frame: pd.DataFrame) -> str:
     """各 donor 的整體形狀變化幅度表。"""
     lines = ["| donor | 中位數 | 最小 | 最大 | passage 數 |", "|---|---:|---:|---:|---:|"]
@@ -109,6 +135,25 @@ def render_report(
     best = contrast.sort_values("rank").iloc[0]
     magnitude = tables["donor_magnitude"].drop_duplicates("b_id").sort_values("median")
     spread = tables["donor_spread"]
+
+    notable_thresholds = metadata.get("notable_thresholds", [])
+    n_notable = len(notable_thresholds)
+    notable_percentile = float(metadata.get("notable_percentile", 90.0))
+    primary_feature = notable_thresholds[0]["feature"] if notable_thresholds else None
+    dose_response = tables["shape_dose_response"]
+    ifn_curve = dose_response[
+        (dose_response["feature"] == primary_feature)
+        & (dose_response["curve"].str.startswith("IFN"))
+    ].sort_values("dose_ng_ml")
+    ecc_control = float(ifn_curve["median"].iloc[0]) if not ifn_curve.empty else float("nan")
+    ecc_high = float(ifn_curve["median"].iloc[-1]) if not ifn_curve.empty else float("nan")
+
+    fractions = tables["notable_fraction"]
+    per_condition = fractions.groupby("condition")["notable_fraction"].mean()
+    top_condition = str(per_condition.idxmax())
+    top_fraction = float(per_condition.max())
+    ifn100_fraction = float(per_condition.get("IFN100_TNF0", float("nan")))
+    tnf_retained = float(tables["shape_tnf_correlations"]["retained_fraction"].median())
 
     blocks = tables["donor_magnitude"]
     last_passage = int(blocks["passage"].max())
@@ -177,10 +222,44 @@ TNF-α 軸另外也控制了 IFN-γ 濃度。
 
 ![細胞形狀隨刺激濃度的變化](figures/fig05_shape_dose_response.png)
 
-![不同 IFN-γ 濃度下的細胞外觀](figures/fig06_cells_by_dose.png)
+### 形狀特別的細胞
 
-代表性細胞取「最接近該濃度中位數」，不是隨機也不是挑好看的，
-清單見 `cells_by_dose.csv`。
+原本每個濃度都取最接近中位數的細胞，但濃度之間的中位數位移很小
+（離心率 {ecc_control:.3f} → {ecc_high:.3f}），肉眼看不出差別。改成用形狀門檻挑細胞：
+把達標的那群和典型細胞擺在一起，差異才看得出來。
+
+篩選條件取**兩條劑量軸合併排名的前 {n_notable} 個形狀特徵**（fig03 與 fig04 的名次相加），
+且要求兩軸同號；門檻取未刺激對照組的第 {notable_percentile:.0f} 百分位：
+
+{_threshold_list(metadata)}
+
+![形狀特別的細胞](figures/fig06_notable_cells.png)
+
+每格上方兩行是**細胞編號**與刺激條件＋該特徵的值，可以直接回原圖找到同一顆細胞；
+完整清單見 `notable_cells.csv`。每一列都在達標區間上**等分位取樣**，所以是從
+「剛過門檻」漸變到「明顯特別」，不是全部挑最極端的。
+
+**刻意不挑最極端的那一端。** 實測全資料離心率前 40 名落在 0.9975–0.9989、
+長軸長落在 416–541 像素，多數是分割把相鄰細胞併成一個物件的結果，而且沒有
+劑量梯度（IFN0 佔 12–25%，和無關聯時的期望值差不多）。挑那一群等於在展示
+分割失敗，不是展示生物差異。
+
+![形狀特別的細胞比例](figures/fig13_notable_fraction.png)
+
+{_notable_fraction_table(tables['notable_fraction'])}
+
+影像庫只放得下少數幾顆細胞，容易被質疑是挑出來的；上面的比例才是量化證據。
+
+**這張表的排序值得注意。** 達標比例最高的是 {top_condition}（{top_fraction:.0%}），
+不是濃度最高的 IFN100_TNF0（{ifn100_fraction:.0%}）；而且 TNF-α 單獨作用的
+IFN0_TNF25／IFN0_TNF50 都高於 IFN25_TNF0。也就是說**形狀變化跟著 TNF-α 走的成分
+比跟著 IFN-γ 更多**，這和 fig04 的相關係數一致（離心率對 TNF 0.481、對 IFN 0.479，
+緊緻度對 TNF 0.469、對 IFN 0.441）。
+
+但要注意這裡有一部分是細胞密度：TNF-α 讓細胞數下降得比 IFN-γ 明顯
+（相關係數 −0.31 對 −0.11），而細胞少的視野裡細胞攤得比較開。fig04 顯示
+TNF 軸扣掉密度後只保留約 {tnf_retained:.0%}，IFN 軸則幾乎不受影響。
+**IDO 的誘導由 IFN-γ 主導，形狀的變化則和 TNF-α 與細胞密度關係更深，兩者不是同一回事。**
 
 ## 問題 2：IDO 亮與暗在形狀上的差異
 
@@ -249,7 +328,10 @@ P7 則跳到 {p7_low:.2f}–{p7_high:.2f}）。三個 donor 同時出現同一�
 | `shape_delta.csv` | 每個 donor×passage×條件的形狀變化量 |
 | `donor_magnitude.csv` | 各 donor 的整體形狀變化幅度 |
 | `donor_spread.csv` | 各特徵×濃度下 donor 之間的差距 |
-| `cells_by_dose.csv`、`paired_cells.csv` | 影像庫用到的細胞清單 |
+| `notable_feature_ranking.csv` | 兩條劑量軸合併排名，篩選條件的來源 |
+| `notable_fraction.csv` | 各條件下形狀達標的細胞比例 |
+| `notable_cells.csv` | fig06 用到的細胞編號、條件與特徵值 |
+| `paired_cells.csv` | fig09 用到的細胞清單 |
 | `figures/` | fig01–fig12 |
 
 ## 限制

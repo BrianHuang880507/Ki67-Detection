@@ -36,12 +36,15 @@ from .brightness import (
 )
 from .donor_response import delta_matrix, donor_spread, overall_magnitude, shape_delta
 from .reporting import render_report
-from .selection import (
-    cells_by_dose,
-    fixed_window_span,
-    paired_cells_within_image,
-    render_selection,
+from .notable import (
+    build_thresholds,
+    cell_caption,
+    combined_ranking,
+    notable_fraction,
+    select_notable_cells,
+    select_typical_cells,
 )
+from .selection import fixed_window_span, paired_cells_within_image, render_selection
 from .shape import (
     DENSITY_COLUMN,
     correlate_shape_with_dose,
@@ -86,7 +89,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=PRIMARY_CONDITION,
         help=f"亮暗比較的主力條件（預設 {PRIMARY_CONDITION}，亮暗人數最平衡）",
     )
-    parser.add_argument("--cells-per-dose", type=int, default=8, help="每個濃度放幾顆代表性細胞")
+    parser.add_argument("--cells-per-dose", type=int, default=8, help="每一列放幾顆細胞")
+    parser.add_argument(
+        "--notable-features",
+        type=int,
+        default=3,
+        help="用兩條劑量軸合併排名的前幾個形狀特徵當篩選條件（預設 3）",
+    )
+    parser.add_argument(
+        "--notable-percentile",
+        type=float,
+        default=90.0,
+        help="形狀「特別」的門檻取對照組的第幾百分位（預設 90）",
+    )
     parser.add_argument("--paired-images", type=int, default=10, help="亮暗配對影像庫用幾張影像")
     parser.add_argument("--detail-features", type=int, default=3, help="劑量曲線畫幾個形狀特徵")
     parser.add_argument("--skip-images", action="store_true", help="不讀原始影像，跳過兩張影像庫")
@@ -216,28 +231,62 @@ def main(argv: list[str] | None = None) -> int:
             f"中位數 {row.median:.3f}（{row.min:.3f}–{row.max:.3f}，n={int(row.n_passages)} 個 passage）"
         )
 
+    ranking = combined_ranking(ifn_table, tnf_table, top_n=args.notable_features)
+    shape_thresholds = build_thresholds(cells, ranking, percentile=args.notable_percentile)
+    tables["notable_feature_ranking"] = ranking
+    fractions = notable_fraction(cells, shape_thresholds)
+    tables["notable_fraction"] = fractions
+    for threshold in shape_thresholds:
+        log(f"形狀門檻　{threshold.describe()}")
+        block = fractions[fractions["feature"] == threshold.feature]
+        low = block[block["condition"] == "IFN0_TNF0"]["notable_fraction"].iloc[0]
+        high = block[block["condition"] == HIGH_DOSE_CONDITION]["notable_fraction"].iloc[0]
+        log(f"　　達標比例　IFN0_TNF0 {low:.1%} → {HIGH_DOSE_CONDITION} {high:.1%}")
+    figure_paths["fig13"] = fig.plot_notable_fraction(
+        fractions, figures_dir / "fig13_notable_fraction.png", "形狀特別的細胞比例"
+    )
+
     if not args.skip_images:
-        dose_selection = cells_by_dose(
-            labelled_cells, top_features[:2], per_dose=args.cells_per_dose
-        )
-        dose_span = fixed_window_span(dose_selection)
+        blocks = [select_typical_cells(cells, shape_thresholds, count=args.cells_per_dose)]
+        blocks += [
+            select_notable_cells(cells, threshold, count=args.cells_per_dose)
+            for threshold in shape_thresholds
+        ]
+        notable_selection = pd.concat(blocks, ignore_index=True)
+        # 這張圖同時放典型細胞與長軸特別長的細胞，若用 P95 當視窗，典型細胞
+        # 會縮成小點看不清楚。取 P75 讓多數細胞填滿版面，少數最長的略微出界。
+        notable_span = fixed_window_span(notable_selection, quantile=0.75, margin=1.25)
         rendered, _ = render_selection(
             data_root,
-            dose_selection,
-            GalleryConfig(tile_pixels=180, fixed_span=dose_span, subtract_background=True),
+            notable_selection,
+            GalleryConfig(tile_pixels=180, fixed_span=notable_span, subtract_background=True),
         )
-        log(f"濃度列固定裁切視窗 {dose_span} 像素，圖上相對大小為真實比例")
+        log(f"形狀影像庫固定裁切視窗 {notable_span} 像素，圖上相對大小為真實比例")
+
         rows = []
-        for dose, block in dose_selection.groupby("row_dose", sort=True):
+        for label, block in notable_selection.groupby("notable_label", sort=False):
             images = [
                 rendered[(str(row.image_key), int(row.cell_label))] for row in block.itertuples()
             ]
-            rows.append((f"IFN-γ {int(dose)}", images))
-        figure_paths["fig06"] = fig.plot_cells_by_dose(
-            rows, figures_dir / "fig06_cells_by_dose.png", "不同 IFN-γ 濃度下的細胞外觀"
+            captions = [cell_caption(row) for _, row in block.iterrows()]
+            rows.append((label, images, captions))
+        figure_paths["fig06"] = fig.plot_notable_cells(
+            rows, figures_dir / "fig06_notable_cells.png", "形狀特別的細胞"
         )
-        tables["cells_by_dose"] = dose_selection[
-            ["image_key", "cell_label", "b_id", "passage", "condition", "row_dose", "IDO_score_ff"]
+        tables["notable_cells"] = notable_selection[
+            [
+                "image_key",
+                "cell_label",
+                "b_id",
+                "passage",
+                "condition",
+                "ifn_dose",
+                "tnf_dose",
+                "notable_feature",
+                "notable_label",
+                "notable_value",
+                "IDO_score_ff",
+            ]
         ]
 
         candidates = images_with_both_groups(
@@ -298,6 +347,18 @@ def main(argv: list[str] | None = None) -> int:
             "control_cells": thresholds.control_cells,
             "control_median": thresholds.control_median,
         },
+        "notable_percentile": args.notable_percentile,
+        "notable_thresholds": [
+            {
+                "feature": item.feature,
+                "feature_label": item.feature_label,
+                "direction": item.direction,
+                "threshold": item.threshold,
+                "artifact_cutoff": item.artifact_cutoff,
+                "control_median": item.control_median,
+            }
+            for item in shape_thresholds
+        ],
         "figures": {key: value.name for key, value in sorted(figure_paths.items())},
     }
     (out_root / "run_metadata.json").write_text(

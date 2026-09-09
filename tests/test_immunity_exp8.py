@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -7,6 +9,7 @@ import pytest
 from immunity.exp6 import gallery as gl
 from immunity.exp8 import brightness as br
 from immunity.exp8 import donor_response as dr
+from immunity.exp8 import notable as nb
 from immunity.exp8 import selection as sel
 from immunity.exp8 import shape as sh
 
@@ -325,3 +328,115 @@ def test_fixed_span_pads_at_the_image_border() -> None:
     # 視窗中心在 (69.5, 69.5)，左上會超出邊界，仍必須回傳完整 200 見方。
     assert crop["ido"].shape == (200, 200)
     assert crop["mask"].shape == (200, 200)
+
+
+# --- 形狀特別的細胞（fig06 / fig13） -----------------------------------------
+
+
+@pytest.fixture()
+def ranking(fov: pd.DataFrame) -> pd.DataFrame:
+    ifn_table = sh.correlate_shape_with_dose(fov[fov["tnf_dose"] == 0], "ifn_dose", ("n_cells",))
+    tnf_table = sh.correlate_shape_with_dose(fov[fov["ifn_dose"] == 0], "tnf_dose", ("n_cells",))
+    return nb.combined_ranking(ifn_table, tnf_table, top_n=3)
+
+
+def test_combined_ranking_keeps_only_same_sign_features(ranking: pd.DataFrame) -> None:
+    assert len(ranking) == 3
+    assert (np.sign(ranking["rho_ifn"]) == np.sign(ranking["rho_tnf"])).all()
+    assert list(ranking["combined_rank"]) == [1, 2, 3]
+    assert list(ranking["mean_rank"]) == sorted(ranking["mean_rank"])
+    assert set(ranking["direction"]) <= {-1, 1}
+
+
+def test_combined_ranking_rejects_tables_with_no_agreement() -> None:
+    left = pd.DataFrame(
+        {"feature": ["a"], "feature_label": ["A"], "rank": [1], "spearman_rho": [0.5]}
+    )
+    right = pd.DataFrame({"feature": ["a"], "rank": [1], "spearman_rho": [-0.5]})
+    with pytest.raises(sh.ShapeError, match="同號"):
+        nb.combined_ranking(left, right, top_n=1)
+
+
+def test_build_thresholds_uses_the_control_percentile(
+    cells: pd.DataFrame, ranking: pd.DataFrame
+) -> None:
+    thresholds = nb.build_thresholds(cells, ranking, percentile=90.0)
+    assert len(thresholds) == 3
+    control = cells[cells["condition"] == nb.CONTROL_CONDITION]
+    for item in thresholds:
+        wanted = 90.0 if item.direction > 0 else 10.0
+        assert item.threshold == pytest.approx(
+            float(np.percentile(control[item.feature], wanted))
+        )
+        assert "對照組" in item.describe()
+
+
+def test_threshold_qualifies_excludes_the_artifact_tail(
+    cells: pd.DataFrame, ranking: pd.DataFrame
+) -> None:
+    item = nb.build_thresholds(cells, ranking, percentile=90.0, artifact_trim=0.05)[0]
+    values = cells[item.feature]
+    qualifies = item.qualifies(values)
+    assert qualifies.any()
+    if item.direction > 0:
+        assert (values[qualifies] > item.threshold).all()
+        # 最極端的那一群被排除，不會出現在挑選結果裡。
+        assert not qualifies[values > item.artifact_cutoff].any()
+    else:
+        assert (values[qualifies] < item.threshold).all()
+
+
+def test_notable_fraction_is_about_the_percentile_in_the_control(
+    cells: pd.DataFrame, ranking: pd.DataFrame
+) -> None:
+    thresholds = nb.build_thresholds(cells, ranking, percentile=90.0)
+    table = nb.notable_fraction(cells, thresholds)
+    assert len(table) == 3 * cells["condition"].nunique()
+    control = table[table["condition"] == nb.CONTROL_CONDITION]
+    assert control["notable_fraction"].between(0.04, 0.12).all()
+    assert (table["notable_fraction_min"] <= table["notable_fraction_max"]).all()
+    assert list(table["feature_order"]) == sorted(table["feature_order"])
+
+
+def test_select_notable_cells_spreads_over_the_qualifying_range(
+    cells: pd.DataFrame, ranking: pd.DataFrame
+) -> None:
+    item = nb.build_thresholds(cells, ranking, percentile=90.0)[0]
+    chosen = nb.select_notable_cells(cells, item, count=8)
+    assert len(chosen) == 8
+    assert item.qualifies(chosen[item.feature]).all()
+    # 等分位取樣：值必須展開，不能全部擠在中位數附近。
+    values = chosen["notable_value"].to_numpy()
+    qualifying = cells[item.qualifies(cells[item.feature])][item.feature]
+    covered = (values.max() - values.min()) / (qualifying.max() - qualifying.min())
+    assert covered > 0.5
+    assert set(chosen["notable_feature"]) == {item.feature}
+
+
+def test_select_notable_cells_rejects_an_unreachable_threshold(
+    cells: pd.DataFrame, ranking: pd.DataFrame
+) -> None:
+    item = nb.build_thresholds(cells, ranking, percentile=90.0)[0]
+    impossible = replace(item, threshold=float(cells[item.feature].max()) * 10)
+    with pytest.raises(sh.ShapeError, match="門檻"):
+        nb.select_notable_cells(cells, impossible, count=4)
+
+
+def test_select_typical_cells_are_all_below_every_threshold(
+    cells: pd.DataFrame, ranking: pd.DataFrame
+) -> None:
+    thresholds = nb.build_thresholds(cells, ranking, percentile=90.0)
+    chosen = nb.select_typical_cells(cells, thresholds, count=8)
+    assert len(chosen) == 8
+    assert (chosen["condition"] == nb.CONTROL_CONDITION).all()
+    for item in thresholds:
+        assert not item.qualifies(chosen[item.feature]).any()
+
+
+def test_cell_caption_carries_the_cell_id(cells: pd.DataFrame, ranking: pd.DataFrame) -> None:
+    item = nb.build_thresholds(cells, ranking, percentile=90.0)[0]
+    chosen = nb.select_notable_cells(cells, item, count=3)
+    identifier, detail = nb.cell_caption(chosen.iloc[0])
+    assert "#" in identifier
+    assert identifier.startswith(str(chosen.iloc[0]["image_key"]))
+    assert str(chosen.iloc[0]["condition"]) in detail
