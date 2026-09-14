@@ -296,8 +296,9 @@ def main(argv: list[str] | None = None) -> int:
             ]
             captions = [cell_caption(row) for _, row in block.iterrows()]
             rows.append((row_label(threshold), images, captions))
+        # 不放大標：這張圖要盡量把版面留給細胞，說明寫在 REPORT.md。
         figure_paths["fig06"] = fig.plot_notable_cells(
-            rows, figures_dir / "fig06_notable_cells.png", "形狀特別且 IDO 亮的細胞"
+            rows, figures_dir / "fig06_notable_cells.png"
         )
         tables["notable_cells"] = notable_selection[
             [

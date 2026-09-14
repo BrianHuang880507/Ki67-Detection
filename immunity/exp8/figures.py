@@ -320,7 +320,7 @@ def _tile_axes(ax: plt.Axes, image: np.ndarray) -> None:
 def plot_notable_cells(
     rows: list[tuple[str, list[np.ndarray], list[tuple[str, str, str]]]],
     out_path: Path,
-    title: str,
+    title: str | None = None,
 ) -> Path:
     """fig06：一列一個形狀條件，列出達標的細胞並標上細胞編號與特徵值。
 
@@ -328,9 +328,11 @@ def plot_notable_cells(
     生醫同仁要引用的數字；列標題則帶出是哪個特徵與達標門檻。
     """
     columns = max(len(images) for _, images, _ in rows)
-    fig = _new_figure(columns * 2.25 + 1.6, len(rows) * 2.52 + 1.0)
+    # 沒有大標時把上方空間全部還給細胞；邊界收到最小，讓每格在版面上佔更大比例。
+    top = 0.90 if title else 0.972
+    fig = _new_figure(columns * 2.6 + 1.5, len(rows) * 2.92 + (0.9 if title else 0.25))
     grid = fig.add_gridspec(
-        len(rows), columns, hspace=0.42, wspace=0.06, top=0.9, bottom=0.02, left=0.145, right=0.995
+        len(rows), columns, hspace=0.34, wspace=0.05, top=top, bottom=0.012, left=0.125, right=0.997
     )
     row_axes: list[list[plt.Axes]] = [[] for _ in rows]
     for row_index, (row_label, images, captions) in enumerate(rows):
@@ -343,17 +345,17 @@ def plot_notable_cells(
                 identifier, condition, value = captions[column_index]
                 ax.set_title(
                     f"{identifier}\n{condition}",
-                    fontsize=9.0,
+                    fontsize=11.0,
                     color=TEXT_SECONDARY,
-                    pad=20.0,
+                    pad=24.0,
                     linespacing=1.3,
                 )
                 ax.text(
                     0.5,
-                    1.015,
+                    1.012,
                     value,
                     transform=ax.transAxes,
-                    fontsize=12.0,
+                    fontsize=15.0,
                     fontweight="bold",
                     color=TEXT_PRIMARY,
                     ha="center",
@@ -364,17 +366,18 @@ def plot_notable_cells(
             if column_index == 0:
                 ax.set_ylabel(
                     row_label,
-                    fontsize=13.0,
+                    fontsize=15.5,
                     color=color,
                     fontweight="bold",
                     rotation=0,
                     ha="right",
                     va="center",
-                    labelpad=22,
+                    labelpad=24,
                     linespacing=1.5,
                 )
     _draw_row_bands(fig, row_axes)
-    _title(fig, title)
+    if title:
+        _title(fig, title)
     return _save(fig, out_path)
 
 
