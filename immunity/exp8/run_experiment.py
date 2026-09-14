@@ -35,6 +35,7 @@ from .brightness import (
     positive_fraction,
 )
 from .donor_response import delta_matrix, donor_spread, overall_magnitude, shape_delta
+from .export_cells import build_export_table, estimate_vmax, export_cells, export_window_span
 from .reporting import render_report
 from .notable import (
     bright_floor,
@@ -113,6 +114,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--paired-images", type=int, default=10, help="亮暗配對影像庫用幾張影像")
     parser.add_argument("--detail-features", type=int, default=3, help="劑量曲線畫幾個形狀特徵")
     parser.add_argument("--skip-images", action="store_true", help="不讀原始影像，跳過兩張影像庫")
+    parser.add_argument(
+        "--skip-cell-export",
+        action="store_true",
+        help="跳過逐顆細胞 PNG 匯出（約兩萬張，是整條流程最花時間的一步）",
+    )
     return parser.parse_args(argv)
 
 
@@ -351,6 +357,36 @@ def main(argv: list[str] | None = None) -> int:
         log(f"影像庫完成：濃度列 {len(rows)} 列、亮暗配對 {len(pairs)} 組")
     else:
         log("已略過影像庫（--skip-images）")
+
+    if not args.skip_cell_export:
+        export_table = build_export_table(cells, shape_thresholds)
+        span = export_window_span(export_table)
+        log(
+            f"逐顆匯出：{len(export_table):,} 個檔案、"
+            f"{export_table['image_key'].nunique()} 張影像、視窗 {span} 像素"
+        )
+        for label, block in export_table.groupby("export_label", sort=False):
+            log(f"　　{label}：{len(block):,} 顆")
+        vmax = estimate_vmax(data_root, export_table, span)
+        log(f"　　共用綠色飽和值 {vmax:.0f} 灰階")
+        manifest = export_cells(
+            data_root,
+            export_table,
+            out_root / "cell_exports",
+            span=span,
+            vmax=vmax,
+            progress=log,
+        )
+        tables["cell_exports"] = manifest
+        log(f"逐顆匯出完成：{len(manifest):,} 個檔案")
+    else:
+        # 匯出兩萬張要好幾分鐘。略過時若先前的清單還在，就讀回來讓報告保持完整。
+        previous = out_root / "cell_exports.csv"
+        if previous.exists():
+            tables["cell_exports"] = pd.read_csv(previous)
+            log(f"已略過逐顆匯出，沿用既有清單（{len(tables['cell_exports']):,} 個檔案）")
+        else:
+            log("已略過逐顆細胞匯出（--skip-cell-export）")
 
     for name, frame in tables.items():
         _write_csv(frame, out_root / f"{name}.csv", log)

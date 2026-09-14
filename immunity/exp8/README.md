@@ -25,6 +25,7 @@ conda run --no-capture-output -n ki67dtc python -m immunity.exp8.run_experiment
 | `--notable-features` | 5 | fig06 用合併排名前幾個形狀特徵當篩選條件 |
 | `--notable-percentile` | 90 | 形狀「特別」的門檻取對照組第幾百分位 |
 | `--notable-ido-percentile` | 50 | fig06 形狀列要求 IDO 亮到亮細胞群第幾百分位 |
+| `--skip-cell-export` | 關 | 跳過逐顆細胞 PNG 匯出（約兩萬張，最花時間的一步） |
 | `--paired-images` | 10 | 亮暗配對影像庫用幾張影像 |
 | `--detail-features` | 3 | 劑量曲線畫幾個形狀特徵 |
 | `--skip-images` | 關 | 不讀原始影像，跳過 fig06 與 fig09 |
@@ -105,6 +106,30 @@ fig06 原本每個濃度都取最接近中位數的細胞，但濃度之間的�
 fig13 是 fig06 的量化對照：影像庫只放得下幾顆細胞，容易被質疑是挑出來的，
 比例才說得出「哪個條件真的比較多這種細胞」。
 
+### 五、逐顆細胞匯出 `cell_exports/`
+
+fig06 是挑 6 顆做版面；`cell_exports/` 是**達標的全部細胞**，給同仁自己翻。
+
+```
+cell_exports/
+  Eccentricity/      B4_P5_C01_F01_cell011_IFN100_TNF0_0.990.png
+  MajorAxisLength/   B4_P5_C01_F01_cell011_IFN100_TNF0_240.png
+  Compactness/       ...
+  MaxFeretDiameter/  ...
+  Perimeter/         ...
+```
+
+- **一個特徵一個資料夾**，資料夾名用英文確保路徑安全。
+- **一顆細胞一張圖**，檔名是「細胞編號＿刺激條件＿特徵值」。
+- **圖上也寫同樣三項**（外加特徵名稱，讓單獨一個檔案也看得懂），
+  用 OpenCV 畫在圖片上方的白色文字區，所以文字不會蓋到細胞。
+- 收錄條件是**該特徵 > 對照組 P90**，與 fig06 同一條門檻，但**不套用 IDO 亮度
+  限制**——這裡的用途是完整翻閱，不是挑代表。
+- 同一顆細胞若同時達標多個特徵，會在各自的資料夾各出現一次。
+- 所有資料夾**共用同一個裁切視窗與綠色飽和值**，跨特徵、跨條件可以直接比大小。
+  視窗取達標細胞 MaxFeret 的 P95×1.1，約 1–2% 最長的細胞會略微出界。
+- 對照表 `cell_exports.csv` 含每個檔案的 donor、passage、條件、特徵值與 IDO 值。
+
 ## 兩個算繪上的決定
 
 **固定裁切視窗。** 影像庫若讓每顆細胞各自貼合外框再縮放到同尺寸，大細胞和
@@ -155,6 +180,7 @@ fig03／fig04 每個特徵畫兩根長條：原始相關係數，以及扣除細
 | `notable_feature_ranking.csv` | 兩條劑量軸合併排名，fig06 篩選條件的來源 |
 | `notable_fraction.csv` | 各條件下形狀達標的細胞比例 |
 | `notable_cells.csv` | fig06 用到的細胞編號、條件與特徵值 |
+| `cell_exports.csv` | `cell_exports/` 每個檔案對應的細胞、條件、特徵值與 IDO 值 |
 | `paired_cells.csv` | fig09 用到的細胞清單 |
 
 ## 結果與限制

@@ -84,6 +84,23 @@ def _passage_table(frame: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
+def _export_table(tables: Mapping[str, pd.DataFrame]) -> str:
+    """逐顆匯出的檔案數統計。"""
+    frame = tables.get("cell_exports")
+    if frame is None or frame.empty:
+        return "（本次執行以 `--skip-cell-export` 略過逐顆匯出。）"
+    lines = ["| 資料夾 | 特徵 | 檔案數 | 影像數 | 細胞數 |", "|---|---|---:|---:|---:|"]
+    for folder, block in frame.groupby("export_folder", sort=False):
+        lines.append(
+            f"| `{folder}/` | {block['feature_label'].iloc[0]} | {len(block):,} | "
+            f"{block['image_key'].nunique()} | {block['cell_label'].count():,} |"
+        )
+    unique_cells = frame.drop_duplicates(["image_key", "cell_label"])
+    lines.append(f"| **合計** | | **{len(frame):,}** | {frame['image_key'].nunique()} | "
+                 f"{len(unique_cells):,} 顆不重複 |")
+    return "\n".join(lines)
+
+
 def _threshold_list(metadata: Mapping[str, Any]) -> str:
     """形狀「特別」的門檻清單。"""
     lines = []
@@ -257,6 +274,19 @@ TNF-α 軸另外也控制了 IFN-γ 濃度。
 
 影像庫只放得下少數幾顆細胞，容易被質疑是挑出來的；上面的比例才是量化證據。
 
+### 逐顆細胞匯出
+
+fig06 是挑 6 顆做版面；`cell_exports/` 是**達標的全部細胞**，給同仁自己翻：
+一個特徵一個資料夾，一顆細胞一張圖，檔名與圖上文字都是
+「細胞編號＿刺激條件＿特徵值」。收錄條件與 fig06 相同（> 對照組 P90），
+但**不套用 IDO 亮度限制**——這裡是完整翻閱用，不是挑代表。
+同一顆細胞若同時達標多個特徵，會在各自的資料夾各出現一次。
+
+{_export_table(tables)}
+
+所有資料夾共用同一個裁切視窗與綠色飽和值，跨特徵、跨條件可以直接比大小。
+每個檔案對應的 donor、passage、條件、特徵值與 IDO 值見 `cell_exports.csv`。
+
 **這張表的排序值得注意。** 達標比例最高的是 {top_condition}（{top_fraction:.0%}），
 不是濃度最高的 IFN100_TNF0（{ifn100_fraction:.0%}）；而且 TNF-α 單獨作用的
 IFN0_TNF25／IFN0_TNF50 都高於 IFN25_TNF0。也就是說**形狀變化跟著 TNF-α 走的成分
@@ -338,6 +368,8 @@ P7 則跳到 {p7_low:.2f}–{p7_high:.2f}）。三個 donor 同時出現同一�
 | `notable_feature_ranking.csv` | 兩條劑量軸合併排名，篩選條件的來源 |
 | `notable_fraction.csv` | 各條件下形狀達標的細胞比例 |
 | `notable_cells.csv` | fig06 用到的細胞編號、條件與特徵值 |
+| `cell_exports/` | 逐顆細胞 PNG，一個特徵一個資料夾 |
+| `cell_exports.csv` | 每個匯出檔案對應的細胞、條件、特徵值與 IDO 值 |
 | `paired_cells.csv` | fig09 用到的細胞清單 |
 | `figures/` | fig01–fig12 |
 

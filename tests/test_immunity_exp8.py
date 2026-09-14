@@ -9,6 +9,7 @@ import pytest
 from immunity.exp6 import gallery as gl
 from immunity.exp8 import brightness as br
 from immunity.exp8 import donor_response as dr
+from immunity.exp8 import export_cells as ex
 from immunity.exp8 import notable as nb
 from immunity.exp8 import selection as sel
 from immunity.exp8 import shape as sh
@@ -475,6 +476,97 @@ def test_select_notable_cells_reports_when_the_ido_floor_is_too_high(
     impossible = float(cells["IDO_score_ff"].max()) + 1.0
     with pytest.raises(sh.ShapeError, match="不足"):
         nb.select_notable_cells(cells, item, count=6, ido_floor=impossible)
+
+
+def test_folder_and_value_formatting() -> None:
+    assert ex.folder_name("cell__Eccentricity") == "Eccentricity"
+    assert ex.format_value(0.98412) == "0.984"
+    assert ex.format_value(184.5) == "184"
+    assert ex.format_value(9.999) == "9.999"
+
+
+def test_build_export_table_has_one_row_per_cell_and_feature(
+    cells: pd.DataFrame, ranking: pd.DataFrame
+) -> None:
+    thresholds = nb.build_thresholds(cells, ranking, percentile=90.0)
+    table = ex.build_export_table(cells, thresholds)
+
+    expected = sum(int(item.qualifies(cells[item.feature]).sum()) for item in thresholds)
+    assert len(table) == expected
+    assert set(table["export_folder"]) == {ex.folder_name(item.feature) for item in thresholds}
+    # 每一列都必須真的達標。
+    for item in thresholds:
+        block = table[table["export_feature"] == item.feature]
+        assert item.qualifies(block[item.feature]).all()
+    # 檔名不重複，且同一資料夾內唯一。
+    assert not table.duplicated(subset=["export_folder", "export_file"]).any()
+
+
+def test_export_file_name_carries_id_condition_and_value(
+    cells: pd.DataFrame, ranking: pd.DataFrame
+) -> None:
+    thresholds = nb.build_thresholds(cells, ranking, percentile=90.0)
+    row = ex.build_export_table(cells, thresholds).iloc[0]
+    name = str(row["export_file"])
+    assert name.startswith(str(row["image_key"]))
+    assert f"cell{int(row['cell_label']):03d}" in name
+    assert str(row["condition"]) in name
+    assert ex.format_value(float(row["export_value"])) in name
+    assert name.endswith(".png")
+
+
+def test_export_window_span_covers_most_cells(
+    cells: pd.DataFrame, ranking: pd.DataFrame
+) -> None:
+    thresholds = nb.build_thresholds(cells, ranking, percentile=90.0)
+    table = ex.build_export_table(cells, thresholds)
+    span = ex.export_window_span(table)
+    assert span >= 96
+    assert (table["cell__MaxFeretDiameter"] <= span).mean() > 0.9
+
+
+def test_draw_header_adds_three_lines_above_the_image() -> None:
+    image = np.zeros((40, 60, 3), dtype=np.uint8)
+    canvas = ex._draw_header(image, ("A", "B", "C"))
+    assert canvas.shape == (40 + ex.HEADER_HEIGHT, 60, 3)
+    # 原圖原封不動搬到下半部，文字只畫在上方白色區塊。
+    assert np.array_equal(canvas[ex.HEADER_HEIGHT :], image)
+    assert canvas[: ex.HEADER_HEIGHT].min() < 255
+
+
+def test_export_cells_writes_one_file_per_row(
+    tmp_path, monkeypatch, cells: pd.DataFrame, ranking: pd.DataFrame
+) -> None:
+    thresholds = nb.build_thresholds(cells, ranking, percentile=90.0)[:2]
+    table = ex.build_export_table(cells, thresholds)
+    table = table[table["image_key"].isin(table["image_key"].drop_duplicates().head(2))]
+
+    def _fake_bundle(_root, _row):
+        mask = np.zeros((300, 300), dtype=np.int32)
+        nucleus = np.zeros((300, 300), dtype=np.int32)
+        for label in cells["cell_label"].unique():
+            offset = int(label) * 12 % 200
+            mask[offset : offset + 40, offset : offset + 40] = int(label)
+            nucleus[offset + 12 : offset + 24, offset + 12 : offset + 24] = int(label)
+        ido = np.full((300, 300), 4.0, dtype=np.float32)
+        ido[mask > 0] = 60.0
+        return gl.ImageBundle(
+            phase=np.full((300, 300), 30.0, dtype=np.float32),
+            ido=ido,
+            cell_mask=mask,
+            nucleus_mask=nucleus,
+        )
+
+    monkeypatch.setattr(ex, "load_image_bundle", _fake_bundle)
+    manifest = ex.export_cells(tmp_path, table, tmp_path / "out", span=120, vmax=60.0)
+
+    assert len(manifest) == len(table)
+    written = sorted((tmp_path / "out").rglob("*.png"))
+    assert len(written) == len(table)
+    for row in manifest.itertuples():
+        assert (tmp_path / "out" / row.export_folder / row.export_file).exists()
+    # 資料夾數等於特徵數。
+    assert {path.parent.name for path in written} == set(manifest["export_folder"])
 
 
 def test_row_label_shows_the_feature_and_threshold(
