@@ -478,6 +478,11 @@ def test_select_notable_cells_reports_when_the_ido_floor_is_too_high(
         nb.select_notable_cells(cells, item, count=6, ido_floor=impossible)
 
 
+def _bright_min(cells: pd.DataFrame) -> float:
+    """匯出用的亮暗切點，沿用 brightness 的亮門檻。"""
+    return br.control_thresholds(cells).bright_min
+
+
 def test_folder_and_value_formatting() -> None:
     assert ex.folder_name("cell__Eccentricity") == "Eccentricity"
     assert ex.format_value(0.98412) == "0.984"
@@ -489,11 +494,16 @@ def test_build_export_table_has_one_row_per_cell_and_feature(
     cells: pd.DataFrame, ranking: pd.DataFrame
 ) -> None:
     thresholds = nb.build_thresholds(cells, ranking, percentile=90.0)
-    table = ex.build_export_table(cells, thresholds)
+    table = ex.build_export_table(cells, thresholds, bright_min=_bright_min(cells))
 
     expected = sum(int(item.qualifies(cells[item.feature]).sum()) for item in thresholds)
     assert len(table) == expected
-    assert set(table["export_folder"]) == {ex.folder_name(item.feature) for item in thresholds}
+    # 每個特徵資料夾底下再分亮／不亮兩個子資料夾。
+    assert set(table["export_folder"]) == {
+        f"{ex.folder_name(item.feature)}/{sub}"
+        for item in thresholds
+        for sub in (ex.BRIGHT_FOLDER, ex.DIM_FOLDER)
+    }
     # 每一列都必須真的達標。
     for item in thresholds:
         block = table[table["export_feature"] == item.feature]
@@ -506,7 +516,7 @@ def test_export_file_name_carries_id_condition_and_value(
     cells: pd.DataFrame, ranking: pd.DataFrame
 ) -> None:
     thresholds = nb.build_thresholds(cells, ranking, percentile=90.0)
-    row = ex.build_export_table(cells, thresholds).iloc[0]
+    row = ex.build_export_table(cells, thresholds, bright_min=_bright_min(cells)).iloc[0]
     name = str(row["export_file"])
     assert name.startswith(str(row["image_key"]))
     assert f"cell{int(row['cell_label']):03d}" in name
@@ -519,15 +529,35 @@ def test_export_window_span_covers_most_cells(
     cells: pd.DataFrame, ranking: pd.DataFrame
 ) -> None:
     thresholds = nb.build_thresholds(cells, ranking, percentile=90.0)
-    table = ex.build_export_table(cells, thresholds)
+    table = ex.build_export_table(cells, thresholds, bright_min=_bright_min(cells))
     span = ex.export_window_span(table)
     assert span >= 96
     assert (table["cell__MaxFeretDiameter"] <= span).mean() > 0.9
 
 
-def test_draw_header_adds_three_lines_above_the_image() -> None:
+def test_export_table_splits_each_feature_into_bright_and_dim(
+    cells: pd.DataFrame, ranking: pd.DataFrame
+) -> None:
+    thresholds = nb.build_thresholds(cells, ranking, percentile=90.0)
+    bright_min = _bright_min(cells)
+    table = ex.build_export_table(cells, thresholds, bright_min=bright_min)
+
+    bright = table[table["export_class"] == ex.BRIGHT_FOLDER]
+    dim = table[table["export_class"] == ex.DIM_FOLDER]
+    assert (bright["IDO_score_ff"] > bright_min).all()
+    assert (dim["IDO_score_ff"] <= bright_min).all()
+    # 兩類加起來等於全部，沒有細胞因為落在灰帶而消失。
+    assert len(bright) + len(dim) == len(table)
+    # 子資料夾名稱要出現在路徑的第二段。
+    assert set(path.split("/")[1] for path in table["export_folder"]) == {
+        ex.BRIGHT_FOLDER,
+        ex.DIM_FOLDER,
+    }
+
+
+def test_draw_header_adds_four_lines_above_the_image() -> None:
     image = np.zeros((40, 60, 3), dtype=np.uint8)
-    canvas = ex._draw_header(image, ("A", "B", "C"))
+    canvas = ex._draw_header(image, ("A", "B", "C", "D"))
     assert canvas.shape == (40 + ex.HEADER_HEIGHT, 60, 3)
     # 原圖原封不動搬到下半部，文字只畫在上方白色區塊。
     assert np.array_equal(canvas[ex.HEADER_HEIGHT :], image)
@@ -538,7 +568,7 @@ def test_export_cells_writes_one_file_per_row(
     tmp_path, monkeypatch, cells: pd.DataFrame, ranking: pd.DataFrame
 ) -> None:
     thresholds = nb.build_thresholds(cells, ranking, percentile=90.0)[:2]
-    table = ex.build_export_table(cells, thresholds)
+    table = ex.build_export_table(cells, thresholds, bright_min=_bright_min(cells))
     table = table[table["image_key"].isin(table["image_key"].drop_duplicates().head(2))]
 
     def _fake_bundle(_root, _row):
@@ -565,8 +595,10 @@ def test_export_cells_writes_one_file_per_row(
     assert len(written) == len(table)
     for row in manifest.itertuples():
         assert (tmp_path / "out" / row.export_folder / row.export_file).exists()
-    # 資料夾數等於特徵數。
-    assert {path.parent.name for path in written} == set(manifest["export_folder"])
+    # 實際的目錄結構就是 manifest 裡的「特徵/亮暗」兩層。
+    assert {
+        path.parent.relative_to(tmp_path / "out").as_posix() for path in written
+    } == set(manifest["export_folder"])
 
 
 def test_row_label_shows_the_feature_and_threshold(

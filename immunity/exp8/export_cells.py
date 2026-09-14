@@ -30,9 +30,13 @@ from ..exp6.gallery import (
 from .notable import FeatureThreshold
 
 
-#: 圖上文字區的高度與三行的基準線位置（像素）。
-HEADER_HEIGHT = 58
-HEADER_LINES_Y = (17, 36, 53)
+#: 圖上文字區的高度與四行的基準線位置（像素）。
+HEADER_HEIGHT = 76
+HEADER_LINES_Y = (17, 35, 53, 71)
+
+#: 亮／不亮的子資料夾名稱，用英文確保路徑安全。
+BRIGHT_FOLDER = "IDO_bright"
+DIM_FOLDER = "IDO_dim"
 HEADER_FONT = cv2.FONT_HERSHEY_SIMPLEX
 HEADER_SCALE = 0.42
 HEADER_COLOR = (28, 28, 28)
@@ -49,22 +53,40 @@ def format_value(value: float) -> str:
 
 
 def build_export_table(
-    cells: pd.DataFrame, thresholds: list[FeatureThreshold]
+    cells: pd.DataFrame,
+    thresholds: list[FeatureThreshold],
+    *,
+    bright_min: float,
+    target: str = "IDO_score_ff",
 ) -> pd.DataFrame:
-    """列出每個特徵所有達標的細胞，一列一個 (細胞, 特徵) 組合。"""
+    """列出每個特徵所有達標的細胞，一列一個 (細胞, 特徵) 組合。
+
+    每個特徵資料夾再依 IDO 分成亮／不亮兩個子資料夾。切點沿用
+    `brightness.control_thresholds` 的亮門檻（未刺激對照組的 P99），
+    所以和 fig07／fig09 用的是同一個定義。
+
+    這裡刻意只切成兩類而不是三類：`brightness.py` 的三分法會把中間灰帶排除，
+    用在統計比較上沒問題，但這批匯出的用途是完整翻閱，不該有細胞憑空消失。
+    """
     blocks: list[pd.DataFrame] = []
     for threshold in thresholds:
         qualifying = cells[threshold.qualifies(cells[threshold.feature])]
         if qualifying.empty:
             raise GalleryError(f"{threshold.feature_label} 沒有任何達標細胞")
         value = qualifying[threshold.feature].astype(float)
+        is_bright = qualifying[target] > bright_min
         blocks.append(
             qualifying.assign(
                 export_feature=threshold.feature,
-                export_folder=folder_name(threshold.feature),
+                export_class=np.where(is_bright, BRIGHT_FOLDER, DIM_FOLDER),
+                export_folder=[
+                    f"{folder_name(threshold.feature)}/{BRIGHT_FOLDER if flag else DIM_FOLDER}"
+                    for flag in is_bright
+                ],
                 export_label=threshold.feature_label,
                 export_value=value,
                 export_threshold=threshold.threshold,
+                export_bright_min=bright_min,
                 export_file=[
                     f"{key}_cell{int(label):03d}_{condition}_{format_value(item)}.png"
                     for key, label, condition, item in zip(
@@ -129,8 +151,8 @@ def estimate_vmax(
     return float(max(np.percentile(np.concatenate(pooled), 99.0), 1.0))
 
 
-def _draw_header(image: np.ndarray, lines: tuple[str, str, str]) -> np.ndarray:
-    """在圖片上方加一條白色文字區，寫上細胞編號、條件與特徵值。"""
+def _draw_header(image: np.ndarray, lines: tuple[str, ...]) -> np.ndarray:
+    """在圖片上方加一條白色文字區，寫上細胞編號、條件、特徵值與 IDO 值。"""
     height, width = image.shape[:2]
     canvas = np.full((height + HEADER_HEIGHT, width, 3), 255, dtype=np.uint8)
     canvas[HEADER_HEIGHT:] = image
@@ -192,12 +214,14 @@ def export_cells(
                 )
                 rendered[label] = (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)
             value = format_value(float(row.export_value))
+            # 資料夾已經分了亮／不亮，圖上也寫出 IDO 值，一眼就能驗證分在哪一邊。
             canvas = _draw_header(
                 rendered[label],
                 (
                     f"{row.image_key} #{label}",
                     str(row.condition),
                     f"{folder_name(str(row.export_feature))} {value}",
+                    f"IDO {float(row.IDO_score_ff):.2f}  {str(row.export_class)}",
                 ),
             )
             path = out_root / str(row.export_folder) / str(row.export_file)
@@ -206,6 +230,7 @@ def export_cells(
             records.append(
                 {
                     "export_folder": row.export_folder,
+                    "export_class": row.export_class,
                     "export_file": row.export_file,
                     "image_key": row.image_key,
                     "cell_label": label,

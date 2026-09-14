@@ -112,16 +112,22 @@ fig06 是挑 6 顆做版面；`cell_exports/` 是**達標的全部細胞**，給
 
 ```
 cell_exports/
-  Eccentricity/      B4_P5_C01_F01_cell011_IFN100_TNF0_0.990.png
-  MajorAxisLength/   B4_P5_C01_F01_cell011_IFN100_TNF0_240.png
-  Compactness/       ...
-  MaxFeretDiameter/  ...
-  Perimeter/         ...
+  Eccentricity/
+    IDO_bright/      B4_P5_C01_F01_cell011_IFN100_TNF0_0.990.png
+    IDO_dim/         ...
+  MajorAxisLength/
+    IDO_bright/      B4_P5_C01_F01_cell011_IFN100_TNF0_240.png
+    IDO_dim/         ...
+  Compactness/ MaxFeretDiameter/ Perimeter/   （同樣兩層）
 ```
 
-- **一個特徵一個資料夾**，資料夾名用英文確保路徑安全。
+- **一個特徵一個資料夾**，底下再依 IDO 分 `IDO_bright` / `IDO_dim`，
+  資料夾名用英文確保路徑安全。
+- 亮暗切點是 **IDO > 未刺激對照組 P99（1.52 灰階）**，和 fig07／fig09 同一個定義。
+  這裡刻意只切兩類：`brightness.py` 的三分法會排除中間灰帶，用在統計比較上沒問題，
+  但這批的用途是完整翻閱，不該有細胞憑空消失。
 - **一顆細胞一張圖**，檔名是「細胞編號＿刺激條件＿特徵值」。
-- **圖上也寫同樣三項**（外加特徵名稱，讓單獨一個檔案也看得懂），
+- **圖上寫四行**：細胞編號、刺激條件、特徵名稱＋值、IDO 值＋所屬類別。
   用 OpenCV 畫在圖片上方的白色文字區，所以文字不會蓋到細胞。
 - 收錄條件是**該特徵 > 對照組 P90**，與 fig06 同一條門檻，但**不套用 IDO 亮度
   限制**——這裡的用途是完整翻閱，不是挑代表。

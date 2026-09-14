@@ -89,15 +89,32 @@ def _export_table(tables: Mapping[str, pd.DataFrame]) -> str:
     frame = tables.get("cell_exports")
     if frame is None or frame.empty:
         return "（本次執行以 `--skip-cell-export` 略過逐顆匯出。）"
-    lines = ["| 資料夾 | 特徵 | 檔案數 | 影像數 | 細胞數 |", "|---|---|---:|---:|---:|"]
-    for folder, block in frame.groupby("export_folder", sort=False):
+    has_class = "export_class" in frame.columns
+    if not has_class:
+        lines = ["| 資料夾 | 特徵 | 檔案數 |", "|---|---|---:|"]
+        for folder, block in frame.groupby("export_folder", sort=False):
+            lines.append(f"| `{folder}/` | {block['feature_label'].iloc[0]} | {len(block):,} |")
+        return "\n".join(lines)
+
+    lines = ["| 特徵資料夾 | IDO 亮 | IDO 不亮 | 合計 | 亮的比例 |", "|---|---:|---:|---:|---:|"]
+    for feature, block in frame.groupby("feature_label", sort=False):
+        counts = block["export_class"].value_counts()
+        bright = int(counts.get("IDO_bright", 0))
+        dim = int(counts.get("IDO_dim", 0))
+        total = bright + dim
         lines.append(
-            f"| `{folder}/` | {block['feature_label'].iloc[0]} | {len(block):,} | "
-            f"{block['image_key'].nunique()} | {block['cell_label'].count():,} |"
+            f"| {feature} | {bright:,} | {dim:,} | {total:,} | "
+            f"{bright / total:.0%} |" if total else f"| {feature} | 0 | 0 | 0 | n/a |"
         )
+    counts = frame["export_class"].value_counts()
+    bright = int(counts.get("IDO_bright", 0))
+    dim = int(counts.get("IDO_dim", 0))
     unique_cells = frame.drop_duplicates(["image_key", "cell_label"])
-    lines.append(f"| **合計** | | **{len(frame):,}** | {frame['image_key'].nunique()} | "
-                 f"{len(unique_cells):,} 顆不重複 |")
+    lines.append(
+        f"| **合計** | **{bright:,}** | **{dim:,}** | **{len(frame):,}** | "
+        f"{bright / len(frame):.0%} |"
+    )
+    lines.append(f"\n不重複細胞 {len(unique_cells):,} 顆、來自 {frame['image_key'].nunique()} 張影像。")
     return "\n".join(lines)
 
 
@@ -157,6 +174,7 @@ def render_report(
     n_notable = len(notable_thresholds)
     notable_percentile = float(metadata.get("notable_percentile", 90.0))
     ido_floor = float(metadata.get("notable_ido_floor", float("nan")))
+    bright_cut = float(metadata.get("thresholds", {}).get("bright_min", float("nan")))
     primary_feature = notable_thresholds[0]["feature"] if notable_thresholds else None
     dose_response = tables["shape_dose_response"]
     ifn_curve = dose_response[
@@ -277,9 +295,12 @@ TNF-α 軸另外也控制了 IFN-γ 濃度。
 ### 逐顆細胞匯出
 
 fig06 是挑 6 顆做版面；`cell_exports/` 是**達標的全部細胞**，給同仁自己翻：
-一個特徵一個資料夾，一顆細胞一張圖，檔名與圖上文字都是
-「細胞編號＿刺激條件＿特徵值」。收錄條件與 fig06 相同（> 對照組 P90），
-但**不套用 IDO 亮度限制**——這裡是完整翻閱用，不是挑代表。
+一個特徵一個資料夾，底下再依 IDO 分 `IDO_bright` / `IDO_dim` 兩個子資料夾，
+一顆細胞一張圖，檔名是「細胞編號＿刺激條件＿特徵值」，圖上還多寫 IDO 值與所屬類別。
+
+收錄條件與 fig06 相同（形狀 > 對照組 P90），但**不套用 IDO 亮度下限**——
+這裡是完整翻閱用，不是挑代表。亮暗切點是 IDO > 對照組 P99（{bright_cut:.2f} 灰階），
+與 fig07／fig09 同一個定義；只切兩類不留灰帶，才不會有細胞憑空消失。
 同一顆細胞若同時達標多個特徵，會在各自的資料夾各出現一次。
 
 {_export_table(tables)}

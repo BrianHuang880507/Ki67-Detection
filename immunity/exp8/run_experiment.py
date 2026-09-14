@@ -359,14 +359,22 @@ def main(argv: list[str] | None = None) -> int:
         log("已略過影像庫（--skip-images）")
 
     if not args.skip_cell_export:
-        export_table = build_export_table(cells, shape_thresholds)
+        export_table = build_export_table(
+            cells, shape_thresholds, bright_min=thresholds.bright_min
+        )
         span = export_window_span(export_table)
         log(
             f"逐顆匯出：{len(export_table):,} 個檔案、"
-            f"{export_table['image_key'].nunique()} 張影像、視窗 {span} 像素"
+            f"{export_table['image_key'].nunique()} 張影像、視窗 {span} 像素；"
+            f"亮／不亮以 IDO > {thresholds.bright_min:.2f} 灰階切分"
         )
         for label, block in export_table.groupby("export_label", sort=False):
-            log(f"　　{label}：{len(block):,} 顆")
+            counts = block["export_class"].value_counts()
+            log(
+                f"　　{label}：共 {len(block):,} 顆"
+                f"（亮 {int(counts.get('IDO_bright', 0)):,}、"
+                f"不亮 {int(counts.get('IDO_dim', 0)):,}）"
+            )
         vmax = estimate_vmax(data_root, export_table, span)
         log(f"　　共用綠色飽和值 {vmax:.0f} 灰階")
         manifest = export_cells(
