@@ -446,6 +446,37 @@ def test_cell_caption_carries_the_cell_id_and_value(
     assert float(value) == pytest.approx(float(row["notable_value"]), rel=1e-3)
 
 
+def test_bright_floor_sits_inside_the_bright_population(cells: pd.DataFrame) -> None:
+    thresholds = br.control_thresholds(cells)
+    floor = nb.bright_floor(cells, thresholds.bright_min, percentile=50.0)
+    bright = cells.loc[cells["IDO_score_ff"] > thresholds.bright_min, "IDO_score_ff"]
+    assert floor == pytest.approx(float(np.median(bright)))
+    assert floor > thresholds.bright_min
+
+
+def test_select_notable_cells_honours_the_ido_floor(
+    cells: pd.DataFrame, ranking: pd.DataFrame
+) -> None:
+    item = nb.build_thresholds(cells, ranking, percentile=90.0)[0]
+    thresholds = br.control_thresholds(cells)
+    floor = nb.bright_floor(cells, thresholds.bright_min, percentile=50.0)
+    chosen = nb.select_notable_cells(cells, item, count=6, ido_floor=floor)
+    assert len(chosen) == 6
+    assert (chosen["IDO_score_ff"] >= floor).all()
+    assert item.qualifies(chosen[item.feature]).all()
+    # 未刺激的細胞本來就不會亮，所以這幾列不該出現對照條件。
+    assert not (chosen["condition"] == nb.CONTROL_CONDITION).any()
+
+
+def test_select_notable_cells_reports_when_the_ido_floor_is_too_high(
+    cells: pd.DataFrame, ranking: pd.DataFrame
+) -> None:
+    item = nb.build_thresholds(cells, ranking, percentile=90.0)[0]
+    impossible = float(cells["IDO_score_ff"].max()) + 1.0
+    with pytest.raises(sh.ShapeError, match="不足"):
+        nb.select_notable_cells(cells, item, count=6, ido_floor=impossible)
+
+
 def test_row_label_shows_the_feature_and_threshold(
     cells: pd.DataFrame, ranking: pd.DataFrame
 ) -> None:

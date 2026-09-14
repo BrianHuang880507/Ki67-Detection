@@ -178,20 +178,46 @@ def _spread_over_quantiles(frame: pd.DataFrame, column: str, count: int) -> pd.D
     return ordered.iloc[positions].set_index("index")
 
 
+def bright_floor(
+    cells: pd.DataFrame, bright_min: float, *, percentile: float = 50.0, target: str = "IDO_score_ff"
+) -> float:
+    """「IDO 明顯亮」的下限：亮細胞群內的某個百分位。
+
+    只要求 `> bright_min`（對照組 P99）會放進一大堆只比對照亮一點點的細胞，
+    去背圖上看起來仍接近全黑。再往亮細胞群內取一個百分位，畫面上的綠色才明顯。
+    """
+    bright = cells.loc[cells[target] > bright_min, target].dropna()
+    if bright.empty:
+        raise ShapeError("沒有任何亮細胞，無法決定 IDO 下限")
+    return float(np.percentile(bright, percentile))
+
+
 def select_notable_cells(
     cells: pd.DataFrame,
     threshold: FeatureThreshold,
     *,
     count: int,
+    ido_floor: float | None = None,
+    target: str = "IDO_score_ff",
 ) -> pd.DataFrame:
     """挑出達標的細胞，在達標區間內等分位取樣。
 
     不取最極端的那一端：門檻已經確保它們「特別」，再往尾端挑只會挑到分割
     失敗的物件（相鄰細胞被併成一個）。
+
+    `ido_floor` 給定時，只從 IDO 明顯亮的細胞裡挑。未刺激的細胞本來就不會亮，
+    因此這個限制等於把這幾列限定在有刺激的條件——典型細胞列不套用。
     """
     qualifying = cells[threshold.qualifies(cells[threshold.feature])]
     if qualifying.empty:
         raise ShapeError(f"沒有任何細胞達到 {threshold.feature_label} 的門檻")
+    if ido_floor is not None:
+        qualifying = qualifying[qualifying[target] >= ido_floor]
+        if len(qualifying) < count:
+            raise ShapeError(
+                f"{threshold.feature_label}：形狀達標且 IDO >= {ido_floor:.2f} 的細胞只有 "
+                f"{len(qualifying)} 顆，不足 {count} 顆"
+            )
 
     chosen = _spread_over_quantiles(qualifying, threshold.feature, count)
     if threshold.direction < 0:

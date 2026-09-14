@@ -37,6 +37,7 @@ from .brightness import (
 from .donor_response import delta_matrix, donor_spread, overall_magnitude, shape_delta
 from .reporting import render_report
 from .notable import (
+    bright_floor,
     build_thresholds,
     cell_caption,
     combined_ranking,
@@ -102,6 +103,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=90.0,
         help="形狀「特別」的門檻取對照組的第幾百分位（預設 90）",
+    )
+    parser.add_argument(
+        "--notable-ido-percentile",
+        type=float,
+        default=50.0,
+        help="fig06 形狀列要求 IDO 亮到亮細胞群的第幾百分位（預設 50；典型細胞列不套用）",
     )
     parser.add_argument("--paired-images", type=int, default=10, help="亮暗配對影像庫用幾張影像")
     parser.add_argument("--detail-features", type=int, default=3, help="劑量曲線畫幾個形狀特徵")
@@ -247,12 +254,25 @@ def main(argv: list[str] | None = None) -> int:
         fractions, figures_dir / "fig13_notable_fraction.png", "形狀特別的細胞比例"
     )
 
+    # 形狀列只挑 IDO 明顯亮的細胞；典型細胞列來自未刺激對照，本來就不會亮，
+    # 因此不套用這個下限。
+    ido_floor = bright_floor(cells, thresholds.bright_min, percentile=args.notable_ido_percentile)
+    log(
+        f"IDO 明顯亮的下限 {ido_floor:.2f} 灰階"
+        f"（亮細胞群的 P{args.notable_ido_percentile:.0f}；亮的定義為 > {thresholds.bright_min:.2f}）"
+    )
+
     if not args.skip_images:
         blocks: list[tuple[object, pd.DataFrame]] = [
             (None, select_typical_cells(cells, shape_thresholds, count=args.cells_per_dose))
         ]
         blocks += [
-            (threshold, select_notable_cells(cells, threshold, count=args.cells_per_dose))
+            (
+                threshold,
+                select_notable_cells(
+                    cells, threshold, count=args.cells_per_dose, ido_floor=ido_floor
+                ),
+            )
             for threshold in shape_thresholds
         ]
         notable_selection = pd.concat([block for _, block in blocks], ignore_index=True)
@@ -277,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
             captions = [cell_caption(row) for _, row in block.iterrows()]
             rows.append((row_label(threshold), images, captions))
         figure_paths["fig06"] = fig.plot_notable_cells(
-            rows, figures_dir / "fig06_notable_cells.png", "形狀特別的細胞"
+            rows, figures_dir / "fig06_notable_cells.png", "形狀特別且 IDO 亮的細胞"
         )
         tables["notable_cells"] = notable_selection[
             [
@@ -354,6 +374,8 @@ def main(argv: list[str] | None = None) -> int:
             "control_median": thresholds.control_median,
         },
         "notable_percentile": args.notable_percentile,
+        "notable_ido_percentile": args.notable_ido_percentile,
+        "notable_ido_floor": ido_floor,
         "notable_thresholds": [
             {
                 "feature": item.feature,

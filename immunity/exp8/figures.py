@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+from matplotlib.patches import Rectangle
 
 from ..exp6.figures import (
     GRID,
@@ -47,6 +48,9 @@ DIVERGING = LinearSegmentedColormap.from_list(
 
 TITLE_SIZE = 15
 PANEL_TITLE_SIZE = 11.5
+
+#: fig06 灰白相間底色中的「灰」，取發散配色的中性灰。
+BAND_SHADED = "#f0efec"
 
 
 def _title(fig_or_ax, text: str, *, axes: bool = False) -> None:
@@ -328,10 +332,12 @@ def plot_notable_cells(
     grid = fig.add_gridspec(
         len(rows), columns, hspace=0.42, wspace=0.06, top=0.9, bottom=0.02, left=0.145, right=0.995
     )
+    row_axes: list[list[plt.Axes]] = [[] for _ in rows]
     for row_index, (row_label, images, captions) in enumerate(rows):
         color = TEXT_SECONDARY if row_index == 0 else TEXT_PRIMARY
         for column_index in range(columns):
             ax = fig.add_subplot(grid[row_index, column_index])
+            row_axes[row_index].append(ax)
             if column_index < len(images):
                 _tile_axes(ax, images[column_index])
                 identifier, condition, value = captions[column_index]
@@ -367,8 +373,46 @@ def plot_notable_cells(
                     labelpad=22,
                     linespacing=1.5,
                 )
+    _draw_row_bands(fig, row_axes)
     _title(fig, title)
     return _save(fig, out_path)
+
+
+def _draw_row_bands(fig: plt.Figure, row_axes: list[list[plt.Axes]]) -> None:
+    """在每一列後方鋪灰白相間的底色，讓特徵列一眼分得開。
+
+    色帶要連同該列上方的標題一起蓋住，所以邊界取在兩列之間的空隙，而不是
+    貼著座標軸。
+    """
+    extents = [
+        (
+            min(ax.get_position().y0 for ax in axes),
+            max(ax.get_position().y1 for ax in axes),
+        )
+        for axes in row_axes
+        if axes
+    ]
+    if len(extents) < 2:
+        return
+    gaps = [extents[index - 1][0] - extents[index][1] for index in range(1, len(extents))]
+    typical_gap = float(np.median(gaps))
+
+    for index, (bottom, top) in enumerate(extents):
+        gap_above = gaps[index - 1] if index >= 1 else typical_gap
+        gap_below = gaps[index] if index < len(gaps) else typical_gap
+        band_top = min(1.0, top + 0.88 * gap_above)
+        band_bottom = max(0.0, bottom - 0.12 * gap_below)
+        fig.add_artist(
+            Rectangle(
+                (0.0, band_bottom),
+                1.0,
+                band_top - band_bottom,
+                transform=fig.transFigure,
+                facecolor=BAND_SHADED if index % 2 else SURFACE,
+                edgecolor="none",
+                zorder=0,
+            )
+        )
 
 
 def plot_notable_fraction(table: pd.DataFrame, out_path: Path, title: str) -> Path:

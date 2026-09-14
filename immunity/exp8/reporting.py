@@ -139,6 +139,7 @@ def render_report(
     notable_thresholds = metadata.get("notable_thresholds", [])
     n_notable = len(notable_thresholds)
     notable_percentile = float(metadata.get("notable_percentile", 90.0))
+    ido_floor = float(metadata.get("notable_ido_floor", float("nan")))
     primary_feature = notable_thresholds[0]["feature"] if notable_thresholds else None
     dose_response = tables["shape_dose_response"]
     ifn_curve = dose_response[
@@ -233,7 +234,12 @@ TNF-α 軸另外也控制了 IFN-γ 濃度。
 
 {_threshold_list(metadata)}
 
-![形狀特別的細胞](figures/fig06_notable_cells.png)
+五個形狀列**另外要求 IDO 明顯亮**（IDO_score_ff ≥ {ido_floor:.2f} 灰階，
+即亮細胞群的中位數），所以圖上看得到的是「形狀特別、同時 IDO 也真的亮起來」的細胞，
+而且幾乎全部來自有刺激的條件。**典型細胞列不套用這個限制**——它取自未刺激對照，
+本來就不會亮，放在最上面是為了對照。
+
+![形狀特別且 IDO 亮的細胞](figures/fig06_notable_cells.png)
 
 每格上方三行是**細胞編號**（`image_key #cell_label`）、刺激條件，以及**該特徵的值**，
 可以直接回原圖找到同一顆細胞；完整清單見 `notable_cells.csv`。列標題同時寫出

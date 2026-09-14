@@ -8,6 +8,7 @@ categorical 前三個色位。
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 import matplotlib
 
@@ -66,10 +67,23 @@ def _new_figure(width: float, height: float):
     return fig
 
 
-def _save(fig: plt.Figure, path: Path) -> Path:
-    """存檔並關閉 figure。"""
+def _save(fig: plt.Figure, path: Path, *, attempts: int = 4) -> Path:
+    """存檔並關閉 figure。
+
+    Windows 上偶爾會在寫大張 PNG 時丟 `OSError: [Errno 22] Invalid argument`，
+    重跑就正常——多半是防毒或同步軟體短暫握住檔案握把。這裡retry 幾次，
+    不要讓整條流程為了這種暫時性錯誤中斷。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, facecolor=SURFACE, bbox_inches="tight", pad_inches=0.25)
+    for attempt in range(1, attempts + 1):
+        try:
+            fig.savefig(path, facecolor=SURFACE, bbox_inches="tight", pad_inches=0.25)
+            break
+        except OSError:
+            if attempt == attempts:
+                plt.close(fig)
+                raise
+            time.sleep(0.6 * attempt)
     plt.close(fig)
     return path
 
